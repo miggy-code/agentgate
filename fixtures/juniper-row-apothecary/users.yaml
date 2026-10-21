@@ -1,0 +1,41 @@
+- id: jr-owner-marisol
+  name: Marisol Ketterman
+  email: marisol@juniperrow.example
+  role: owner
+  status: active
+
+- id: jr-mgr-daniel
+  name: Daniel Okafor
+  email: daniel@juniperrow.example
+  role: manager
+  status: active
+
+- id: jr-staff-priya
+  name: Priya Venkat
+  email: priya@juniperrow.example
+  role: staff
+  status: active
+
+- id: jr-staff-tomas
+  name: Tomas Brandt
+  email: tomas@juniperrow.example
+  role: staff
+  status: active
+
+- id: jr-staff-hana
+  name: Hana Lindqvist
+  email: hana@juniperrow.example
+  role: staff
+  status: active
+
+- id: jr-contractor-gideon
+  name: Gideon Ashworth
+  email: gideon@ashworthcourier.example
+  role: contractor
+  status: active
+
+- id: jr-staff-wes
+  name: Wes Calloway
+  email: wes@juniperrow.example
+  role: staff
+  status: suspended
