@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets: only .env.example is tracked
+.env*
+!.env.example
+
+# Generated at runtime
+data/*.db
+data/*.db-*
+reports/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
