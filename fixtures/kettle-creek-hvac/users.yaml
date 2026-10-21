@@ -1,0 +1,47 @@
+- id: kc-owner-dale
+  name: Dale Hargrove
+  email: dale@kettlecreek.example
+  role: owner
+  status: active
+
+- id: kc-mgr-marisol
+  name: Marisol Quint
+  email: marisol@kettlecreek.example
+  role: manager
+  status: active
+
+- id: kc-mgr-terrence
+  name: Terrence Okafor
+  email: terrence@kettlecreek.example
+  role: manager
+  status: active
+
+- id: kc-staff-nadine
+  name: Nadine Ferro
+  email: nadine@kettlecreek.example
+  role: staff
+  status: active
+
+- id: kc-staff-colby
+  name: Colby Reyes
+  email: colby@kettlecreek.example
+  role: staff
+  status: active
+
+- id: kc-staff-priya
+  name: Priya Nair
+  email: priya@kettlecreek.example
+  role: staff
+  status: active
+
+- id: kc-contractor-hollis
+  name: Hollis Wren
+  email: hollis@wrencomfort.example
+  role: contractor
+  status: active
+
+- id: kc-staff-gavin
+  name: Gavin Pruitt
+  email: gavin@kettlecreek.example
+  role: staff
+  status: suspended
