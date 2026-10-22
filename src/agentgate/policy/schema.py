@@ -56,6 +56,7 @@ class Conditions(_Model):
 
     recipient_in: ListName | None = None
     recipient_external: bool | None = None
+    amount_usd_gt: Usd | None = None
     amount_usd_lte: Usd | None = None
     run_max_label_gte: Label | None = None
     doc_tags_any: frozenset[Tag] | None = Field(default=None, min_length=1)
@@ -70,6 +71,7 @@ class Conditions(_Model):
 CONDITION_ACTIONS: dict[str, frozenset[Action]] = {
     "recipient_in": frozenset({Action.SEND}),
     "recipient_external": frozenset({Action.SEND}),
+    "amount_usd_gt": frozenset({Action.SPEND}),
     "amount_usd_lte": frozenset({Action.SPEND}),
     "run_max_label_gte": frozenset(Action),
     "doc_tags_any": frozenset({Action.READ, Action.WRITE}),

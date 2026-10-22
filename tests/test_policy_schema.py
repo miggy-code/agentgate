@@ -171,6 +171,10 @@ BASE_RULE = {"id": "extra", "tools": ["docs.read"], "actions": ["read"]}
             "amount_usd_lte applies only to spend",
         ),
         (
+            BASE_RULE | {"effect": "deny", "where": {"amount_usd_gt": "5"}},
+            "amount_usd_gt applies only to spend",
+        ),
+        (
             {
                 "id": "extra",
                 "effect": "deny",
