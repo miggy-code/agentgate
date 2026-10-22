@@ -168,3 +168,29 @@ def test_context_manager_closes_connection() -> None:
         store.add_customer(_customer())
     with pytest.raises(sqlite3.ProgrammingError):
         store.list_customers()
+
+
+def test_transactions_serialize_read_check_write_across_threads() -> None:
+    import threading
+
+    store = Store()
+    with store.transaction():
+        store.connection.execute("CREATE TABLE counter (n INTEGER NOT NULL) STRICT")
+        store.connection.execute("INSERT INTO counter VALUES (0)")
+    barrier = threading.Barrier(16)
+
+    def bump() -> None:
+        barrier.wait()
+        for _ in range(25):
+            with store.transaction():
+                (n,) = store.connection.execute("SELECT n FROM counter").fetchone()
+                store.connection.execute("UPDATE counter SET n = ?", (n + 1,))
+
+    threads = [threading.Thread(target=bump) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    with store.locked():
+        (n,) = store.connection.execute("SELECT n FROM counter").fetchone()
+    assert n == 16 * 25

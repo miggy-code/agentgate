@@ -3,10 +3,16 @@
 The store is a thin persistence layer: it saves and returns validated models and enforces
 identity constraints (unique ids and emails, foreign keys). It does not decide who may see
 what; tenant and permission checks belong to the gate layer above it.
+
+Other components (spend ledger, approvals, retrieval index) keep their own tables in the
+same database through `connection`, always inside `transaction()` or `locked()`. One
+connection is shared across threads behind a re-entrant lock, because with autocommit off a
+statement from a second thread would otherwise land inside the first thread's transaction.
 """
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -59,13 +65,29 @@ class Store:
     def __init__(self, path: str | Path = ":memory:") -> None:
         # isolation_level=None turns off sqlite3's implicit transactions, so single writes
         # commit immediately and transaction() alone decides multi-write boundaries.
-        self._conn = sqlite3.connect(path, isolation_level=None)
+        self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The shared connection, for components that keep their own tables here.
+
+        Use it only inside `transaction()` or `locked()`.
+        """
+        return self._conn
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold the store lock for a group of reads that must see one consistent state."""
+        with self._lock:
+            yield
 
     def __enter__(self) -> Self:
         return self
@@ -80,71 +102,86 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """Run the enclosed writes atomically: all of them commit or none do."""
-        if self._conn.in_transaction:
-            raise RuntimeError("nested transactions are not supported")
-        self._conn.execute("BEGIN")
-        try:
-            yield
-        except BaseException:
-            self._conn.execute("ROLLBACK")
-            raise
-        self._conn.execute("COMMIT")
+        """Run the enclosed statements atomically: all of them commit or none do.
+
+        The transaction holds the store lock and SQLite's write lock from the start
+        (BEGIN IMMEDIATE), so a read-check-write sequence such as a spend reservation cannot
+        interleave with another thread or, for a file database, another process.
+        """
+        with self._lock:
+            if self._conn.in_transaction:
+                raise RuntimeError("nested transactions are not supported")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
 
     def add_customer(self, customer: Customer) -> None:
-        self._conn.execute(
-            "INSERT INTO customers (id, name, domains, timezone) VALUES (?, ?, ?, ?)",
-            # Domains are an ordered tuple on the model, so their order is kept as written.
-            (customer.id, customer.name, json.dumps(list(customer.domains)), customer.timezone),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO customers (id, name, domains, timezone) VALUES (?, ?, ?, ?)",
+                # Domains are an ordered tuple on the model, so their order is kept as written.
+                (customer.id, customer.name, json.dumps(list(customer.domains)), customer.timezone),
+            )
 
     def add_user(self, user: User) -> None:
-        self._conn.execute(
-            "INSERT INTO users (id, customer_id, name, email, role, status)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                user.id,
-                user.customer_id,
-                user.name,
-                user.email,
-                user.role.value,
-                user.status.value,
-            ),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO users (id, customer_id, name, email, role, status)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    user.id,
+                    user.customer_id,
+                    user.name,
+                    user.email,
+                    user.role.value,
+                    user.status.value,
+                ),
+            )
 
     def add_document(self, document: Document) -> None:
-        self._conn.execute(
-            "INSERT INTO documents"
-            " (id, customer_id, title, label, tags, assigned_user_ids, body)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                document.id,
-                document.customer_id,
-                document.title,
-                document.label,
-                _sorted_json(document.tags),
-                _sorted_json(document.assigned_user_ids),
-                document.body,
-            ),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO documents"
+                " (id, customer_id, title, label, tags, assigned_user_ids, body)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    document.id,
+                    document.customer_id,
+                    document.title,
+                    document.label,
+                    _sorted_json(document.tags),
+                    _sorted_json(document.assigned_user_ids),
+                    document.body,
+                ),
+            )
 
     def get_customer(self, customer_id: str) -> Customer | None:
-        row = self._conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
-        return None if row is None else _customer(row)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM customers WHERE id = ?", (customer_id,)
+            ).fetchone()
+            return None if row is None else _customer(row)
 
     def list_customers(self) -> list[Customer]:
-        rows = self._conn.execute("SELECT * FROM customers ORDER BY id").fetchall()
-        return [_customer(row) for row in rows]
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM customers ORDER BY id").fetchall()
+            return [_customer(row) for row in rows]
 
     def get_user(self, user_id: str) -> User | None:
-        row = self._conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        return None if row is None else _user(row)
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            return None if row is None else _user(row)
 
     def list_users(self, customer_id: str) -> list[User]:
-        rows = self._conn.execute(
-            "SELECT * FROM users WHERE customer_id = ? ORDER BY id", (customer_id,)
-        ).fetchall()
-        return [_user(row) for row in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM users WHERE customer_id = ? ORDER BY id", (customer_id,)
+            ).fetchall()
+            return [_user(row) for row in rows]
 
     def get_document(self, doc_id: str) -> Document | None:
         """Return a document by id from any customer.
@@ -152,14 +189,16 @@ class Store:
         This lookup is deliberately not tenant-scoped. Callers must not hand the result to a
         user without the gate layer first checking the document's customer and label.
         """
-        row = self._conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
-        return None if row is None else _document(row)
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+            return None if row is None else _document(row)
 
     def list_documents(self, customer_id: str) -> list[Document]:
-        rows = self._conn.execute(
-            "SELECT * FROM documents WHERE customer_id = ? ORDER BY id", (customer_id,)
-        ).fetchall()
-        return [_document(row) for row in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM documents WHERE customer_id = ? ORDER BY id", (customer_id,)
+            ).fetchall()
+            return [_document(row) for row in rows]
 
 
 # Rows go back through model validation, so a hand-edited database cannot smuggle in
