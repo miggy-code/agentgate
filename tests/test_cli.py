@@ -1,12 +1,16 @@
 import os
 import shutil
+import sqlite3
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 import agentgate
+from agentgate.audit.base import AuditEvent, EventKind
+from agentgate.audit.panoptes import PanoptesSink
 from agentgate.cli import app
 from agentgate.policy.schema import load_bundle
 from agentgate.policy.version import bundle_version
@@ -156,3 +160,74 @@ def test_output_has_no_colour_or_em_dashes(tmp_path: Path) -> None:
     _, out, _ = _test(policies, fixtures, "--verbose")
     assert "\x1b" not in out
     assert chr(0x2014) not in out  # em dash
+
+
+# audit verify
+
+
+def _audit_db(path: Path, events: int = 3) -> list[str]:
+    sink = PanoptesSink(path)
+    try:
+        recorded = [
+            AuditEvent(
+                timestamp=datetime(2026, 10, 22, 12, 0, index, tzinfo=UTC),
+                kind=EventKind.ALLOW,
+                customer_id="acme",
+                reason="matched_allow",
+            )
+            for index in range(events)
+        ]
+        for event in recorded:
+            sink.record(event)
+    finally:
+        sink.close()
+    return [event.event_id for event in recorded]
+
+
+def test_audit_verify_intact_chain(tmp_path: Path) -> None:
+    db = tmp_path / "audit.db"
+    _audit_db(db)
+    result = runner.invoke(app, ["audit", "verify", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == f"{db}  3 events  chain intact\n"
+    assert result.stderr == ""
+
+
+def test_audit_verify_tampered_chain(tmp_path: Path) -> None:
+    db = tmp_path / "audit.db"
+    event_ids = _audit_db(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE events SET context = json_set(context, '$.agentgate.reason', 'forged')"
+        " WHERE event_id = ?",
+        (event_ids[1],),
+    )
+    conn.commit()
+    conn.close()
+    result = runner.invoke(app, ["audit", "verify", "--db", str(db)])
+    assert result.exit_code == 1
+    assert result.stdout == (
+        f"{db}  3 events  chain BROKEN: Canonical event hash mismatch at event {event_ids[1]}\n"
+    )
+    assert "\x1b" not in result.stdout
+    assert chr(0x2014) not in result.stdout  # em dash
+
+
+def test_audit_verify_missing_file(tmp_path: Path) -> None:
+    db = tmp_path / "data" / "audit.db"
+    result = runner.invoke(app, ["audit", "verify", "--db", str(db)])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == f"error: audit database not found: {db}\n"
+    assert not db.exists()
+    assert not db.parent.exists()
+
+
+def test_audit_verify_defaults_to_data_audit_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _audit_db(tmp_path / "data" / "audit.db", events=1)
+    result = runner.invoke(app, ["audit", "verify"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == f"{Path('data/audit.db')}  1 events  chain intact\n"

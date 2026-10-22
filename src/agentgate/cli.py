@@ -1,16 +1,18 @@
-"""The agentgate command line: policy lint and policy test.
+"""The agentgate command line: policy lint, policy test and audit verify.
 
 Output is plain, deterministic text (customers sorted, cases in file order, no colour), so
 it reads the same in a terminal, a CI log and a diff. Problems that stop a command go to
 stderr as one "error: ..." line with exit status 1.
 """
 
+import sqlite3
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 
 import agentgate
+from agentgate.audit.panoptes import PanoptesSink
 from agentgate.fixtures import FixtureError
 from agentgate.policy.schema import PolicyError
 from agentgate.policy.testing import load_policy_bundles, run_policy_tests
@@ -24,6 +26,8 @@ app = typer.Typer(
 )
 policy_app = typer.Typer(help="Validate and test customer policies.", no_args_is_help=True)
 app.add_typer(policy_app, name="policy")
+audit_app = typer.Typer(help="Inspect the audit log.", no_args_is_help=True)
+app.add_typer(audit_app, name="audit")
 
 PoliciesOption = Annotated[
     Path, typer.Option("--policies", help="Directory holding one folder per customer policy.")
@@ -103,6 +107,33 @@ def test(
     typer.echo(f"total  {report.passed}/{report.total} passed")
     if report.failed:
         raise typer.Exit(code=1)
+
+
+@audit_app.command("verify")
+def verify(
+    db: Annotated[Path, typer.Option("--db", help="Panoptes audit database to check.")] = Path(
+        "data/audit.db"
+    ),
+) -> None:
+    """Check the audit log's hash chain. Exits 1 if any stored event was changed."""
+    try:
+        # create=False: a mistyped path must fail, not verify a new empty log.
+        sink = PanoptesSink(db, create=False)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        _fail(str(exc))
+    try:
+        result = sink.verify()
+        count = sink.count()
+    finally:
+        sink.close()
+    if result["valid"]:
+        typer.echo(f"{db}  {count} events  chain intact")
+        return
+    line = f"{db}  {count} events  chain BROKEN: {result['error']}"
+    if result.get("broken_event_id"):
+        line += f" at event {result['broken_event_id']}"
+    typer.echo(line)
+    raise typer.Exit(code=1)
 
 
 def main() -> None:

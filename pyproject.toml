@@ -12,6 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Miguel Padilla" }]
 dependencies = [
+    "panoptes-observe>=0.1.1,<0.2",
     "pydantic>=2.9,<3",
     "pyyaml>=6,<7",
     "typer>=0.12,<1",
@@ -46,6 +47,11 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["src"]
+
+[[tool.mypy.overrides]]
+# panoptes-observe ships no py.typed marker or stubs.
+module = ["panoptes", "panoptes.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
