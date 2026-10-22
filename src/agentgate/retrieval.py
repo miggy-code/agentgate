@@ -7,25 +7,36 @@ search tool from the document's metadata alone (label, tags, assignment, never t
 and only an ALLOW counts; a read that would need approval is not searchable. Read and search
 therefore share one decision path and cannot disagree.
 
-Full-text search then runs only over the permitted documents, in the same SQL statement as
-the ranking. As defence in depth, every ranked document is decided again from its stored
-row before it is returned, and any disagreement raises RetrievalInvariantError.
+Ranking is BM25F computed in Python over the permitted documents only. The index is a
+plain inverted index (per-field term frequencies and field lengths) built with the same
+tokeniser as the query. Every index read is restricted to the permitted ids in SQL, so the
+term frequencies, document frequencies, average field lengths and document count behind a
+score all come from documents the run may read. The order of results therefore cannot
+depend on any document the run cannot read, in this customer or another. FTS5 is not used:
+its bm25 takes statistics from the whole table, and it exposes no per-document field
+lengths, so permitted-only statistics would need a second tokeniser that has to agree
+with FTS5's exactly.
+
+As defence in depth, every ranked document is decided again from its stored row before it
+is returned, and any disagreement raises RetrievalInvariantError.
 
 Costs and limits:
-- Each search makes one engine call per document of the customer. That is fine at MVP
-  scale; compiling the read rules into a SQL predicate is the place to optimise later.
-- bm25 term statistics (document frequency, average length) come from the whole index, not
-  just the permitted rows, so the order of permitted results for a multi-term query can
-  shift with the content of documents the run cannot read. Membership and counts never do.
-  Ranking with statistics computed over the permitted set alone would close that gap.
+- Each search makes one engine call per document of the customer, and reads the field
+  lengths of every permitted document plus the postings of the query terms. That is fine at
+  MVP scale; compiling the read rules into a SQL predicate and caching per-permission-set
+  statistics are the places to optimise later.
+- The index is rebuilt explicitly. Documents added after `rebuild()` are not searchable
+  until it runs again.
 
 The trace returned with each search is for the audit log only. The model sees `documents`.
 """
 
 import json
+import math
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from agentgate.context import RunContext
@@ -40,27 +51,46 @@ MAX_TERM_LENGTH = 64
 
 _TERM = re.compile(r"[a-z0-9]+")
 
-# A standalone index keyed by document id rather than an external-content table: the
-# documents table has no INTEGER PRIMARY KEY, so its rowids are not stable enough to key on.
-# remove_diacritics 2 folds accents the same way query sanitisation does.
-_SCHEMA = """
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-    doc_id UNINDEXED,
-    title,
-    body,
-    tokenize = 'unicode61 remove_diacritics 2'
-)
-"""
+# BM25F parameters. A title hit is a stronger signal than a body hit in these short documents.
+K1 = 1.2
+B = 0.75
+TITLE_WEIGHT = 2.0
+BODY_WEIGHT = 1.0
 
-# bm25 column weights in table order: doc_id (unindexed), title, body. A title hit is a
-# stronger signal than a body hit in these short documents.
-_RANK_SQL = """
-SELECT doc_id
-FROM documents_fts
-WHERE documents_fts MATCH ?
+# Postings hold only terms a query can contain (MAX_TERM_LENGTH or shorter); lengths count
+# every token. Keyed by document id because the documents table has no INTEGER PRIMARY KEY,
+# so its rowids are not a stable key.
+_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS retrieval_postings (
+        term TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        title_tf INTEGER NOT NULL,
+        body_tf INTEGER NOT NULL,
+        PRIMARY KEY (term, doc_id)
+    ) STRICT, WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS retrieval_lengths (
+        doc_id TEXT PRIMARY KEY,
+        title_len INTEGER NOT NULL,
+        body_len INTEGER NOT NULL
+    ) STRICT
+    """,
+)
+
+# Ids and terms travel as one JSON parameter each, so the statements have a fixed shape and
+# no bound-variable limit however many documents a customer has.
+_LENGTHS_SQL = """
+SELECT doc_id, title_len, body_len
+FROM retrieval_lengths
+WHERE doc_id IN (SELECT value FROM json_each(?))
+"""
+_POSTINGS_SQL = """
+SELECT term, doc_id, title_tf, body_tf
+FROM retrieval_postings
+WHERE term IN (SELECT value FROM json_each(?))
   AND doc_id IN (SELECT value FROM json_each(?))
-ORDER BY bm25(documents_fts, 0.0, 2.0, 1.0), doc_id
-LIMIT ?
 """
 
 
@@ -104,15 +134,14 @@ class _Filter:
 
 
 def sanitize_query(query: str) -> tuple[str, ...]:
-    """Reduce free text to plain lowercase word terms, so FTS5 syntax cannot be injected.
+    """Reduce free text to plain lowercase word terms, so no query syntax can be injected.
 
     Compatibility forms and accents are folded first (fullwidth letters, "cafe" for "café").
     Terms are deduplicated in order, at most MAX_TERMS are kept, and a term longer than
     MAX_TERM_LENGTH is dropped rather than truncated into a different word.
     """
-    folded = unicodedata.normalize("NFKD", query).lower()
     terms: list[str] = []
-    for term in _TERM.findall(folded):
+    for term in _tokens(query):
         if len(term) > MAX_TERM_LENGTH or term in terms:
             continue
         terms.append(term)
@@ -121,29 +150,108 @@ def sanitize_query(query: str) -> tuple[str, ...]:
     return tuple(terms)
 
 
-def _match_expression(terms: tuple[str, ...]) -> str:
-    # Terms are [a-z0-9]+ only, so quoting each one makes it a literal phrase and no term
-    # can read as an operator (NEAR, NOT), a column filter or a prefix query.
-    return " OR ".join(f'"{term}"' for term in terms)
+def _tokens(text: str) -> list[str]:
+    # Queries and documents share this, so a folded query word always meets the same folded
+    # word in the index.
+    return _TERM.findall(unicodedata.normalize("NFKD", text).lower())
+
+
+@dataclass(frozen=True)
+class _Posting:
+    term: str
+    doc_id: str
+    title_tf: int
+    body_tf: int
+
+
+@dataclass(frozen=True)
+class _Lengths:
+    title: int
+    body: int
+
+
+def _bm25f(
+    terms: Sequence[str],
+    lengths: dict[str, _Lengths],
+    postings: Iterable[_Posting],
+    limit: int,
+) -> list[str]:
+    """Rank documents by BM25F using statistics from `lengths` and `postings` alone.
+
+    Callers pass only permitted documents, which is what keeps unreadable documents out of
+    every statistic. Each field's term frequency is normalised by that field's length
+    against its average, weighted, summed, then saturated once per term with K1.
+    """
+    count = len(lengths)
+    if count == 0:
+        return []
+    avg_title = sum(n.title for n in lengths.values()) / count
+    avg_body = sum(n.body for n in lengths.values()) / count
+
+    by_term: dict[str, list[_Posting]] = {}
+    for posting in postings:
+        if posting.doc_id in lengths:
+            by_term.setdefault(posting.term, []).append(posting)
+
+    scores: dict[str, float] = {}
+    for term in terms:
+        matches = by_term.get(term, [])
+        if not matches:
+            continue
+        # The Lucene form of IDF stays positive, so a term common in a small permitted set
+        # still counts for something instead of scoring zero or below.
+        idf = math.log(1 + (count - len(matches) + 0.5) / (len(matches) + 0.5))
+        for posting in matches:
+            size = lengths[posting.doc_id]
+            weighted = TITLE_WEIGHT * _normalised(posting.title_tf, size.title, avg_title)
+            weighted += BODY_WEIGHT * _normalised(posting.body_tf, size.body, avg_body)
+            gain = idf * weighted * (K1 + 1) / (weighted + K1)
+            scores[posting.doc_id] = scores.get(posting.doc_id, 0.0) + gain
+    ranked = sorted(scores, key=lambda doc_id: (-scores[doc_id], doc_id))
+    return ranked[:limit]
+
+
+def _normalised(tf: int, length: int, average: float) -> float:
+    if tf == 0:
+        return 0.0
+    if average == 0:
+        return float(tf)
+    return tf / (1 - B + B * length / average)
 
 
 class DocumentIndex:
-    """A full-text index over every document in a store, searched per run and permission."""
+    """A word index over every document in a store, searched per run and permission."""
 
     def __init__(self, store: Store) -> None:
         self._store = store
         with store.locked():
-            store.connection.execute(_SCHEMA)
+            for statement in _SCHEMA:
+                store.connection.execute(statement)
 
     def rebuild(self) -> None:
         """(Re)index every document in the store. Call after loading fixtures."""
         with self._store.transaction():
             conn = self._store.connection
-            conn.execute("DELETE FROM documents_fts")
-            conn.execute(
-                "INSERT INTO documents_fts (doc_id, title, body)"
-                " SELECT id, title, body FROM documents ORDER BY id"
-            )
+            conn.execute("DELETE FROM retrieval_postings")
+            conn.execute("DELETE FROM retrieval_lengths")
+            rows = conn.execute("SELECT id, title, body FROM documents ORDER BY id").fetchall()
+            for row in rows:
+                title = _tokens(row["title"])
+                body = _tokens(row["body"])
+                conn.execute(
+                    "INSERT INTO retrieval_lengths (doc_id, title_len, body_len) VALUES (?, ?, ?)",
+                    (row["id"], len(title), len(body)),
+                )
+                title_tf = Counter(t for t in title if len(t) <= MAX_TERM_LENGTH)
+                body_tf = Counter(t for t in body if len(t) <= MAX_TERM_LENGTH)
+                conn.executemany(
+                    "INSERT INTO retrieval_postings (term, doc_id, title_tf, body_tf)"
+                    " VALUES (?, ?, ?, ?)",
+                    [
+                        (term, row["id"], title_tf[term], body_tf[term])
+                        for term in sorted(title_tf.keys() | body_tf.keys())
+                    ],
+                )
 
     def search(
         self,
@@ -228,12 +336,17 @@ class DocumentIndex:
     ) -> list[str]:
         if not terms or not permitted_ids:
             return []
-        # The permitted ids travel as one JSON parameter, so the statement has a fixed shape
-        # and no bound-variable limit however many documents a customer has.
-        rows = self._store.connection.execute(
-            _RANK_SQL, (_match_expression(terms), json.dumps(permitted_ids), limit)
-        ).fetchall()
-        return [row["doc_id"] for row in rows]
+        conn = self._store.connection
+        ids = json.dumps(permitted_ids)
+        lengths = {
+            row["doc_id"]: _Lengths(row["title_len"], row["body_len"])
+            for row in conn.execute(_LENGTHS_SQL, (ids,))
+        }
+        postings = [
+            _Posting(row["term"], row["doc_id"], row["title_tf"], row["body_tf"])
+            for row in conn.execute(_POSTINGS_SQL, (json.dumps(terms), ids))
+        ]
+        return _bm25f(terms, lengths, postings, limit)
 
     def _recheck(
         self,

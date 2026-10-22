@@ -354,7 +354,7 @@ def test_run_max_label_reaches_a_read_rule(world: World, tmp_path: Path) -> None
         ("x'; DROP TABLE documents; --", "x drop table documents"),
     ],
 )
-def test_fts_syntax_is_searched_as_plain_words(world: World, query: str, plain: str) -> None:
+def test_fts5_syntax_is_searched_as_plain_words(world: World, query: str, plain: str) -> None:
     assert sanitize_query(query) == sanitize_query(plain)
     result = world.search("kc-owner-dale", query)
     assert result.trace.returned_ids == world.search("kc-owner-dale", plain).trace.returned_ids
@@ -528,3 +528,45 @@ def test_invariant_check_fires_when_the_filter_is_wrong(
         world.search("kc-staff-nadine", "payroll")
     with pytest.raises(RetrievalInvariantError, match="kc-job-2047"):
         world.search("kc-contractor-hollis", "heat pump tune-up")
+
+
+@pytest.mark.parametrize(
+    ("user_id", "query"),
+    [
+        ("kc-staff-nadine", "furnace refrigerant thermostat warranty"),
+        ("kc-contractor-hollis", "furnace refrigerant job dispatch"),
+        ("jr-staff-priya", "refill shipping cold order"),
+        ("jr-contractor-gideon", "delivery shipping cold return"),
+    ],
+)
+def test_ranking_ignores_documents_the_run_cannot_read(user_id: str, query: str) -> None:
+    world = _build_world()
+    user = world.user(user_id)
+    noisy = sanitize_query(query)[0]
+    before = world.search(user_id, query)
+    assert len(before.trace.returned_ids) >= 4
+
+    # Many unreadable documents that lean hard on one query term: restricted ones in the
+    # user's own customer and readable-looking public ones in the other customer.
+    foreign = other(user.customer_id)
+    for i in range(300):
+        for customer_id, label in ((user.customer_id, "restricted"), (foreign, "public")):
+            world.store.add_document(
+                Document(
+                    id=f"{customer_id[:2]}-noise-{label}-{i:03d}",
+                    customer_id=customer_id,
+                    title=f"{noisy} {noisy} notes",
+                    label=label,
+                    body=" ".join([noisy] * 40 + ["filler"] * i),
+                )
+            )
+    world.index.rebuild()
+
+    after = world.search(user_id, query)
+    assert after.trace.returned_ids == before.trace.returned_ids
+    assert after.trace.candidates_in_tenant == before.trace.candidates_in_tenant + 300
+    assert after.trace.permitted == before.trace.permitted
+    # The noise is indexed and found by someone who may read it.
+    owner = next(u for u in world.users(user.customer_id) if u.role is Role.OWNER)
+    assert any("-noise-" in i for i in world.search(owner.id, noisy).trace.returned_ids)
+    world.store.close()
