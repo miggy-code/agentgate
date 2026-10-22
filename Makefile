@@ -1,4 +1,4 @@
-.PHONY: install lint format type test check
+.PHONY: install lint format type test policy check
 
 install:
 	uv sync
@@ -17,4 +17,8 @@ type:
 test:
 	uv run pytest
 
-check: lint type test
+policy:
+	uv run agentgate policy lint
+	uv run agentgate policy test
+
+check: lint type test policy

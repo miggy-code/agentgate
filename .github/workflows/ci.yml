@@ -34,3 +34,6 @@ jobs:
 
       - name: Test
         run: make test
+
+      - name: Policy tests
+        run: make policy
