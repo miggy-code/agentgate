@@ -1,0 +1,34 @@
+# Tools an agent run may call for Juniper Row Apothecary.
+# cost_usd is the per-call platform cost counted against the spend caps in policy.yaml.
+
+- id: docs.search
+  description: Search the company document store and return matching snippets.
+  actions: [read]
+  base_risk: 0
+  cost_usd: "0.0005"
+
+- id: docs.read
+  description: Read one document from the company document store.
+  actions: [read]
+  base_risk: 0
+  cost_usd: "0.0005"
+
+- id: notes.write
+  description: Write a note into the company knowledge base, attached to a document.
+  actions: [write]
+  base_risk: 10
+  cost_usd: "0.001"
+
+- id: email.send
+  description: Send an email from the company mailbox.
+  actions: [send]
+  customer_facing: true
+  base_risk: 40
+  cost_usd: "0.001"
+
+- id: refund.issue
+  description: Issue a refund to a customer's original payment method.
+  actions: [spend]
+  customer_facing: true
+  base_risk: 35
+  cost_usd: "0.002"

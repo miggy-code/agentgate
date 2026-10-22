@@ -1,0 +1,33 @@
+# Tools an agent run may call for Kettle Creek Heating & Air.
+# cost_usd is the per-call platform cost counted against the spend caps in policy.yaml.
+
+- id: docs.search
+  description: Search the company document store and return matching snippets.
+  actions: [read]
+  base_risk: 0
+  cost_usd: "0.0005"
+
+- id: docs.read
+  description: Read one document from the company document store.
+  actions: [read]
+  base_risk: 0
+  cost_usd: "0.0005"
+
+- id: notes.write
+  description: Write a note into the company knowledge base, attached to a document.
+  actions: [write]
+  base_risk: 10
+  cost_usd: "0.001"
+
+- id: email.send
+  description: Send an email from the company mailbox.
+  actions: [send]
+  customer_facing: true
+  base_risk: 40
+  cost_usd: "0.001"
+
+- id: parts.order
+  description: Order HVAC parts from a supplier on the company account.
+  actions: [spend]
+  base_risk: 30
+  cost_usd: "0.002"

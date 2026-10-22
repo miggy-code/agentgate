@@ -1,0 +1,516 @@
+# Expected decisions for policies/kettle-creek-hvac. Role and customer come from the fixtures.
+# `rules` lists the deciding rule ids in policy file order; it is omitted for default and
+# built-in denies.
+
+# Reads: contractor
+- name: contractor reads a public service menu
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-service-menu
+  expect: allow
+  rules: [contractor-read-public]
+
+- name: contractor searches public warranty terms
+  user: kc-contractor-hollis
+  tool: docs.search
+  action: read
+  document: kc-warranty-terms
+  expect: allow
+  rules: [contractor-read-public]
+
+- name: contractor reads a job ticket assigned to him
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-job-2041-furnace-igniter
+  expect: allow
+  rules: [contractor-read-assigned]
+
+- name: contractor searches a second job ticket assigned to him
+  user: kc-contractor-hollis
+  tool: docs.search
+  action: read
+  document: kc-job-2044-ac-no-cool
+  expect: allow
+  rules: [contractor-read-assigned]
+
+- name: contractor reads a job ticket assigned to a staff member
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-job-2047-heat-pump-tuneup
+  expect: deny
+
+- name: contractor reads the refrigerant handling SOP
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-refrigerant-handling-sop
+  expect: allow
+  rules: [contractor-read-sop]
+
+- name: contractor searches the dispatch procedure SOP
+  user: kc-contractor-hollis
+  tool: docs.search
+  action: read
+  document: kc-dispatch-procedure
+  expect: allow
+  rules: [contractor-read-sop]
+
+- name: contractor reads an internal policy that is neither assigned nor an SOP
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-fleet-vehicle-policy
+  expect: deny
+
+- name: contractor reads the untrusted inbound email
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-inbox-repair-inquiry-0914
+  expect: deny
+
+- name: contractor reads the confidential customer list
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-customer-list
+  expect: deny
+
+- name: contractor reads restricted payroll
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: kc-payroll-summary
+  expect: deny
+
+# Reads: staff
+- name: staff reads an internal SOP
+  user: kc-staff-nadine
+  tool: docs.read
+  action: read
+  document: kc-dispatch-procedure
+  expect: allow
+  rules: [staff-read]
+
+- name: staff searches a public FAQ
+  user: kc-staff-priya
+  tool: docs.search
+  action: read
+  document: kc-seasonal-maintenance-faq
+  expect: allow
+  rules: [staff-read]
+
+- name: staff reads an internal job ticket assigned to someone else
+  user: kc-staff-colby
+  tool: docs.read
+  action: read
+  document: kc-job-2041-furnace-igniter
+  expect: allow
+  rules: [staff-read]
+
+- name: staff reads the untrusted inbound email
+  user: kc-staff-nadine
+  tool: docs.read
+  action: read
+  document: kc-inbox-repair-inquiry-0914
+  expect: allow
+  rules: [staff-read]
+
+- name: staff reads the confidential pricing and margin sheet
+  user: kc-staff-nadine
+  tool: docs.read
+  action: read
+  document: kc-pricing-margin-sheet
+  expect: deny
+
+- name: staff searches the confidential customer list
+  user: kc-staff-colby
+  tool: docs.search
+  action: read
+  document: kc-customer-list
+  expect: deny
+
+# Reads: manager
+- name: manager reads the confidential customer list
+  user: kc-mgr-marisol
+  tool: docs.read
+  action: read
+  document: kc-customer-list
+  expect: allow
+  rules: [manager-read]
+
+- name: manager searches an internal SOP
+  user: kc-mgr-terrence
+  tool: docs.search
+  action: read
+  document: kc-install-checklist-sop
+  expect: allow
+  rules: [manager-read]
+
+- name: manager reads restricted payroll
+  user: kc-mgr-terrence
+  tool: docs.read
+  action: read
+  document: kc-payroll-summary
+  expect: deny
+
+- name: manager reads the restricted HR note
+  user: kc-mgr-marisol
+  tool: docs.read
+  action: read
+  document: kc-hr-note-former-technician
+  expect: deny
+
+# Reads: owner
+- name: owner reads restricted succession notes
+  user: kc-owner-dale
+  tool: docs.read
+  action: read
+  document: kc-owner-succession-notes
+  expect: allow
+  rules: [owner-read]
+
+- name: owner searches a public document
+  user: kc-owner-dale
+  tool: docs.search
+  action: read
+  document: kc-service-area-hours
+  expect: allow
+  rules: [owner-read]
+
+# Reads: cross-customer (built-in deny)
+- name: owner reads another customer's restricted payroll
+  user: kc-owner-dale
+  tool: docs.read
+  action: read
+  document: jr-payroll-summary-2026
+  expect: deny
+
+- name: contractor reads another customer's public catalog
+  user: kc-contractor-hollis
+  tool: docs.read
+  action: read
+  document: jr-product-catalog
+  expect: deny
+
+- name: manager searches another customer's SOP
+  user: kc-mgr-marisol
+  tool: docs.search
+  action: read
+  document: jr-sop-order-fulfillment
+  expect: deny
+
+# Notes
+- name: staff writes a note on an internal SOP
+  user: kc-staff-nadine
+  tool: notes.write
+  action: write
+  document: kc-dispatch-procedure
+  expect: allow
+  rules: [write-notes-internal]
+
+- name: staff writes a note on a public document
+  user: kc-staff-priya
+  tool: notes.write
+  action: write
+  document: kc-service-menu
+  expect: allow
+  rules: [write-notes-internal]
+
+- name: staff writes a note on a confidential bid
+  user: kc-staff-priya
+  tool: notes.write
+  action: write
+  document: kc-commercial-bid-harlan-school
+  expect: deny
+
+- name: manager writes a note on a confidential bid
+  user: kc-mgr-marisol
+  tool: notes.write
+  action: write
+  document: kc-commercial-bid-harlan-school
+  expect: allow
+  rules: [write-notes-confidential]
+
+- name: owner writes a note on a public document
+  user: kc-owner-dale
+  tool: notes.write
+  action: write
+  document: kc-warranty-terms
+  expect: allow
+  rules: [write-notes-confidential]
+
+- name: owner writes a note on restricted succession notes
+  user: kc-owner-dale
+  tool: notes.write
+  action: write
+  document: kc-owner-succession-notes
+  expect: deny
+
+- name: manager writes a note on restricted payroll
+  user: kc-mgr-terrence
+  tool: notes.write
+  action: write
+  document: kc-payroll-summary
+  expect: deny
+
+- name: contractor writes a note on his own job ticket
+  user: kc-contractor-hollis
+  tool: notes.write
+  action: write
+  document: kc-job-2041-furnace-igniter
+  expect: deny
+
+- name: contractor writes a note on a public document
+  user: kc-contractor-hollis
+  tool: notes.write
+  action: write
+  document: kc-service-menu
+  expect: deny
+
+- name: manager writes a note on another customer's document
+  user: kc-mgr-marisol
+  tool: notes.write
+  action: write
+  document: jr-shift-schedule
+  expect: deny
+
+# Email
+- name: staff emails a manager
+  user: kc-staff-nadine
+  tool: email.send
+  action: send
+  recipients: [marisol@kettlecreek.example]
+  expect: allow
+  rules: [email-internal]
+
+- name: owner emails the shared service mailbox after reading restricted data
+  user: kc-owner-dale
+  tool: email.send
+  action: send
+  recipients: [service@kettlecreek.example, terrence@kettlecreek.example]
+  run_max_label: restricted
+  expect: allow
+  rules: [email-internal]
+
+- name: manager emails a customer in the directory
+  user: kc-mgr-terrence
+  tool: email.send
+  action: send
+  recipients: [beatrice.l@mail-sample.example]
+  expect: require_approval
+  rules: [email-customers]
+
+- name: staff emails two customers after reading only internal data
+  user: kc-staff-colby
+  tool: email.send
+  action: send
+  recipients: [ruben.c@mail-sample.example, yvette.d@mail-sample.example]
+  run_max_label: internal
+  expect: require_approval
+  rules: [email-customers]
+
+- name: owner emails a customer after reading public data only
+  user: kc-owner-dale
+  tool: email.send
+  action: send
+  recipients: [odalys.f@mail-sample.example]
+  run_max_label: public
+  expect: require_approval
+  rules: [email-customers]
+
+- name: manager emails a customer after reading confidential data
+  user: kc-mgr-marisol
+  tool: email.send
+  action: send
+  recipients: [imani.r@mail-sample.example]
+  run_max_label: confidential
+  expect: deny
+  rules: [no-external-after-confidential]
+
+- name: staff emails the injection target from the inbound email
+  user: kc-staff-nadine
+  tool: email.send
+  action: send
+  recipients: [records-review@exfil-drop.example]
+  expect: deny
+
+- name: owner emails the injection target after reading confidential data
+  user: kc-owner-dale
+  tool: email.send
+  action: send
+  recipients: [records-review@exfil-drop.example]
+  run_max_label: confidential
+  expect: deny
+  rules: [no-external-after-confidential]
+
+- name: staff emails an internal address with the injection target added
+  user: kc-staff-priya
+  tool: email.send
+  action: send
+  recipients: [dale@kettlecreek.example, records-review@exfil-drop.example]
+  expect: deny
+
+- name: manager emails a customer with one outsider added after a restricted read
+  user: kc-mgr-terrence
+  tool: email.send
+  action: send
+  recipients: [tobias.m@mail-sample.example, records-review@exfil-drop.example]
+  run_max_label: restricted
+  expect: deny
+  rules: [no-external-after-confidential]
+
+- name: staff replies to the untrusted inbound sender who is not in the directory
+  user: kc-staff-nadine
+  tool: email.send
+  action: send
+  recipients: [gordon.vance@mail-sample.example]
+  expect: deny
+
+- name: staff emails a customer and copies a manager
+  user: kc-staff-colby
+  tool: email.send
+  action: send
+  recipients: [anselm.w@mail-sample.example, marisol@kettlecreek.example]
+  expect: deny
+
+- name: staff emails a look-alike company domain
+  user: kc-staff-nadine
+  tool: email.send
+  action: send
+  recipients: [dale@kettlecreek-hvac.example]
+  expect: deny
+
+- name: staff emails a subdomain of the company domain
+  user: kc-staff-nadine
+  tool: email.send
+  action: send
+  recipients: [dale@mail.kettlecreek.example]
+  expect: deny
+
+- name: manager emails the parts supplier
+  user: kc-mgr-marisol
+  tool: email.send
+  action: send
+  recipients: [accounts@northfield-supply.example]
+  expect: deny
+
+- name: contractor emails the office
+  user: kc-contractor-hollis
+  tool: email.send
+  action: send
+  recipients: [service@kettlecreek.example]
+  expect: deny
+
+- name: contractor emails a customer after reading confidential data
+  user: kc-contractor-hollis
+  tool: email.send
+  action: send
+  recipients: [beatrice.l@mail-sample.example]
+  run_max_label: confidential
+  expect: deny
+  rules: [no-external-after-confidential]
+
+# Parts orders
+- name: manager orders parts at exactly 500.00
+  user: kc-mgr-terrence
+  tool: parts.order
+  action: spend
+  amount_usd: "500.00"
+  expect: allow
+  rules: [parts-order-up-to-500]
+
+- name: manager orders parts at 500.01, which needs approval
+  user: kc-mgr-terrence
+  tool: parts.order
+  action: spend
+  amount_usd: "500.01"
+  expect: require_approval
+  rules: [parts-order-approval-to-5000]
+
+- name: owner orders a small part
+  user: kc-owner-dale
+  tool: parts.order
+  action: spend
+  amount_usd: "42.75"
+  expect: allow
+  rules: [parts-order-up-to-500]
+
+- name: owner orders parts at exactly 5000.00, which needs approval
+  user: kc-owner-dale
+  tool: parts.order
+  action: spend
+  amount_usd: "5000.00"
+  expect: require_approval
+  rules: [parts-order-approval-to-5000]
+
+- name: owner orders parts at 5000.01, above every limit
+  user: kc-owner-dale
+  tool: parts.order
+  action: spend
+  amount_usd: "5000.01"
+  expect: deny
+
+- name: staff orders parts at exactly 200.00
+  user: kc-staff-colby
+  tool: parts.order
+  action: spend
+  amount_usd: "200.00"
+  expect: require_approval
+  rules: [parts-order-staff-approval]
+
+- name: staff orders parts at 200.01
+  user: kc-staff-colby
+  tool: parts.order
+  action: spend
+  amount_usd: "200.01"
+  expect: deny
+
+- name: staff orders parts with no amount
+  user: kc-staff-priya
+  tool: parts.order
+  action: spend
+  expect: deny
+
+- name: contractor orders a part
+  user: kc-contractor-hollis
+  tool: parts.order
+  action: spend
+  amount_usd: "10.00"
+  expect: deny
+
+# Built-in denies
+- name: owner calls the pharmacy refund tool, which this customer does not have
+  user: kc-owner-dale
+  tool: refund.issue
+  action: spend
+  amount_usd: "10.00"
+  expect: deny
+
+- name: manager calls an unknown shell tool
+  user: kc-mgr-marisol
+  tool: shell.exec
+  action: write
+  expect: deny
+
+- name: staff uses docs.read to write
+  user: kc-staff-nadine
+  tool: docs.read
+  action: write
+  document: kc-dispatch-procedure
+  expect: deny
+
+- name: owner reads without naming a document
+  user: kc-owner-dale
+  tool: docs.read
+  action: read
+  expect: deny
+
+- name: staff writes a note without naming a document
+  user: kc-staff-nadine
+  tool: notes.write
+  action: write
+  expect: deny

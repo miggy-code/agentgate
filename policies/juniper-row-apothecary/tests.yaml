@@ -1,0 +1,456 @@
+# Expected decisions for policies/juniper-row-apothecary. Role and customer come from the fixtures.
+# `rules` lists the deciding rule ids in policy file order; it is omitted for default and
+# built-in denies.
+
+# Reads: contractor
+- name: contractor reads public shipping information
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-shipping-info
+  expect: allow
+  rules: [contractor-read-public]
+
+- name: contractor reads the north route manifest assigned to him
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-manifest-2026-10-22-north
+  expect: allow
+  rules: [contractor-read-assigned]
+
+- name: contractor searches the south route manifest assigned to him
+  user: jr-contractor-gideon
+  tool: docs.search
+  action: read
+  document: jr-manifest-2026-10-22-south
+  expect: allow
+  rules: [contractor-read-assigned]
+
+- name: contractor reads the shop pickups manifest assigned to staff
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-manifest-2026-10-22-shop-pickups
+  expect: deny
+
+- name: contractor reads the cold-chain shipping SOP
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-sop-cold-chain-shipping
+  expect: allow
+  rules: [contractor-read-sop]
+
+- name: contractor searches the order fulfillment SOP
+  user: jr-contractor-gideon
+  tool: docs.search
+  action: read
+  document: jr-sop-order-fulfillment
+  expect: allow
+  rules: [contractor-read-sop]
+
+- name: contractor reads the internal shift schedule
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-shift-schedule
+  expect: deny
+
+- name: contractor reads the untrusted inbound email
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-inbox-delayed-order-inquiry
+  expect: deny
+
+- name: contractor reads the confidential customer list
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-customer-list
+  expect: deny
+
+- name: contractor reads restricted order records
+  user: jr-contractor-gideon
+  tool: docs.read
+  action: read
+  document: jr-order-records-2026-10
+  expect: deny
+
+# Reads: staff
+- name: staff reads the shop pickups manifest assigned to her
+  user: jr-staff-priya
+  tool: docs.read
+  action: read
+  document: jr-manifest-2026-10-22-shop-pickups
+  expect: allow
+  rules: [staff-read]
+
+- name: staff reads a delivery route manifest assigned to the courier
+  user: jr-staff-tomas
+  tool: docs.read
+  action: read
+  document: jr-manifest-2026-10-22-north
+  expect: allow
+  rules: [staff-read]
+
+- name: staff searches the public return policy
+  user: jr-staff-hana
+  tool: docs.search
+  action: read
+  document: jr-return-policy
+  expect: allow
+  rules: [staff-read]
+
+- name: staff reads the confidential sales summary
+  user: jr-staff-hana
+  tool: docs.read
+  action: read
+  document: jr-sales-summary-q3-2026
+  expect: deny
+
+- name: staff reads restricted order records
+  user: jr-staff-priya
+  tool: docs.read
+  action: read
+  document: jr-order-records-2026-09
+  expect: deny
+
+# Reads: manager
+- name: manager reads confidential supplier pricing
+  user: jr-mgr-daniel
+  tool: docs.read
+  action: read
+  document: jr-supplier-pricing
+  expect: allow
+  rules: [manager-read]
+
+- name: manager searches the internal shift schedule
+  user: jr-mgr-daniel
+  tool: docs.search
+  action: read
+  document: jr-shift-schedule
+  expect: allow
+  rules: [manager-read]
+
+- name: manager reads restricted September order records
+  user: jr-mgr-daniel
+  tool: docs.read
+  action: read
+  document: jr-order-records-2026-09
+  expect: allow
+  rules: [manager-read-orders]
+
+- name: manager searches restricted refill schedule records tagged orders
+  user: jr-mgr-daniel
+  tool: docs.search
+  action: read
+  document: jr-refill-schedule-records
+  expect: allow
+  rules: [manager-read-orders]
+
+- name: manager reads restricted payroll
+  user: jr-mgr-daniel
+  tool: docs.read
+  action: read
+  document: jr-payroll-summary-2026
+  expect: deny
+
+# Reads: owner
+- name: owner reads restricted payroll
+  user: jr-owner-marisol
+  tool: docs.read
+  action: read
+  document: jr-payroll-summary-2026
+  expect: allow
+  rules: [owner-read]
+
+- name: owner searches the public product catalog
+  user: jr-owner-marisol
+  tool: docs.search
+  action: read
+  document: jr-product-catalog
+  expect: allow
+  rules: [owner-read]
+
+# Reads: cross-customer (built-in deny)
+- name: manager reads another customer's internal SOP
+  user: jr-mgr-daniel
+  tool: docs.read
+  action: read
+  document: kc-dispatch-procedure
+  expect: deny
+
+- name: owner reads another customer's confidential customer list
+  user: jr-owner-marisol
+  tool: docs.read
+  action: read
+  document: kc-customer-list
+  expect: deny
+
+- name: contractor searches another customer's public FAQ
+  user: jr-contractor-gideon
+  tool: docs.search
+  action: read
+  document: kc-seasonal-maintenance-faq
+  expect: deny
+
+# Notes
+- name: staff writes a note on an internal SOP
+  user: jr-staff-tomas
+  tool: notes.write
+  action: write
+  document: jr-sop-refill-reminders
+  expect: allow
+  rules: [write-notes-internal]
+
+- name: staff writes a note on a confidential wholesale agreement
+  user: jr-staff-tomas
+  tool: notes.write
+  action: write
+  document: jr-wholesale-agreement-summary
+  expect: deny
+
+- name: manager writes a note on a confidential wholesale agreement
+  user: jr-mgr-daniel
+  tool: notes.write
+  action: write
+  document: jr-wholesale-agreement-summary
+  expect: allow
+  rules: [write-notes-confidential]
+
+- name: owner writes a note on the public store hours
+  user: jr-owner-marisol
+  tool: notes.write
+  action: write
+  document: jr-store-hours-contact
+  expect: allow
+  rules: [write-notes-confidential]
+
+- name: manager writes a note on restricted order records he can read
+  user: jr-mgr-daniel
+  tool: notes.write
+  action: write
+  document: jr-order-records-2026-10
+  expect: deny
+
+- name: owner writes a note on restricted payroll
+  user: jr-owner-marisol
+  tool: notes.write
+  action: write
+  document: jr-payroll-summary-2026
+  expect: deny
+
+- name: contractor writes a note on his own manifest
+  user: jr-contractor-gideon
+  tool: notes.write
+  action: write
+  document: jr-manifest-2026-10-22-north
+  expect: deny
+
+- name: staff writes a note on another customer's document
+  user: jr-staff-hana
+  tool: notes.write
+  action: write
+  document: kc-service-menu
+  expect: deny
+
+# Email
+- name: staff emails the care mailbox
+  user: jr-staff-hana
+  tool: email.send
+  action: send
+  recipients: [care@juniperrow.example]
+  expect: allow
+  rules: [email-internal]
+
+- name: manager emails the owner after reading restricted order records
+  user: jr-mgr-daniel
+  tool: email.send
+  action: send
+  recipients: [marisol@juniperrow.example]
+  run_max_label: restricted
+  expect: allow
+  rules: [email-internal]
+
+- name: staff emails a customer in the directory
+  user: jr-staff-priya
+  tool: email.send
+  action: send
+  recipients: [alma.whitfield@mail.example]
+  expect: require_approval
+  rules: [email-customers]
+
+- name: owner emails two customers after reading internal data
+  user: jr-owner-marisol
+  tool: email.send
+  action: send
+  recipients: [noor.hl@mail.example, sunita.m@mail.example]
+  run_max_label: internal
+  expect: require_approval
+  rules: [email-customers]
+
+- name: manager emails a customer after reading restricted order records
+  user: jr-mgr-daniel
+  tool: email.send
+  action: send
+  recipients: [denny.o@mail.example]
+  run_max_label: restricted
+  expect: deny
+  rules: [no-external-after-confidential]
+
+- name: staff emails the injection target from the inbound email
+  user: jr-staff-tomas
+  tool: email.send
+  action: send
+  recipients: [audit@records-request.example]
+  expect: deny
+
+- name: owner emails the injection target after reading confidential data
+  user: jr-owner-marisol
+  tool: email.send
+  action: send
+  recipients: [audit@records-request.example]
+  run_max_label: confidential
+  expect: deny
+  rules: [no-external-after-confidential]
+
+- name: staff emails a customer with the injection target added
+  user: jr-staff-hana
+  tool: email.send
+  action: send
+  recipients: [ravi.c@mail.example, audit@records-request.example]
+  expect: deny
+
+- name: manager emails the care mailbox with one outsider added after a confidential read
+  user: jr-mgr-daniel
+  tool: email.send
+  action: send
+  recipients: [care@juniperrow.example, audit@records-request.example]
+  run_max_label: confidential
+  expect: deny
+  rules: [no-external-after-confidential]
+
+- name: staff replies to the untrusted inbound sender who is not in the directory
+  user: jr-staff-priya
+  tool: email.send
+  action: send
+  recipients: [rhea.kowalczyk@mail.example]
+  expect: deny
+
+- name: staff emails an unlisted address on the shared customer mail domain
+  user: jr-staff-priya
+  tool: email.send
+  action: send
+  recipients: [someone.new@mail.example]
+  expect: deny
+
+- name: manager emails the wholesale supplier
+  user: jr-mgr-daniel
+  tool: email.send
+  action: send
+  recipients: [wholesale@harrowfield.example]
+  expect: deny
+
+- name: contractor emails the care mailbox
+  user: jr-contractor-gideon
+  tool: email.send
+  action: send
+  recipients: [care@juniperrow.example]
+  expect: deny
+
+# Refunds
+- name: staff refund at exactly 100.00
+  user: jr-staff-tomas
+  tool: refund.issue
+  action: spend
+  amount_usd: "100.00"
+  expect: require_approval
+  rules: [refund-staff-approval]
+
+- name: staff refund at 100.01
+  user: jr-staff-tomas
+  tool: refund.issue
+  action: spend
+  amount_usd: "100.01"
+  expect: deny
+
+- name: manager refund at exactly 500.00
+  user: jr-mgr-daniel
+  tool: refund.issue
+  action: spend
+  amount_usd: "500.00"
+  expect: require_approval
+  rules: [refund-manager-approval]
+
+- name: manager refund at 500.01
+  user: jr-mgr-daniel
+  tool: refund.issue
+  action: spend
+  amount_usd: "500.01"
+  expect: deny
+
+- name: owner refund at exactly 2000.00
+  user: jr-owner-marisol
+  tool: refund.issue
+  action: spend
+  amount_usd: "2000.00"
+  expect: require_approval
+  rules: [refund-owner-approval]
+
+- name: owner refund at 2000.01
+  user: jr-owner-marisol
+  tool: refund.issue
+  action: spend
+  amount_usd: "2000.01"
+  expect: deny
+
+- name: owner small refund still needs approval
+  user: jr-owner-marisol
+  tool: refund.issue
+  action: spend
+  amount_usd: "12.50"
+  expect: require_approval
+  rules: [refund-owner-approval]
+
+- name: staff refund with no amount
+  user: jr-staff-hana
+  tool: refund.issue
+  action: spend
+  expect: deny
+
+- name: contractor issues a refund
+  user: jr-contractor-gideon
+  tool: refund.issue
+  action: spend
+  amount_usd: "5.00"
+  expect: deny
+
+# Built-in denies
+- name: manager calls the HVAC parts tool, which this customer does not have
+  user: jr-mgr-daniel
+  tool: parts.order
+  action: spend
+  amount_usd: "50.00"
+  expect: deny
+
+- name: owner calls an unknown export tool
+  user: jr-owner-marisol
+  tool: records.export
+  action: read
+  document: jr-order-records-2026-10
+  expect: deny
+
+- name: staff uses email.send to spend
+  user: jr-staff-priya
+  tool: email.send
+  action: spend
+  amount_usd: "10.00"
+  expect: deny
+
+- name: manager searches without naming a document
+  user: jr-mgr-daniel
+  tool: docs.search
+  action: read
+  expect: deny

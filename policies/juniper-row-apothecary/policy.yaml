@@ -1,0 +1,176 @@
+# Access policy for Juniper Row Apothecary. Deny by default: anything no rule allows is denied.
+# Precedence: any matching deny wins, then require_approval, then allow.
+apiVersion: agentgate/v1
+customer: juniper-row-apothecary
+
+# Least to most sensitive.
+labels: [public, internal, confidential, restricted]
+default: deny
+
+# Platform cost caps for agent runs.
+spend:
+  per_run_usd: "0.40"
+  per_customer_day_usd: "15.00"
+  max_calls_per_run: 30
+
+approvals:
+  approver_roles: [owner, manager]
+  ttl_minutes: 60
+  risk_threshold: 50
+
+lists:
+  # Company mailboxes only. Exact domain, so subdomains and look-alikes do not match.
+  internal_addresses:
+    - "@juniperrow.example"
+  # Exact customer addresses from the customer list. Senders seen only in untrusted inbox
+  # mail are not added, and the shared mail.example domain is never listed with @domain.
+  customer_directory:
+    - alma.whitfield@mail.example
+    - denny.o@mail.example
+    - imogen.stroud@mail.example
+    - lucas.t@mail.example
+    - noor.hl@mail.example
+    - beatrix.q@mail.example
+    - ferris.odunsi@mail.example
+    - joanna.pv@mail.example
+    - ravi.c@mail.example
+    - corliss.a@mail.example
+    - teo.fenwick@mail.example
+    - sunita.m@mail.example
+
+rules:
+  # Reading documents (search and read). One rule per role, each up to that role's ceiling.
+  - id: contractor-read-public
+    effect: allow
+    description: Contractors may search and read public documents.
+    roles: [contractor]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: public}
+
+  - id: contractor-read-assigned
+    effect: allow
+    description: Contractors may read internal documents assigned to them, such as their delivery manifests.
+    roles: [contractor]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: internal}
+    where:
+      doc_assigned_to_user: true
+
+  - id: contractor-read-sop
+    effect: allow
+    description: Contractors may read internal standard operating procedures.
+    roles: [contractor]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: internal}
+    where:
+      doc_tags_any: [sop]
+
+  - id: staff-read
+    effect: allow
+    description: Staff may search and read documents up to internal.
+    roles: [staff]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: internal}
+
+  - id: manager-read
+    effect: allow
+    description: The manager may search and read documents up to confidential.
+    roles: [manager]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: confidential}
+
+  - id: manager-read-orders
+    effect: allow
+    description: The manager may also read restricted order records (tagged orders), but not payroll.
+    roles: [manager]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: restricted}
+    where:
+      doc_tags_any: [orders]
+
+  - id: owner-read
+    effect: allow
+    description: The owner may search and read every document, including restricted.
+    roles: [owner]
+    tools: [docs.search, docs.read]
+    actions: [read]
+    labels: {max: restricted}
+
+  # Writing notes. Nobody writes restricted and contractors never write (default deny).
+  - id: write-notes-internal
+    effect: allow
+    description: Staff may write knowledge-base notes on documents up to internal.
+    roles: [staff]
+    tools: [notes.write]
+    actions: [write]
+    labels: {max: internal}
+
+  - id: write-notes-confidential
+    effect: allow
+    description: The owner and the manager may write knowledge-base notes on documents up to confidential.
+    roles: [owner, manager]
+    tools: [notes.write]
+    actions: [write]
+    labels: {max: confidential}
+
+  # Email. Any other recipient, and any contractor send, falls to default deny.
+  - id: email-internal
+    effect: allow
+    description: Owner, manager and staff may email company addresses.
+    roles: [owner, manager, staff]
+    tools: [email.send]
+    actions: [send]
+    where:
+      recipient_in: internal_addresses
+
+  - id: email-customers
+    effect: require_approval
+    description: Emailing customers in the directory needs approval.
+    roles: [owner, manager, staff]
+    tools: [email.send]
+    actions: [send]
+    where:
+      recipient_in: customer_directory
+
+  - id: no-external-after-confidential
+    effect: deny
+    description: No run may email outside the company once it has read confidential or restricted data.
+    tools: [email.send]
+    actions: [send]
+    where:
+      run_max_label_gte: confidential
+      recipient_external: true
+
+  # Refunds always need approval, up to a per-role limit. Above each limit is default deny.
+  - id: refund-staff-approval
+    effect: require_approval
+    description: Staff refunds up to 100 USD need approval.
+    roles: [staff]
+    tools: [refund.issue]
+    actions: [spend]
+    where:
+      amount_usd_lte: "100.00"
+
+  - id: refund-manager-approval
+    effect: require_approval
+    description: Manager refunds up to 500 USD need approval.
+    roles: [manager]
+    tools: [refund.issue]
+    actions: [spend]
+    where:
+      amount_usd_lte: "500.00"
+
+  - id: refund-owner-approval
+    effect: require_approval
+    description: Owner refunds up to 2000 USD need approval.
+    roles: [owner]
+    tools: [refund.issue]
+    actions: [spend]
+    where:
+      amount_usd_lte: "2000.00"
