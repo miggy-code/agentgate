@@ -7,15 +7,14 @@ and leaves the store unchanged.
 
 import re
 import sqlite3
-from collections.abc import Callable, Hashable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any
 
-import yaml
 from pydantic import ValidationError
 
+from agentgate._yaml import parse_yaml
 from agentgate.models import Customer, Document, User
 from agentgate.store import Store
 
@@ -88,31 +87,6 @@ class _CustomerBundle:
     documents: list[tuple[Path, Document]] = field(default_factory=list)
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):
-    """SafeLoader that rejects duplicate mapping keys instead of keeping the last one."""
-
-    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Hashable, Any]:
-        seen: set[object] = set()
-        for key_node, _ in node.value:
-            key = self.construct_object(key_node, deep=deep)
-            if not isinstance(key, Hashable):
-                break  # SafeConstructor reports unhashable keys itself.
-            if key in seen:
-                raise yaml.constructor.ConstructorError(
-                    None, None, f"duplicate key {key!r}", key_node.start_mark
-                )
-            seen.add(key)
-        return super().construct_mapping(node, deep=deep)
-
-
-def _parse_yaml(text: str, path: Path) -> Any:
-    try:
-        # _UniqueKeyLoader is a SafeLoader, so tags cannot build arbitrary Python objects.
-        return yaml.load(text, Loader=_UniqueKeyLoader)
-    except yaml.YAMLError as exc:
-        raise FixtureError(f"{path}: invalid YAML: {exc}") from exc
-
-
 def _validate[M: (Customer, User, Document)](model: type[M], data: object, path: Path) -> M:
     try:
         return model.model_validate(data)
@@ -131,7 +105,7 @@ def _load_customer_dir(directory: Path) -> _CustomerBundle:
     if not customer_path.is_file():
         raise FixtureError(f"{customer_path}: missing customer.yaml")
     customer = _validate(
-        Customer, _parse_yaml(customer_path.read_text(), customer_path), customer_path
+        Customer, parse_yaml(customer_path.read_text(), customer_path, FixtureError), customer_path
     )
     if customer.id != directory.name:
         raise FixtureError(
@@ -156,7 +130,7 @@ def _load_customer_dir(directory: Path) -> _CustomerBundle:
 def _load_users(path: Path, customer_id: str) -> list[User]:
     if not path.is_file():
         raise FixtureError(f"{path}: missing users.yaml")
-    entries = _parse_yaml(path.read_text(), path)
+    entries = parse_yaml(path.read_text(), path, FixtureError)
     if entries is None:
         return []
     if not isinstance(entries, list):
@@ -184,7 +158,7 @@ def _split_front_matter(text: str, path: Path) -> tuple[str, str]:
 
 def _load_document(path: Path, customer_id: str) -> Document:
     front_text, body = _split_front_matter(path.read_text(), path)
-    front = _parse_yaml(front_text, path)
+    front = parse_yaml(front_text, path, FixtureError)
     if not isinstance(front, dict):
         raise FixtureError(f"{path}: front matter must be a mapping")
     for key in ("id", "customer_id", "body"):
