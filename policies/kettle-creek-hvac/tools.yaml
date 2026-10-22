@@ -29,5 +29,5 @@
 - id: parts.order
   description: Order HVAC parts from a supplier on the company account.
   actions: [spend]
-  base_risk: 30
+  base_risk: 20
   cost_usd: "0.002"
