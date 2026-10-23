@@ -386,3 +386,60 @@ def test_concurrent_reserves_across_connections_never_exceed_the_cap(
     assert len(successes) == int(CAP // AMOUNT)
     assert spent == sum((r.amount_usd for r in successes), Decimal(0))
     assert spent <= CAP
+
+
+def _recount(store: Store, customer_id: str, day: date) -> Decimal:
+    # The day total computed the slow way, straight from the reservation rows.
+    with store.locked():
+        rows = store.connection.execute(
+            "SELECT status, reserved_usd, actual_usd FROM spend_reservations"
+            " WHERE customer_id = ? AND day = ? AND status != 'released'",
+            (customer_id, day.isoformat()),
+        ).fetchall()
+    return sum(
+        (Decimal(r["actual_usd"] if r["status"] == "settled" else r["reserved_usd"]) for r in rows),
+        Decimal(0),
+    )
+
+
+def test_running_day_total_matches_a_full_recount(clock: FixedClock) -> None:
+    store = Store()
+    ledger = SpendLedger(store, clock)
+    acme, beta = _customer("acme"), _customer("beta")
+    limits = _limits(run="100", day="1000", calls=1000)
+    # A fixed mix of reserve, settle above and below the estimate, and release.
+    for i in range(300):
+        customer = acme if i % 3 else beta
+        reservation = _ok(
+            _reserve(
+                ledger, f"0.{i % 97:02d}", run_id=f"run-{i % 7}", customer=customer, limits=limits
+            )
+        )
+        if i % 5 == 0:
+            ledger.release(reservation)
+        elif i % 2 == 0:
+            ledger.settle(reservation, reservation.amount_usd * 3)
+        elif i % 7 == 0:
+            ledger.settle(reservation, Decimal(0))
+        if i == 150:
+            clock.advance(timedelta(days=1))
+    for customer in (acme, beta):
+        for day in (TODAY, TODAY + timedelta(days=1)):
+            assert ledger.customer_day_spent(customer.id, day) == _recount(store, customer.id, day)
+
+
+def test_day_totals_are_rebuilt_for_a_ledger_written_before_they_existed(
+    tmp_path: Path, clock: FixedClock
+) -> None:
+    path = tmp_path / "ledger.db"
+    first = SpendLedger(Store(path), clock)
+    kept = _ok(_reserve(first, "0.40"))
+    first.settle(kept, Decimal("0.55"))
+    _ok(_reserve(first, "0.10"))
+    first.release(_ok(_reserve(first, "0.30")))
+    # Simulate the older schema: the totals table did not exist yet.
+    store = Store(path)
+    with store.transaction():
+        store.connection.execute("DELETE FROM spend_day_totals")
+    reopened = SpendLedger(store, clock)
+    assert reopened.customer_day_spent("acme", TODAY) == Decimal("0.65")

@@ -48,6 +48,16 @@ _SCHEMA = (
     CREATE INDEX IF NOT EXISTS spend_reservations_customer_day
         ON spend_reservations(customer_id, day)
     """,
+    # A running total per customer day, kept in the same transaction as every reservation
+    # change, so the daily cap check reads one row instead of summing the whole day.
+    """
+    CREATE TABLE IF NOT EXISTS spend_day_totals (
+        customer_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        total_usd TEXT NOT NULL,
+        PRIMARY KEY (customer_id, day)
+    ) STRICT
+    """,
 )
 
 _OPEN = "open"
@@ -97,6 +107,7 @@ class SpendLedger:
                 # Each CREATE commits on its own; IF NOT EXISTS makes a second ledger on the
                 # same database, or a reopened file, a no-op.
                 store.connection.execute(statement)
+        self._backfill_day_totals()
 
     def customer_day(self, customer: Customer) -> date:
         """Today in the customer's timezone, according to the clock."""
@@ -152,6 +163,7 @@ class SpendLedger:
                     self._clock.now().isoformat(),
                 ),
             )
+            self._add_to_day(customer.id, day.isoformat(), amount_usd)
             return reservation
 
     def settle(self, reservation: Reservation, actual_usd: Decimal) -> None:
@@ -189,17 +201,17 @@ class SpendLedger:
     def customer_day_spent(self, customer_id: str, day: date) -> Decimal:
         """Settled actuals plus open reservations for one customer on one local day."""
         with self._store.locked():
-            rows = self._store.connection.execute(
-                "SELECT status, reserved_usd, actual_usd FROM spend_reservations"
-                " WHERE customer_id = ? AND day = ? AND status != ?",
-                (customer_id, day.isoformat(), _RELEASED),
-            ).fetchall()
-        return _total(rows)
+            row = self._store.connection.execute(
+                "SELECT total_usd FROM spend_day_totals WHERE customer_id = ? AND day = ?",
+                (customer_id, day.isoformat()),
+            ).fetchone()
+        return Decimal(0) if row is None else Decimal(row["total_usd"])
 
     def _finish(self, reservation: Reservation, status: str, actual: str | None) -> None:
         with self._store.transaction():
             row = self._store.connection.execute(
-                "SELECT run_id, customer_id, status FROM spend_reservations WHERE id = ?",
+                "SELECT run_id, customer_id, day, status, reserved_usd FROM spend_reservations"
+                " WHERE id = ?",
                 (reservation.id,),
             ).fetchone()
             if row is None:
@@ -215,6 +227,46 @@ class SpendLedger:
                 " WHERE id = ? AND status = ?",
                 (status, actual, self._clock.now().isoformat(), reservation.id, _OPEN),
             )
+            # The open reservation counted at its reserved amount; swap in the actual cost,
+            # or remove it entirely on release.
+            reserved = Decimal(row["reserved_usd"])
+            change = (Decimal(0) if actual is None else Decimal(actual)) - reserved
+            self._add_to_day(row["customer_id"], row["day"], change)
+
+    def _add_to_day(self, customer_id: str, day: str, change: Decimal) -> None:
+        # Only called inside a store transaction, alongside the reservation row it mirrors.
+        row = self._store.connection.execute(
+            "SELECT total_usd FROM spend_day_totals WHERE customer_id = ? AND day = ?",
+            (customer_id, day),
+        ).fetchone()
+        total = (Decimal(0) if row is None else Decimal(row["total_usd"])) + change
+        self._store.connection.execute(
+            "INSERT INTO spend_day_totals (customer_id, day, total_usd) VALUES (?, ?, ?)"
+            " ON CONFLICT (customer_id, day) DO UPDATE SET total_usd = excluded.total_usd",
+            (customer_id, day, str(total)),
+        )
+
+    def _backfill_day_totals(self) -> None:
+        # A database written before spend_day_totals existed has reservations but no totals.
+        with self._store.transaction():
+            (totals,) = self._store.connection.execute(
+                "SELECT COUNT(*) FROM spend_day_totals"
+            ).fetchone()
+            if totals:
+                return
+            rows = self._store.connection.execute(
+                "SELECT customer_id, day, status, reserved_usd, actual_usd"
+                " FROM spend_reservations WHERE status != ?",
+                (_RELEASED,),
+            ).fetchall()
+            by_day: dict[tuple[str, str], list[sqlite3.Row]] = {}
+            for row in rows:
+                by_day.setdefault((row["customer_id"], row["day"]), []).append(row)
+            for (customer_id, day), day_rows in by_day.items():
+                self._store.connection.execute(
+                    "INSERT INTO spend_day_totals (customer_id, day, total_usd) VALUES (?, ?, ?)",
+                    (customer_id, day, str(_total(day_rows))),
+                )
 
 
 def _check_amount(amount: Decimal) -> None:
