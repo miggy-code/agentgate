@@ -37,3 +37,14 @@ jobs:
 
       - name: Policy tests
         run: make policy
+
+      - name: Red-team suite
+        run: make redteam
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-python-${{ matrix.python-version }}
+          path: reports/
+          if-no-files-found: warn
