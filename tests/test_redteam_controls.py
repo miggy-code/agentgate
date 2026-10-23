@@ -59,17 +59,7 @@ SCENARIO_DIR = Path(__file__).resolve().parent.parent / "src/agentgate/redteam/s
 
 # Scenarios that assert correct behaviour the gate does not have yet. Each must fail on the
 # real gate; when one starts passing, the bug is fixed and it comes off this list.
-KNOWN_GATE_BUGS = {
-    # Gate.call_tool creates the approval row, and Gate._decide_approval commits the
-    # decision, before the audit event is recorded; if the sink refuses that event, the
-    # state change stands with no record of it.
-    "ai-012": {
-        "an unrecorded request leaves no approval",
-        "an unrecorded approval stays pending",
-        "an unrecorded approval cannot run",
-        "nothing sent without an approval on record",
-    },
-}
+KNOWN_GATE_BUGS: dict[str, set[str]] = {}
 
 
 def run(ids: list[str], policies: Path = POLICIES) -> list[ScenarioResult]:
@@ -186,6 +176,27 @@ def lax_parse_address(raw: str) -> tuple[str, str] | None:
 
 def lax_is_external(raw: str, domains: frozenset[str]) -> bool:
     return raw.strip().lower().rsplit("@", 1)[-1] not in domains
+
+
+REAL_CREATE = ApprovalQueue.create
+REAL_APPROVE = ApprovalQueue.approve
+
+
+def create_then_record(self: ApprovalQueue, *, record: Any = None, **kwargs: Any) -> Any:
+    """The bug ai-012 found: the approval row commits, then the event is attempted."""
+    approval = REAL_CREATE(self, **kwargs)
+    if record is not None:
+        record(approval)
+    return approval
+
+
+def approve_then_record(
+    self: ApprovalQueue, *args: Any, record: Any = None, expired: Any = None
+) -> Any:
+    decided = REAL_APPROVE(self, *args, expired=expired)
+    if record is not None:
+        record(decided)
+    return decided
 
 
 def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
@@ -550,7 +561,7 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
             edits=(
                 (
                     Gate,
-                    "_execute",
+                    "_record_allow",
                     (
                         (
                             "details=details,",
@@ -561,6 +572,14 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
                 ),
             ),
             breaks=("ai-003", "ai-004"),
+        ),
+        Mutation(
+            "approval changes commit before their event",
+            replace=(
+                (ApprovalQueue, "create", create_then_record),
+                (ApprovalQueue, "approve", approve_then_record),
+            ),
+            breaks=("ai-012",),
         ),
         Mutation(
             "verification always passes",

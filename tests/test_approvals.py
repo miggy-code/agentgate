@@ -759,3 +759,182 @@ def test_error_carries_reason_and_message() -> None:
     assert str(error) == "approval 'x' has expired"
     assert ApprovalStatus.EXECUTED.value == "executed"
     assert ApprovalErrorReason.APPROVER_NOT_ALLOWED.value == "approver_not_allowed"
+
+
+# Record hooks: a state change commits only together with its record
+
+
+class Boom(Exception):
+    pass
+
+
+class Recorder:
+    """Records what it is called with, and whether the call was inside a transaction."""
+
+    def __init__(self, store: Store, *, fail: bool = False) -> None:
+        self.store = store
+        self.fail = fail
+        self.calls: list[tuple[str, ApprovalStatus, bool]] = []
+
+    def __call__(self, approval: Approval) -> None:
+        self.calls.append((approval.id, approval.status, self.store.connection.in_transaction))
+        if self.fail:
+            raise Boom
+
+
+def test_create_records_inside_its_transaction(queue: ApprovalQueue, store: Store) -> None:
+    record = Recorder(store)
+    approval = queue.create(
+        customer_id="acme",
+        run_id="run-1",
+        requested_by="sam",
+        tool=TOOL,
+        action=Action.SEND,
+        args=ARGS,
+        risk_score=70,
+        rule_ids=[],
+        policy_version="sha256:0123456789abcdef",
+        ttl=TTL,
+        record=record,
+    )
+    assert record.calls == [(approval.id, ApprovalStatus.PENDING, True)]
+
+
+def test_create_whose_record_fails_leaves_no_row(queue: ApprovalQueue, store: Store) -> None:
+    with pytest.raises(Boom):
+        queue.create(
+            customer_id="acme",
+            run_id="run-1",
+            requested_by="sam",
+            tool=TOOL,
+            action=Action.SEND,
+            args=ARGS,
+            risk_score=70,
+            rule_ids=[],
+            policy_version="sha256:0123456789abcdef",
+            ttl=TTL,
+            record=Recorder(store, fail=True),
+        )
+    assert queue.list("acme") == []
+    assert not store.connection.in_transaction
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_decision_whose_record_fails_stays_pending(
+    queue: ApprovalQueue, store: Store, decision: str
+) -> None:
+    approval = _create(queue)
+    decide = queue.approve if decision == "approve" else queue.reject
+    with pytest.raises(Boom):
+        decide(approval.id, MANAGER, SETTINGS, "note", record=Recorder(store, fail=True))
+    stored = queue.get(approval.id)
+    assert stored is not None
+    assert (stored.status, stored.decided_by, stored.note) == (ApprovalStatus.PENDING, None, None)
+    # A retry with a working record goes through, and records the decided state.
+    record = Recorder(store)
+    decided = decide(approval.id, MANAGER, SETTINGS, "note", record=record)
+    assert record.calls == [(approval.id, decided.status, True)]
+    assert decided.status is not ApprovalStatus.PENDING
+
+
+def test_claim_whose_record_fails_stays_approved(queue: ApprovalQueue, store: Store) -> None:
+    approval = _approved(queue)
+    with pytest.raises(Boom):
+        queue.claim_for_execution(
+            approval.id,
+            customer_id="acme",
+            tool=TOOL,
+            action=Action.SEND,
+            args=ARGS,
+            record=Recorder(store, fail=True),
+        )
+    stored = queue.get(approval.id)
+    assert stored is not None
+    assert (stored.status, stored.executed_at) == (ApprovalStatus.APPROVED, None)
+    record = Recorder(store)
+    claimed = queue.claim_for_execution(
+        approval.id, customer_id="acme", tool=TOOL, action=Action.SEND, args=ARGS, record=record
+    )
+    assert claimed.status is ApprovalStatus.EXECUTED
+    assert record.calls == [(approval.id, ApprovalStatus.EXECUTED, True)]
+
+
+def test_record_is_not_called_for_a_refused_claim(queue: ApprovalQueue, store: Store) -> None:
+    approval = _approved(queue)
+    record = Recorder(store)
+    with pytest.raises(ApprovalError):
+        queue.claim_for_execution(
+            approval.id,
+            customer_id="acme",
+            tool=TOOL,
+            action=Action.SEND,
+            args={**ARGS, "subject": "Changed"},
+            record=record,
+        )
+    assert record.calls == []
+
+
+def test_expire_due_whose_record_fails_expires_nothing(
+    queue: ApprovalQueue, store: Store, clock: FixedClock
+) -> None:
+    first, second = _create(queue), _approved(queue)
+    clock.advance(TTL)
+    with pytest.raises(Boom):
+        queue.expire_due(record=Recorder(store, fail=True))
+    statuses = [queue.get(a.id).status for a in (first, second)]  # type: ignore[union-attr]
+    assert statuses == [ApprovalStatus.PENDING, ApprovalStatus.APPROVED]
+    record = Recorder(store)
+    assert [a.id for a in queue.expire_due(record=record)] == [first.id, second.id]
+    assert [(i, s) for i, s, _ in record.calls] == [
+        (first.id, ApprovalStatus.EXPIRED),
+        (second.id, ApprovalStatus.EXPIRED),
+    ]
+
+
+def test_expiry_found_by_approve_is_recorded_with_its_mark(
+    queue: ApprovalQueue, store: Store, clock: FixedClock
+) -> None:
+    approval = _create(queue)
+    clock.advance(TTL)
+    # The mark cannot be recorded: nothing is marked and the record's error propagates.
+    with pytest.raises(Boom):
+        queue.approve(approval.id, MANAGER, SETTINGS, expired=Recorder(store, fail=True))
+    assert queue.get(approval.id).status is ApprovalStatus.PENDING  # type: ignore[union-attr]
+    expired = Recorder(store)
+    decision = Recorder(store)
+    with pytest.raises(ApprovalError) as caught:
+        queue.approve(approval.id, MANAGER, SETTINGS, record=decision, expired=expired)
+    assert _reason(caught) is ApprovalErrorReason.EXPIRED
+    assert expired.calls == [(approval.id, ApprovalStatus.EXPIRED, True)]
+    assert decision.calls == []
+    assert queue.get(approval.id).status is ApprovalStatus.EXPIRED  # type: ignore[union-attr]
+
+
+def test_expiry_found_by_claim_is_recorded_with_its_mark(
+    queue: ApprovalQueue, store: Store, clock: FixedClock
+) -> None:
+    approval = _approved(queue)
+    clock.advance(TTL)
+    with pytest.raises(Boom):
+        queue.claim_for_execution(
+            approval.id,
+            customer_id="acme",
+            tool=TOOL,
+            action=Action.SEND,
+            args=ARGS,
+            expired=Recorder(store, fail=True),
+        )
+    assert queue.get(approval.id).status is ApprovalStatus.APPROVED  # type: ignore[union-attr]
+    expired = Recorder(store)
+    with pytest.raises(ApprovalError) as caught:
+        queue.claim_for_execution(
+            approval.id,
+            customer_id="acme",
+            tool=TOOL,
+            action=Action.SEND,
+            args=ARGS,
+            expired=expired,
+        )
+    assert _reason(caught) is ApprovalErrorReason.EXPIRED
+    assert expired.calls == [(approval.id, ApprovalStatus.EXPIRED, True)]
+    assert queue.get(approval.id).status is ApprovalStatus.EXPIRED  # type: ignore[union-attr]

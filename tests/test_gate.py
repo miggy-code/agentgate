@@ -936,6 +936,118 @@ def test_audit_failure_at_run_start_leaves_no_run(world: World) -> None:
     assert count == 0
 
 
+def status_of(world: World, approval_id: str) -> tuple[ApprovalStatus, str | None, bool]:
+    stored = world.gate.approvals.get(approval_id)
+    assert stored is not None
+    return stored.status, stored.decided_by, stored.executed_at is not None
+
+
+def test_audit_failure_on_an_approval_request_leaves_no_approval(world: World) -> None:
+    sink = FailingSink(EventKind.APPROVAL_REQUIRED)
+    gate = world.gate_with(sink=sink)
+    ctx = gate.start_run(KC, "kc-staff-nadine")
+    args = email_args(DIRECTORY_CUSTOMER)
+    with pytest.raises(OSError):
+        gate.call_tool(ctx, "email.send", Action.SEND, args)
+    assert gate.approvals.list(KC) == []
+    assert gate.ledger.run_calls(ctx.run_id) == 0
+    sink.kinds = frozenset()
+    approval = pending(gate.call_tool(ctx, "email.send", Action.SEND, args))
+    assert [a.id for a in gate.approvals.list(KC)] == [approval.approval_id]
+    assert sink.events[-1].kind is EventKind.APPROVAL_REQUIRED
+
+
+@pytest.mark.parametrize("kind", [EventKind.APPROVED, EventKind.REJECTED])
+def test_audit_failure_on_a_decision_leaves_it_pending(world: World, kind: EventKind) -> None:
+    sink = FailingSink()
+    gate = world.gate_with(sink=sink)
+    ctx = gate.start_run(KC, "kc-staff-nadine")
+    args = email_args(DIRECTORY_CUSTOMER)
+    approval_id = pending(gate.call_tool(ctx, "email.send", Action.SEND, args)).approval_id
+    decide = gate.approve if kind is EventKind.APPROVED else gate.reject
+    sink.kinds = frozenset({kind})
+    with pytest.raises(OSError):
+        decide(approval_id, "kc-mgr-terrence")
+    assert status_of(world, approval_id) == (ApprovalStatus.PENDING, None, False)
+    assert gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args) == Denied(
+        "not_approved"
+    )
+    sink.kinds = frozenset()
+    decide(approval_id, "kc-mgr-terrence")
+    assert [e.kind for e in sink.events if e.subject == approval_id][-1] is kind
+    outcome = gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args)
+    if kind is EventKind.APPROVED:
+        executed(outcome)
+        assert len(list_outbox(world.store)) == 1
+    else:
+        assert outcome == Denied("not_approved")
+        assert list_outbox(world.store) == []
+
+
+def test_audit_failure_at_execution_leaves_the_approval_usable(world: World) -> None:
+    sink = FailingSink()
+    gate = world.gate_with(sink=sink)
+    ctx = gate.start_run(KC, "kc-staff-nadine")
+    args = email_args(DIRECTORY_CUSTOMER)
+    approval_id = pending(gate.call_tool(ctx, "email.send", Action.SEND, args)).approval_id
+    gate.approve(approval_id, "kc-mgr-terrence")
+    sink.kinds = frozenset({EventKind.ALLOW})
+    outcome = gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args)
+    assert outcome == Denied("audit_unavailable")
+    assert status_of(world, approval_id) == (ApprovalStatus.APPROVED, "kc-mgr-terrence", False)
+    assert list_outbox(world.store) == []
+    assert gate.ledger.run_calls(ctx.run_id) == 0
+    sink.kinds = frozenset()
+    executed(gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args))
+    allow = [e for e in sink.events if e.kind is EventKind.ALLOW]
+    assert len(allow) == 1
+    assert allow[0].details == {"approved_by": "kc-mgr-terrence"}
+    assert status_of(world, approval_id) == (ApprovalStatus.EXECUTED, "kc-mgr-terrence", True)
+
+
+def test_audit_failure_on_expiry_expires_nothing(world: World) -> None:
+    sink = FailingSink()
+    gate = world.gate_with(sink=sink)
+    ctx = gate.start_run(KC, "kc-staff-nadine")
+    args = email_args(DIRECTORY_CUSTOMER)
+    first = pending(gate.call_tool(ctx, "email.send", Action.SEND, args)).approval_id
+    second = pending(email(world, ctx, OTHER_DIRECTORY_CUSTOMER)).approval_id
+    gate.approve(second, "kc-mgr-terrence")
+    world.clock.advance(timedelta(minutes=60))
+    sink.kinds = frozenset({EventKind.EXPIRED})
+    with pytest.raises(OSError):
+        gate.expire_due()
+    assert status_of(world, first)[0] is ApprovalStatus.PENDING
+    assert status_of(world, second)[0] is ApprovalStatus.APPROVED
+    # Found past expiry by a decision or an execution, the mark is refused the same way.
+    with pytest.raises(OSError):
+        gate.approve(first, "kc-mgr-terrence")
+    outcome = gate.execute_approved(
+        ctx, second, "email.send", Action.SEND, email_args(OTHER_DIRECTORY_CUSTOMER)
+    )
+    assert outcome == Denied("audit_unavailable")
+    assert status_of(world, first)[0] is ApprovalStatus.PENDING
+    assert status_of(world, second)[0] is ApprovalStatus.APPROVED
+    sink.kinds = frozenset()
+    assert [a.id for a in gate.expire_due()] == [first, second]
+    expired = [e.subject for e in sink.events if e.kind is EventKind.EXPIRED]
+    assert expired == [first, second]
+    assert list_outbox(world.store) == []
+
+
+def test_expiry_found_at_execution_is_recorded(world: World) -> None:
+    ctx = world.run("kc-mgr-marisol")
+    args = email_args(DIRECTORY_CUSTOMER)
+    approval_id = pending(world.gate.call_tool(ctx, "email.send", Action.SEND, args)).approval_id
+    world.gate.approve(approval_id, "kc-mgr-terrence")
+    world.clock.advance(timedelta(minutes=60))
+    outcome = world.gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args)
+    assert outcome == Denied("expired")
+    tail = [(e.kind, e.reason) for e in world.events() if e.subject == approval_id][-2:]
+    assert tail == [(EventKind.EXPIRED, "expired"), (EventKind.DENY, "expired")]
+    assert status_of(world, approval_id)[0] is ApprovalStatus.EXPIRED
+
+
 def test_tool_error_is_denied_and_released(world: World) -> None:
     def explode() -> None:
         raise RuntimeError("supplier said AGCANARY-000000000000")

@@ -21,6 +21,15 @@ it already knew:
   NOT_FOUND and WRONG_CUSTOMER separately (ids are unguessable, so this reveals nothing
   useful), but WRONG_CUSTOMER comes before any other check and before any write. Then the
   args hash, then executed, then expiry, then status.
+
+Every state change can be recorded in the same transaction that makes it. create, approve,
+reject, claim_for_execution and expire_due take an optional `record` hook, called with the
+changed approval after its row is written and before COMMIT; the three that can find an
+approval past its expiry and mark it EXPIRED on the way also take an `expired` hook for that
+mark. A hook that raises rolls the transaction back and its exception propagates, so the
+gate can make every change depend on its audit event: no approval exists, is decided, runs
+or expires without the event that records it. Without hooks the queue behaves the same and
+records nothing.
 """
 
 import builtins
@@ -30,7 +39,7 @@ import json
 import math
 import secrets
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -165,6 +174,10 @@ class Approval:
     executed_at: datetime | None
 
 
+# Called inside the transaction that changed an approval, with the approval as changed.
+type Recorder = Callable[[Approval], None]
+
+
 class ApprovalQueue:
     """Pending, decided and executed approvals for every customer, in the shared store."""
 
@@ -188,6 +201,7 @@ class ApprovalQueue:
         rule_ids: Sequence[str],
         policy_version: str,
         ttl: timedelta,
+        record: Recorder | None = None,
     ) -> Approval:
         if ttl <= timedelta(0):
             raise ValueError("approval ttl must be positive")
@@ -221,7 +235,9 @@ class ApprovalQueue:
                 ),
             )
             approval = self._load(approval_id)
-        assert approval is not None
+            assert approval is not None
+            if record is not None:
+                record(approval)
         return approval
 
     def get(self, approval_id: str) -> Approval | None:
@@ -238,8 +254,12 @@ class ApprovalQueue:
         approver: User,
         settings: ApprovalSettings,
         note: str | None = None,
+        record: Recorder | None = None,
+        expired: Recorder | None = None,
     ) -> Approval:
-        return self._decide(approval_id, approver, settings, note, ApprovalStatus.APPROVED)
+        return self._decide(
+            approval_id, approver, settings, note, ApprovalStatus.APPROVED, record, expired
+        )
 
     def reject(
         self,
@@ -247,8 +267,12 @@ class ApprovalQueue:
         approver: User,
         settings: ApprovalSettings,
         note: str | None = None,
+        record: Recorder | None = None,
+        expired: Recorder | None = None,
     ) -> Approval:
-        return self._decide(approval_id, approver, settings, note, ApprovalStatus.REJECTED)
+        return self._decide(
+            approval_id, approver, settings, note, ApprovalStatus.REJECTED, record, expired
+        )
 
     def claim_for_execution(
         self,
@@ -258,20 +282,28 @@ class ApprovalQueue:
         tool: str,
         action: Action,
         args: Mapping[str, JsonValue],
+        record: Recorder | None = None,
+        expired: Recorder | None = None,
     ) -> Approval:
         """Mark an approved approval EXECUTED and return it, exactly once.
 
         The caller passes the tool, action and args it is about to run, never the stored ones,
-        so any change since approval is caught here.
+        so any change since approval is caught here. If `record` raises, the approval stays
+        APPROVED and can still be claimed.
         """
         with self._store.transaction():
+            before = self._load(approval_id)
             outcome = self._claim(approval_id, customer_id, tool, action, args)
+            self._record_outcome(approval_id, before, outcome, record, expired)
         if isinstance(outcome, ApprovalError):
             raise outcome
         return outcome
 
-    def expire_due(self) -> builtins.list[Approval]:
-        """Mark every pending or approved approval past its expiry as EXPIRED and return them."""
+    def expire_due(self, record: Recorder | None = None) -> builtins.list[Approval]:
+        """Mark every pending or approved approval past its expiry as EXPIRED and return them.
+
+        `record` is called for each one; if it raises, none of them is marked.
+        """
         now = _ts(self._now())
         live = (ApprovalStatus.PENDING.value, ApprovalStatus.APPROVED.value)
         with self._store.transaction():
@@ -289,6 +321,8 @@ class ApprovalQueue:
                 self._set_status(approval_id, ApprovalStatus.EXPIRED)
                 approval = self._load(approval_id)
                 assert approval is not None
+                if record is not None:
+                    record(approval)
                 expired.append(approval)
         return expired
 
@@ -315,9 +349,13 @@ class ApprovalQueue:
         settings: ApprovalSettings,
         note: str | None,
         decision: ApprovalStatus,
+        record: Recorder | None,
+        expired: Recorder | None,
     ) -> Approval:
         with self._store.transaction():
+            before = self._load(approval_id)
             outcome = self._decide_locked(approval_id, approver, settings, note, decision)
+            self._record_outcome(approval_id, before, outcome, record, expired)
         if isinstance(outcome, ApprovalError):
             raise outcome
         return outcome
@@ -420,6 +458,30 @@ class ApprovalQueue:
         executed = self._load(approval_id)
         assert executed is not None
         return executed
+
+    def _record_outcome(
+        self,
+        approval_id: str,
+        before: Approval | None,
+        outcome: Approval | ApprovalError,
+        record: Recorder | None,
+        expired: Recorder | None,
+    ) -> None:
+        """Inside the transaction: record the change, or the EXPIRED mark an error made.
+
+        An error that marked a live approval EXPIRED on the way commits that mark, so the
+        mark is recorded with `expired` before COMMIT like any other change.
+        """
+        if not isinstance(outcome, ApprovalError):
+            if record is not None:
+                record(outcome)
+            return
+        live = (ApprovalStatus.PENDING, ApprovalStatus.APPROVED)
+        if expired is None or before is None or before.status not in live:
+            return
+        after = self._load(approval_id)
+        if after is not None and after.status is ApprovalStatus.EXPIRED:
+            expired(after)
 
     def _expire_if_due(self, approval: Approval) -> ApprovalError | None:
         """EXPIRED for an expired approval, marking a live one past its expiry on the way."""

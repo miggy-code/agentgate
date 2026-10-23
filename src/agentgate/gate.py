@@ -13,6 +13,12 @@ allow, an audit record and then the tool. If the allow cannot be
 recorded the tool does not run. Every outcome becomes at least one audit event carrying ids,
 labels, counts and reason codes, never document bodies, message text or argument values.
 
+Approval state changes follow the same rule as run starts: each one is recorded inside the
+transaction that makes it. An approval is created, approved, rejected, expired or claimed
+for execution only if its event (APPROVAL_REQUIRED, APPROVED, REJECTED, EXPIRED, or the
+ALLOW of the approved call) is recorded; if the sink refuses the event, the change is rolled
+back. A claim whose ALLOW cannot be recorded leaves the approval approved and unused.
+
 The run's max label is the most sensitive label of anything returned to the model so far.
 It only rises, and rules such as no-external-after-confidential read it, so reading a
 confidential document closes doors for the rest of the run, including for approvals granted
@@ -29,7 +35,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -340,6 +346,20 @@ class Gate:
         if verdict.effect is Effect.REQUIRE_APPROVAL:
             self._ledger.release(reservation)
             risk = self._risk(run, prepared)
+
+            def record_request(created: Approval) -> None:
+                self._emit(
+                    call,
+                    EventKind.APPROVAL_REQUIRED,
+                    verdict.reason,
+                    subject=created.id,
+                    rule_ids=verdict.rule_ids,
+                    policy_version=verdict.policy_version,
+                    decision=True,
+                    details={"risk_score": risk, "document_id": subject},
+                )
+
+            # A request the audit log cannot record raises here and leaves no approval.
             approval = self._approvals.create(
                 customer_id=run.ctx.customer_id,
                 run_id=run.ctx.run_id,
@@ -351,16 +371,7 @@ class Gate:
                 rule_ids=verdict.rule_ids,
                 policy_version=verdict.policy_version,
                 ttl=timedelta(minutes=run.policy.approvals.ttl_minutes),
-            )
-            self._emit(
-                call,
-                EventKind.APPROVAL_REQUIRED,
-                verdict.reason,
-                subject=approval.id,
-                rule_ids=verdict.rule_ids,
-                policy_version=verdict.policy_version,
-                decision=True,
-                details={"risk_score": risk, "document_id": subject},
+                record=record_request,
             )
             return PendingApproval(approval_id=approval.id, expires_at=approval.expires_at)
 
@@ -409,15 +420,26 @@ class Gate:
         reservation = self._reserve(run, call, prepared.config.cost_usd)
         if isinstance(reservation, CapReached):
             return reservation
+
+        def record_allow(claimed: Approval) -> None:
+            details: dict[str, JsonValue] = {"approved_by": claimed.decided_by}
+            self._record_allow(call, prepared, verdict, claimed.id, details)
+
         try:
-            # The args the caller is about to run, not the stored ones.
+            # The args the caller is about to run, not the stored ones. The ALLOW is
+            # recorded inside the claim, so an approval is consumed only once it is on record.
             self._approvals.claim_for_execution(
                 approval.id,
                 customer_id=run.ctx.customer_id,
                 tool=prepared.config.id,
                 action=prepared.action,
                 args=args,
+                record=_unrecorded_on_failure(record_allow),
+                expired=_unrecorded_on_failure(self._record_expired),
             )
+        except _Unrecorded:
+            self._ledger.release(reservation)
+            return Denied(GateReason.AUDIT_UNAVAILABLE.value)
         except ApprovalError as err:
             self._ledger.release(reservation)
             return self._deny(
@@ -434,7 +456,7 @@ class Gate:
             reservation,
             verdict,
             subject=approval.id,
-            details={"approved_by": approval.decided_by},
+            allow_recorded=True,
         )
 
     # Model spend
@@ -466,26 +488,28 @@ class Gate:
         return self._decide_approval(approval_id, approver_user_id, note, approve=False)
 
     def expire_due(self) -> list[Approval]:
-        expired = self._approvals.expire_due()
-        for approval in expired:
-            call = _Call(
-                time.perf_counter_ns(),
-                approval.customer_id,
-                user_id=approval.requested_by,
-                role=self._run_role(approval.run_id),
-                run_id=approval.run_id,
-                tool=approval.tool,
-                action=approval.action,
-                policy_version=approval.policy_version,
-            )
-            self._emit(
-                call,
-                EventKind.EXPIRED,
-                GateReason.EXPIRED,
-                subject=approval.id,
-                rule_ids=approval.rule_ids,
-            )
-        return expired
+        """Expire every approval past its expiry. If any EXPIRED event cannot be recorded,
+        none is expired and the sink's error propagates."""
+        return self._approvals.expire_due(record=self._record_expired)
+
+    def _record_expired(self, approval: Approval) -> None:
+        call = _Call(
+            time.perf_counter_ns(),
+            approval.customer_id,
+            user_id=approval.requested_by,
+            role=self._run_role(approval.run_id),
+            run_id=approval.run_id,
+            tool=approval.tool,
+            action=approval.action,
+            policy_version=approval.policy_version,
+        )
+        self._emit(
+            call,
+            EventKind.EXPIRED,
+            GateReason.EXPIRED,
+            subject=approval.id,
+            rule_ids=approval.rule_ids,
+        )
 
     def _decide_approval(
         self, approval_id: str, approver_user_id: str, note: str | None, *, approve: bool
@@ -515,35 +539,40 @@ class Gate:
         # The approver's own customer policy: for an approval of that customer this is the
         # approval's policy, and for any other the queue answers not_found.
         engine = self._engines.get(approver.customer_id)
+        kind = EventKind.APPROVED if approve else EventKind.REJECTED
+        reason = GateReason.APPROVED if approve else GateReason.REJECTED
+        decision_call = call
+
+        def record_decision(decided: Approval) -> None:
+            self._emit(
+                decision_call,
+                kind,
+                reason,
+                subject=decided.id,
+                rule_ids=decided.rule_ids,
+                decision=True,
+                details={
+                    "requested_by": decided.requested_by,
+                    "risk_score": decided.risk_score,
+                    "has_note": note is not None,
+                },
+            )
+
         try:
             if engine is None:
                 raise ApprovalError(
                     ApprovalErrorReason.APPROVER_NOT_ALLOWED, "approver's customer has no policy"
                 )
             settings = engine.bundle.policy.approvals
-            if approve:
-                decided = self._approvals.approve(approval_id, approver, settings, note)
-            else:
-                decided = self._approvals.reject(approval_id, approver, settings, note)
+            # The decision commits only if its event is recorded; a sink error propagates
+            # and leaves the approval as it was.
+            decide = self._approvals.approve if approve else self._approvals.reject
+            return decide(
+                approval_id, approver, settings, note, record_decision, self._record_expired
+            )
         except ApprovalError as err:
             self._emit(call, EventKind.DENY, err.reason.value, subject=safe_id, decision=True)
             raise
-        kind = EventKind.APPROVED if approve else EventKind.REJECTED
-        reason = GateReason.APPROVED if approve else GateReason.REJECTED
-        self._emit(
-            call,
-            kind,
-            reason,
-            subject=decided.id,
-            rule_ids=decided.rule_ids,
-            decision=True,
-            details={
-                "requested_by": decided.requested_by,
-                "risk_score": decided.risk_score,
-                "has_note": note is not None,
-            },
-        )
-        return decided
 
     # Steps
 
@@ -785,23 +814,16 @@ class Gate:
         verdict: _Verdict,
         *,
         subject: str | None,
-        details: dict[str, JsonValue] | None = None,
+        allow_recorded: bool = False,
     ) -> Outcome:
-        try:
-            # The allow is on record before anything happens, or nothing happens.
-            self._emit(
-                call,
-                EventKind.ALLOW,
-                verdict.reason,
-                subject=subject,
-                rule_ids=verdict.rule_ids,
-                policy_version=verdict.policy_version,
-                decision=True,
-                details=details,
-            )
-        except Exception:
-            self._ledger.release(reservation)
-            return Denied(GateReason.AUDIT_UNAVAILABLE.value)
+        """Record the allow, unless the caller already has, then run the tool."""
+        if not allow_recorded:
+            try:
+                # The allow is on record before anything happens, or nothing happens.
+                self._record_allow(call, prepared, verdict, subject, None)
+            except Exception:
+                self._ledger.release(reservation)
+                return Denied(GateReason.AUDIT_UNAVAILABLE.value)
 
         env = ToolEnv(store=self._store, index=self._index, clock=self._clock)
         result = self._run_adapter(call, prepared, env, run, reservation, subject)
@@ -815,6 +837,25 @@ class Gate:
         )
         return self._finish(
             run, call, prepared, reservation, result, [*labels, *result.returned_labels], subject
+        )
+
+    def _record_allow(
+        self,
+        call: _Call,
+        prepared: _Prepared,
+        verdict: _Verdict,
+        subject: str | None,
+        details: dict[str, JsonValue] | None,
+    ) -> None:
+        self._emit(
+            call,
+            EventKind.ALLOW,
+            verdict.reason,
+            subject=subject,
+            rule_ids=verdict.rule_ids,
+            policy_version=verdict.policy_version,
+            decision=True,
+            details=details,
         )
 
     def _search(self, run: _Run, call: _Call, prepared: _Prepared) -> Outcome:
@@ -1009,6 +1050,23 @@ class Gate:
                 details=details or {},
             )
         )
+
+
+class _Unrecorded(Exception):
+    """An audit event inside an approval transaction could not be recorded."""
+
+
+def _unrecorded_on_failure(record: Callable[[Approval], None]) -> Callable[[Approval], None]:
+    """The hook, with any failure to record turned into _Unrecorded, so the caller can tell
+    a sink error from the queue's own errors."""
+
+    def wrapped(approval: Approval) -> None:
+        try:
+            record(approval)
+        except Exception as exc:
+            raise _Unrecorded from exc
+
+    return wrapped
 
 
 def _bind(call: _Call, run: _Run) -> _Call:
