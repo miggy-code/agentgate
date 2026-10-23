@@ -169,7 +169,7 @@ task: Find the cold-chain shipping procedure.
   stop: cap_reached after 15 model calls
   cap: max_calls; model calls: 15
   calls counted: 30 of 30
-  spend so far: 0.153183 USD of the 0.40 USD run cap
+  spend so far: 0.153194 USD of the 0.40 USD run cap
 expected: the run stops at a cap with spend and calls within the policy caps
 ok
 

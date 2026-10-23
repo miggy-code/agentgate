@@ -13,7 +13,7 @@ which subject goes first. The sections:
    and query, without the gate's validation, audit and spend steps.
 5. A denied call through the gate: staff reading a restricted document.
 6. The allowed `docs.read` again, on a customer day that already holds many reservations,
-   because the customer-day spend check sums that day's reservations.
+   to show the customer-day spend check does not slow down as the day fills up.
 
 Added latency is the difference of the two medians (and of the two p95s), not a percentile
 of per-call differences. Percentiles are nearest-rank over the timed samples.

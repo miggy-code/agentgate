@@ -2,7 +2,7 @@
 # cost_usd is the per-call platform cost counted against the spend caps in policy.yaml.
 
 - id: docs.search
-  description: Search the company document store and return matching snippets.
+  description: Search the company document store and return the matching documents the user may read.
   actions: [read]
   base_risk: 0
   cost_usd: "0.0005"
@@ -14,7 +14,7 @@
   cost_usd: "0.0005"
 
 - id: notes.write
-  description: Write a note into the company knowledge base, attached to a document.
+  description: Write a new note into the company knowledge base.
   actions: [write]
   base_risk: 10
   cost_usd: "0.001"
