@@ -1,4 +1,4 @@
-.PHONY: install lint format type test policy check demo
+.PHONY: install lint format type test policy redteam bench check demo
 
 install:
 	uv sync
@@ -21,7 +21,13 @@ policy:
 	uv run agentgate policy lint
 	uv run agentgate policy test
 
-check: lint type test policy
+redteam:
+	uv run agentgate redteam
+
+bench:
+	uv run agentgate bench
+
+check: lint type test policy redteam
 
 demo:
 	uv run agentgate demo

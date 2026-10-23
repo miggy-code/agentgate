@@ -1,13 +1,15 @@
+import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 import agentgate
 from agentgate.audit.base import AuditEvent, EventKind
@@ -15,6 +17,8 @@ from agentgate.audit.panoptes import PanoptesSink
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.policy.schema import load_bundle
 from agentgate.policy.version import bundle_version
+from agentgate.redteam import core as redteam_core
+from agentgate.redteam.core import Arena, Category, RegisteredScenario, ScenarioFn
 from conftest import FIXTURES, POLICIES
 from test_policy_testing import CASES, case, write_fixtures, write_policies, write_tree
 
@@ -389,3 +393,225 @@ def test_agent_run_refuses_unknown_and_suspended_users(user_id: str, error: str)
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr == f"{DEMO_IDENTITY_NOTE}\n{error}\n"
+
+
+# red team
+
+
+def _staff_told_not_found(arena: Arena) -> None:
+    ctx = arena.start("kc-staff-nadine")
+    outcome = arena.call(ctx, "docs.read", {"document_id": "kc-payroll-summary"})
+    arena.expect_denied(outcome, "not_found")
+
+
+def _staff_reads_an_sop(arena: Arena) -> None:
+    ctx = arena.start("kc-staff-nadine")
+    arena.expect_executed(arena.call(ctx, "docs.read", {"document_id": "kc-dispatch-procedure"}))
+
+
+def _always_fails(arena: Arena) -> None:
+    arena.expect("the gate stopped it", False, "test-only failing scenario")
+
+
+TEST_SCENARIOS = {
+    "pe-990": (
+        Category.PRIVILEGE_ESCALATION,
+        "Test-only: staff told not_found",
+        _staff_told_not_found,
+    ),
+    "bn-990": (Category.BENIGN, "Test-only: staff reads an SOP", _staff_reads_an_sop),
+}
+FAILING = ("pe-991", Category.PRIVILEGE_ESCALATION, "Test-only: always fails", _always_fails)
+
+
+def _register(scenario_id: str, category: Category, title: str, fn: ScenarioFn) -> None:
+    redteam_core._REGISTRY[scenario_id] = RegisteredScenario(
+        id=scenario_id, category=category, title=title, fn=fn, module=__name__
+    )
+
+
+@pytest.fixture
+def scenarios(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
+    """Only test-only scenarios in the registry; the returned function adds a failing one.
+
+    Every real scenario module is imported first, so nothing registers into the test
+    registry later and the real suite, which other work keeps growing, does not run here.
+    """
+    redteam_core.all_scenarios()
+    monkeypatch.setattr(redteam_core, "_REGISTRY", {})
+    for scenario_id, (category, title, fn) in TEST_SCENARIOS.items():
+        _register(scenario_id, category, title, fn)
+    return lambda: _register(*FAILING)
+
+
+def _redteam(tmp_path: Path, *args: str) -> Result:
+    return runner.invoke(
+        app,
+        [
+            "redteam",
+            "--json",
+            str(tmp_path / "reports" / "redteam.json"),
+            "--md",
+            str(tmp_path / "reports" / "redteam.md"),
+            *WORLD_ARGS,
+            *args,
+        ],
+    )
+
+
+def test_redteam_passes(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    result = _redteam(tmp_path, "--baseline", str(tmp_path / "missing.json"))
+    assert result.exit_code == 0, result.output
+    assert "| privilege_escalation | 1 | 1 | 1/1 (100%) |" in result.stdout
+    assert "| **attacks total** | 1 | 1 | 1/1 (100%) |" in result.stdout
+    assert "Benign control rate: 1/1 (100%)." in result.stdout
+    assert "## Failures\n\nNone.\n" in result.stdout
+    assert result.stderr == (
+        f"warning: baseline {tmp_path / 'missing.json'} not found; baseline check skipped\n"
+    )
+    markdown = (tmp_path / "reports" / "redteam.md").read_text()
+    assert markdown in result.stdout
+    assert "- Command: `agentgate redteam --json " in markdown
+    data = json.loads((tmp_path / "reports" / "redteam.json").read_text())
+    assert data["summary"]["all_passed"] is True
+    assert [s["id"] for s in data["scenarios"]] == ["bn-990", "pe-990"]
+
+
+def test_redteam_fails_on_a_failing_scenario(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    scenarios()
+    result = _redteam(tmp_path, "--baseline", str(tmp_path / "missing.json"), "--verbose")
+    assert result.exit_code == 1, result.output
+    lines = result.stdout.splitlines()
+    assert "FAIL pe-991  Test-only: always fails" in lines
+    assert "       check failed: the gate stopped it: test-only failing scenario" in lines
+    assert "ok   pe-990  Test-only: staff told not_found" in lines
+    assert "| privilege_escalation | 2 | 1 | 1/2 (50.0%) |" in lines
+    assert "- `pe-991` (privilege_escalation) Test-only: always fails" in lines
+    assert "  - failed checks: the gate stopped it" in lines
+    data = json.loads((tmp_path / "reports" / "redteam.json").read_text())
+    assert data["summary"]["all_passed"] is False
+
+
+def test_redteam_category_filter(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    scenarios()
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"format": 1, "categories": {"privilege_escalation": ["pe-989"]}})
+    )
+    result = _redteam(tmp_path, "--category", "benign_control", "--baseline", str(baseline))
+    # The failing attack and the missing attack baseline entry are outside the selection.
+    assert result.exit_code == 0, result.output
+    assert "| benign_control | 1 | 1 | 1/1 (100%) |" in result.stdout
+    assert "privilege_escalation" not in result.stdout
+    assert f"baseline {baseline}: 0 problems" in result.stdout
+
+
+def test_redteam_baseline_problems(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "categories": {
+                    "privilege_escalation": ["pe-989", "pe-990"],
+                    "benign_control": ["bn-990"],
+                },
+            }
+        )
+    )
+    result = _redteam(tmp_path, "--baseline", str(baseline))
+    assert result.exit_code == 1, result.output
+    assert result.stdout.splitlines()[-2:] == [
+        "BASELINE pe-989 (privilege_escalation) is in the baseline but did not run:"
+        " deleted or renamed",
+        f"baseline {baseline}: 1 problems",
+    ]
+
+
+def test_redteam_malformed_baseline(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text("[]")
+    result = _redteam(tmp_path, "--baseline", str(baseline))
+    assert result.exit_code == 1
+    assert result.stderr == f"error: {baseline}: not a format 1 red-team baseline\n"
+
+
+def test_redteam_write_baseline_then_check(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    baseline = tmp_path / "redteam" / "baseline.json"
+    written = _redteam(tmp_path, "--baseline", str(baseline), "--write-baseline")
+    assert written.exit_code == 0, written.output
+    assert written.stdout.splitlines()[-1] == f"baseline written: {baseline}  2 scenarios"
+    assert json.loads(baseline.read_text())["categories"] == {
+        "privilege_escalation": ["pe-990"],
+        "benign_control": ["bn-990"],
+    }
+    checked = _redteam(tmp_path, "--baseline", str(baseline))
+    assert checked.exit_code == 0, checked.output
+    assert checked.stdout.splitlines()[-1] == f"baseline {baseline}: 0 problems"
+
+    # A renamed scenario is caught; writing again records the change and says what moved.
+    del redteam_core._REGISTRY["bn-990"]
+    _register("bn-991", Category.BENIGN, "Test-only: renamed", _staff_reads_an_sop)
+    renamed = _redteam(tmp_path, "--baseline", str(baseline))
+    assert renamed.exit_code == 1
+    assert "BASELINE bn-990 (benign_control) is in the baseline but did not run" in renamed.stdout
+    rewritten = _redteam(tmp_path, "--baseline", str(baseline), "--write-baseline")
+    assert rewritten.exit_code == 0, rewritten.output
+    assert rewritten.stdout.splitlines()[-3:] == [
+        "baseline added: bn-991",
+        "baseline removed: bn-990",
+        f"baseline written: {baseline}  2 scenarios",
+    ]
+
+
+def test_redteam_write_baseline_refuses_on_failure(
+    tmp_path: Path, scenarios: Callable[[], None]
+) -> None:
+    scenarios()
+    baseline = tmp_path / "baseline.json"
+    result = _redteam(tmp_path, "--baseline", str(baseline), "--write-baseline")
+    assert result.exit_code == 1
+    assert result.stderr == f"error: refusing to write {baseline}: 1 scenarios failed\n"
+    assert not baseline.exists()
+    # The reports are still written, so the failure can be read.
+    assert (tmp_path / "reports" / "redteam.json").is_file()
+
+
+def test_redteam_write_baseline_needs_the_whole_suite(
+    tmp_path: Path, scenarios: Callable[[], None]
+) -> None:
+    result = _redteam(tmp_path, "--category", "benign_control", "--write-baseline")
+    assert result.exit_code == 1
+    assert result.stderr == "error: --write-baseline needs the whole suite; drop --category\n"
+    assert result.stdout == ""
+
+
+# bench
+
+
+def test_bench_writes_both_reports(tmp_path: Path) -> None:
+    json_path, md_path = tmp_path / "bench.json", tmp_path / "bench.md"
+    result = runner.invoke(
+        app,
+        [
+            "bench",
+            "--iterations",
+            "20",
+            "--warmup",
+            "2",
+            "--busy-day",
+            "10",
+            "--json",
+            str(json_path),
+            "--md",
+            str(md_path),
+            *WORLD_ARGS,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    markdown = md_path.read_text()
+    assert markdown in result.stdout
+    assert "- Command: `agentgate bench --iterations 20 --warmup 2 --busy-day 10 " in markdown
+    data = json.loads(json_path.read_text())
+    assert data["settings"]["iterations"] == 20
+    assert len(data["sections"]) == 6
