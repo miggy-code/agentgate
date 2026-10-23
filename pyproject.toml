@@ -24,8 +24,14 @@ agentgate = "agentgate.cli:main"
 [project.urls]
 Repository = "https://github.com/miggy-code/agentgate"
 
+[project.optional-dependencies]
+anthropic = [
+    "anthropic>=1.0,<2",
+]
+
 [dependency-groups]
 dev = [
+    "anthropic>=1.0,<2",
     "mypy>=1.13,<2",
     "pytest>=8,<9",
     "ruff>=0.8,<1",
