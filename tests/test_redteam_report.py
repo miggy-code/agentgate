@@ -1,5 +1,6 @@
 """Red-team report formatting, run metadata and the baseline check."""
 
+import dataclasses
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from agentgate.redteam.baseline import (
 )
 from agentgate.redteam.core import Category, Check, ScenarioResult, SuiteResult
 from agentgate.redteam.report import (
+    IN_PROCESS_NOTE,
     RunMeta,
     collect_meta,
     format_rate,
@@ -27,6 +29,7 @@ from agentgate.redteam.report import (
     to_json,
     to_markdown,
 )
+from agentgate.redteam.transport import Transport
 from conftest import ROOT
 
 META = RunMeta(
@@ -370,3 +373,130 @@ def test_repository_baseline_is_well_formed() -> None:
     assert baseline.ids
     for category, ids in baseline.scenarios.items():
         assert all(i.startswith(category.prefix + "-") for i in ids)
+
+
+# Transports
+
+
+def over_mcp(
+    base: SuiteResult, calls: dict[str, tuple[int, int, tuple[tuple[str, int], ...]]]
+) -> SuiteResult:
+    """The suite as an mcp run, with (mcp, direct, direct by reason) calls per scenario id."""
+    results = tuple(
+        dataclasses.replace(r, mcp_calls=m, direct_calls=d, direct_by_reason=reasons)
+        for r in base.results
+        for m, d, reasons in [calls.get(r.id, (0, 0, ()))]
+    )
+    return dataclasses.replace(base, results=results, transport=Transport.MCP)
+
+
+MCP_PASSING = over_mcp(
+    PASSING,
+    {
+        "xt-001": (4, 1, (("forged_context", 1),)),
+        "xt-002": (0, 2, (("action_override", 2),)),
+        "pe-001": (3, 0, ()),
+        "bn-001": (5, 0, ()),
+        "bn-002": (2, 0, ()),
+    },
+)
+
+
+def test_the_header_names_the_transport() -> None:
+    gate = to_markdown(PASSING, META)
+    assert gate.startswith("# agentgate red-team report (transport: gate)\n")
+    assert "- Transport: `gate`, every call goes to the gate in-process" in gate
+    assert "## MCP transport" not in gate
+    assert "calls over MCP" not in gate
+    mcp = to_markdown(MCP_PASSING, META)
+    assert mcp.startswith("# agentgate red-team report (transport: mcp)\n")
+    assert (
+        "- Transport: `mcp`, agent-side tool calls go through an MCP client session to the"
+        " gateway" in mcp
+    )
+
+
+def test_mcp_markdown_counts_calls_and_coverage() -> None:
+    markdown = to_markdown(MCP_PASSING, META)
+    section = markdown.split("## MCP transport\n\n", 1)[1].split("## Failures", 1)[0]
+    lines = section.splitlines()
+    assert lines[0] == "calls over MCP: 14, direct: 3"
+    assert lines[2].startswith("Direct calls by reason: action_override 2, forged_context 1.")
+    assert [line for line in lines if line.startswith("|")] == [
+        "| Category | Scenarios | With an MCP call | Calls over MCP | Direct calls |",
+        "| --- | ---: | ---: | ---: | ---: |",
+        "| cross_tenant | 2 | 1 | 4 | 3 |",
+        "| privilege_escalation | 1 | 1 | 3 | 0 |",
+        "| benign_control | 2 | 2 | 7 | 0 |",
+    ]
+    assert IN_PROCESS_NOTE in section
+    # The pass-rate table is unchanged, and failures still come last.
+    assert table(to_markdown(PASSING, META)) == table(markdown)[:6]
+    assert markdown.endswith("## Failures\n\nNone.\n")
+
+
+def test_mcp_json_counts_calls_per_scenario_and_category() -> None:
+    data = to_json(MCP_PASSING, META)
+    assert json.loads(json.dumps(data)) == data
+    assert data["transport"] == "mcp"
+    assert data["mcp"] == {
+        "calls_over_mcp": 14,
+        "direct_calls": 3,
+        "direct_by_reason": {"action_override": 2, "forged_context": 1},
+        "categories": [
+            {
+                "category": "cross_tenant",
+                "scenarios": 2,
+                "with_mcp_call": 1,
+                "mcp_calls": 4,
+                "direct_calls": 3,
+            },
+            {
+                "category": "privilege_escalation",
+                "scenarios": 1,
+                "with_mcp_call": 1,
+                "mcp_calls": 3,
+                "direct_calls": 0,
+            },
+            {
+                "category": "benign_control",
+                "scenarios": 2,
+                "with_mcp_call": 2,
+                "mcp_calls": 7,
+                "direct_calls": 0,
+            },
+        ],
+        "in_process": IN_PROCESS_NOTE,
+    }
+    scenarios = data["scenarios"]
+    assert isinstance(scenarios, list)
+    by_id = {s["id"]: s for s in scenarios if isinstance(s, dict)}
+    assert by_id["xt-002"]["calls"] == {
+        "mcp": 0,
+        "direct": 2,
+        "direct_by_reason": {"action_override": 2},
+    }
+    gate = to_json(PASSING, META)
+    assert gate["transport"] == "gate"
+    assert "mcp" not in gate
+    assert all("calls" not in s for s in gate["scenarios"] if isinstance(s, dict))
+
+
+def test_the_baseline_applies_to_the_mcp_transport() -> None:
+    assert check_against_baseline(MCP_PASSING, BASELINE) == []
+    assert baseline_from(MCP_PASSING) == BASELINE
+    results = [r for r in MCP_PASSING.results if r.id != "pe-001"]
+    failing = dataclasses.replace(
+        suite(*results, result("pe-001", Category.PRIVILEGE_ESCALATION, passed=False)),
+        transport=Transport.MCP,
+    )
+    missing = dataclasses.replace(
+        suite(*(r for r in PASSING.results if r.id != "xt-002")), transport=Transport.MCP
+    )
+    assert check_against_baseline(failing, BASELINE) == [
+        "pe-001 (privilege_escalation) is in the baseline and failed (transport mcp)"
+    ]
+    assert check_against_baseline(missing, BASELINE) == [
+        "xt-002 (cross_tenant) is in the baseline but did not run: deleted or renamed"
+        " (transport mcp)"
+    ]

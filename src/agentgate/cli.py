@@ -44,6 +44,7 @@ from agentgate.redteam.baseline import (
     write_baseline,
 )
 from agentgate.redteam.core import Category, SuiteResult, run_suite
+from agentgate.redteam.transport import Transport
 from agentgate.tools.builtin import default_tools
 from agentgate.world import (
     DEFAULT_AUDIT_DB,
@@ -539,6 +540,11 @@ def gateway_serve(
 
 DEFAULT_REDTEAM_JSON = Path("reports/redteam.json")
 DEFAULT_REDTEAM_MD = Path("reports/redteam.md")
+# Where a run over each transport writes its reports unless --json and --md say otherwise.
+REDTEAM_REPORTS: dict[Transport, tuple[Path, Path]] = {
+    Transport.GATE: (DEFAULT_REDTEAM_JSON, DEFAULT_REDTEAM_MD),
+    Transport.MCP: (Path("reports/redteam-mcp.json"), Path("reports/redteam-mcp.md")),
+}
 DEFAULT_BENCH_JSON = Path("reports/bench.json")
 DEFAULT_BENCH_MD = Path("reports/bench.md")
 JsonOption = Annotated[Path, typer.Option("--json", help="Write the JSON report here.")]
@@ -592,8 +598,34 @@ def redteam(
         list[Category] | None,
         typer.Option("--category", help="Only this category; repeat for more."),
     ] = None,
-    json_path: JsonOption = DEFAULT_REDTEAM_JSON,
-    md_path: MdOption = DEFAULT_REDTEAM_MD,
+    transport: Annotated[
+        Transport,
+        typer.Option(
+            "--transport",
+            help=(
+                "gate: call the gate in-process. mcp: send every agent-side tool call through"
+                " an MCP client session to the gateway."
+            ),
+        ),
+    ] = Transport.GATE,
+    json_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--json",
+            help="Write the JSON report here. (default: reports/redteam.json, or"
+            " reports/redteam-mcp.json with --transport mcp)",
+            show_default=False,
+        ),
+    ] = None,
+    md_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--md",
+            help="Write the markdown report here. (default: reports/redteam.md, or"
+            " reports/redteam-mcp.md with --transport mcp)",
+            show_default=False,
+        ),
+    ] = None,
     baseline: Annotated[
         Path, typer.Option("--baseline", help="Scenarios that must exist and pass.")
     ] = DEFAULT_BASELINE,
@@ -611,22 +643,31 @@ def redteam(
     fixtures: FixturesOption = DEFAULT_FIXTURES,
 ) -> None:
     """Run the red-team suite. Exits 1 if any scenario failed or the baseline check found
-    problems."""
+    problems. The baseline applies to both transports."""
     if write and category:
         _fail("--write-baseline needs the whole suite; drop --category")
+    default_json, default_md = REDTEAM_REPORTS[transport]
     command = _command(
         "redteam",
         ("--category", [c.value for c in category or []], []),
-        ("--json", json_path, DEFAULT_REDTEAM_JSON),
-        ("--md", md_path, DEFAULT_REDTEAM_MD),
+        ("--transport", transport.value, Transport.GATE.value),
+        ("--json", json_path, None),
+        ("--md", md_path, None),
         ("--baseline", baseline, DEFAULT_BASELINE),
         ("--write-baseline", write, False),
         ("--verbose", verbose, False),
         ("--policies", policies, DEFAULT_POLICIES),
         ("--fixtures", fixtures, DEFAULT_FIXTURES),
     )
+    json_path = default_json if json_path is None else json_path
+    md_path = default_md if md_path is None else md_path
     try:
-        result = run_suite(categories=category or None, policies=policies, fixtures=fixtures)
+        result = run_suite(
+            categories=category or None,
+            policies=policies,
+            fixtures=fixtures,
+            transport=transport,
+        )
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         _fail(str(exc))
     meta = redteam_report.collect_meta(command)

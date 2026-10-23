@@ -9,6 +9,12 @@ decimal place, truncated rather than rounded, so 1999/2000 reads 99.9% and a rat
 shown higher than it was. The attack total covers every category except benign_control,
 whose rate is printed on its own line: it measures how often the gate gets out of the way,
 not how often it stops an attack.
+
+The header names the transport the suite ran over (agentgate.redteam.transport). A report of
+an `mcp` run adds what a pass rate alone would hide: how many agent-side calls went over MCP
+and how many went to the gate directly, why, and per category how many scenarios made at
+least one call over MCP, so a 100% under `mcp` cannot rest on scenarios that never touched
+it. Model spend, run starts and approval decisions are in-process under both transports.
 """
 
 import os
@@ -22,9 +28,15 @@ from pydantic import JsonValue
 
 import agentgate
 from agentgate.redteam.core import Category, ScenarioResult, SuiteResult
+from agentgate.redteam.transport import Transport
 
 _GIT_TIMEOUT_SECONDS = 5
 UNKNOWN_COMMIT = "unknown"
+IN_PROCESS_NOTE = (
+    "Model spend (charge_model and settle_model), run starts and approval decisions stay"
+    " in-process: MCP carries tool calls only, a gateway's identity is bound at launch and"
+    " approvals are decided out of band."
+)
 
 
 @dataclass(frozen=True)
@@ -146,8 +158,9 @@ def _ordered_totals(result: SuiteResult) -> list[tuple[Category, int, int]]:
     ]
 
 
-def scenario_json(result: ScenarioResult) -> dict[str, JsonValue]:
-    return {
+def scenario_json(result: ScenarioResult, *, calls: bool = False) -> dict[str, JsonValue]:
+    """One scenario; with `calls`, also its calls over MCP and direct, for an mcp run."""
+    data: dict[str, JsonValue] = {
         "id": result.id,
         "category": result.category.value,
         "title": result.title,
@@ -155,6 +168,46 @@ def scenario_json(result: ScenarioResult) -> dict[str, JsonValue]:
         "checks": [{"name": check.name, "passed": check.passed} for check in result.checks],
         "leaks": list(result.leaks),
         "error": result.error,
+    }
+    if calls:
+        data["calls"] = {
+            "mcp": result.mcp_calls,
+            "direct": result.direct_calls,
+            "direct_by_reason": dict(result.direct_by_reason),
+        }
+    return data
+
+
+def mcp_category_rows(result: SuiteResult) -> list[tuple[Category, int, int, int, int]]:
+    """(category, scenarios with an MCP call, scenarios, MCP calls, direct calls) per
+    category that ran, in Category order."""
+    rows: list[tuple[Category, int, int, int, int]] = []
+    for category, (reached, total) in result.mcp_coverage().items():
+        of_category = [r for r in result.results if r.category is category]
+        mcp = sum(r.mcp_calls for r in of_category)
+        direct = sum(r.direct_calls for r in of_category)
+        rows.append((category, reached, total, mcp, direct))
+    return rows
+
+
+def mcp_json(result: SuiteResult) -> dict[str, JsonValue]:
+    categories: list[JsonValue] = [
+        {
+            "category": category.value,
+            "scenarios": total,
+            "with_mcp_call": reached,
+            "mcp_calls": mcp,
+            "direct_calls": direct,
+        }
+        for category, reached, total, mcp, direct in mcp_category_rows(result)
+    ]
+    by_reason: dict[str, JsonValue] = dict(result.direct_by_reason())
+    return {
+        "calls_over_mcp": result.mcp_calls,
+        "direct_calls": result.direct_calls,
+        "direct_by_reason": by_reason,
+        "categories": categories,
+        "in_process": IN_PROCESS_NOTE,
     }
 
 
@@ -165,8 +218,10 @@ def to_json(result: SuiteResult, meta: RunMeta) -> dict[str, JsonValue]:
         {"category": category.value, "scenarios": total, "passed": passed}
         for category, passed, total in _ordered_totals(result)
     ]
-    return {
+    mcp = result.transport is Transport.MCP
+    data: dict[str, JsonValue] = {
         "meta": meta.to_json(),
+        "transport": result.transport.value,
         "summary": {
             "all_passed": result.all_passed,
             "scenarios": result.total,
@@ -179,14 +234,22 @@ def to_json(result: SuiteResult, meta: RunMeta) -> dict[str, JsonValue]:
             },
             "categories": categories,
         },
-        "scenarios": [scenario_json(r) for r in result.results],
+        "scenarios": [scenario_json(r, calls=mcp) for r in result.results],
     }
+    if mcp:
+        data["mcp"] = mcp_json(result)
+    return data
+
+
+def transport_line(result: SuiteResult) -> str:
+    return f"- Transport: `{result.transport.value}`, {result.transport.description}"
 
 
 def to_markdown(result: SuiteResult, meta: RunMeta) -> str:
     attacks_passed, attacks_total = attack_totals(result)
     benign_passed, benign_total = benign_totals(result)
-    lines = ["# agentgate red-team report", "", *meta.lines(), ""]
+    title = f"# agentgate red-team report (transport: {result.transport.value})"
+    lines = [title, "", *meta.lines(), transport_line(result), ""]
     lines += [
         "| Category | Scenarios | Passed | Pass rate |",
         "| --- | ---: | ---: | ---: |",
@@ -215,8 +278,31 @@ def to_markdown(result: SuiteResult, meta: RunMeta) -> str:
         lines.append("Benign control rate: no benign scenarios ran.")
     lines += ["", "A scenario passes only when it ran to the end, recorded at least one check,"]
     lines += ["every check passed and the leak detector found nothing.", ""]
+    if result.transport is Transport.MCP:
+        lines += mcp_lines(result)
     lines += failure_lines(result)
     return "\n".join(lines) + "\n"
+
+
+def mcp_lines(result: SuiteResult) -> list[str]:
+    """The MCP section of an mcp run: calls over MCP and direct, and coverage per category."""
+    reasons = ", ".join(f"{reason} {n}" for reason, n in result.direct_by_reason().items())
+    lines = [
+        "## MCP transport",
+        "",
+        f"calls over MCP: {result.mcp_calls}, direct: {result.direct_calls}",
+        "",
+        f"Direct calls by reason: {reasons or 'none'}. An agent-side call goes to the gate"
+        " directly only when MCP cannot express it: a forged context (an MCP client cannot"
+        " pass one), an action the tool does not have, or a run the gateway will not launch"
+        " for.",
+        "",
+        "| Category | Scenarios | With an MCP call | Calls over MCP | Direct calls |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for category, reached, total, mcp, direct in mcp_category_rows(result):
+        lines.append(f"| {category.value} | {total} | {reached} | {mcp} | {direct} |")
+    return [*lines, "", IN_PROCESS_NOTE, ""]
 
 
 def failure_lines(result: SuiteResult) -> list[str]:

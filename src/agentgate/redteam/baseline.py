@@ -5,6 +5,8 @@ when the baseline was written (`agentgate redteam --write-baseline`, which refus
 scenario fails). A later run is checked against it: a baseline scenario that did not run
 (deleted or renamed), a baseline scenario that failed and a new scenario that failed are
 problems. New scenarios that pass are fine; write the baseline again to make them required.
+The same baseline applies to every transport: a run over `mcp` must have the same scenarios
+and pass them, and its problems name the transport.
 
 The file holds no timestamp or commit, so it changes only when the set of scenarios does.
 """
@@ -17,6 +19,7 @@ from pathlib import Path
 from pydantic import JsonValue
 
 from agentgate.redteam.core import Category, SuiteResult
+from agentgate.redteam.transport import Transport
 
 DEFAULT_BASELINE = Path("redteam/baseline.json")
 BASELINE_FORMAT = 1
@@ -103,7 +106,8 @@ def check_against_baseline(
     """Problems with this run against the baseline, or an empty list.
 
     With categories, only the baseline's entries for those categories must have run, for a
-    run limited with --category.
+    run limited with --category. Problems of a run over any transport but `gate` end with
+    the transport, as `(transport mcp)`.
     """
     wanted = None if categories is None else {Category(c) for c in categories}
     by_id = {r.id: r for r in result.results}
@@ -124,4 +128,6 @@ def check_against_baseline(
     for r in result.results:
         if r.id not in required and not r.passed:
             problems.append(f"{r.id} ({r.category.value}) is new and failed")
+    if result.transport is not Transport.GATE:
+        return [f"{problem} (transport {result.transport.value})" for problem in problems]
     return problems

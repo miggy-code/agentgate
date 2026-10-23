@@ -40,19 +40,44 @@ Results are deterministic: the same code gives equal ScenarioResults on every ru
 names and details, and leak strings, must not carry random values (run, approval, email or
 note ids, timestamps from the system clock, latencies). The expect* helpers and the leak
 detector keep to this; a scenario writing its own details must too.
+
+Transports (agentgate.redteam.transport). Under `gate`, the default, the arena calls the gate
+in-process. Under `mcp`, the agent-side paths go through a real MCP client session connected
+to a gateway built for the run: `call`, `execute` (the gateway's approvals_execute tool) and
+the tool calls of `run` (the agent loop is handed a gate whose call_tool goes over the
+session). The outcome a scenario gets back is parsed from what the gateway sent the client.
+Everything that is not agent-side stays in-process under both transports: run starts (a
+gateway's identity is bound at launch), approvals and rejections (decided out of band, as
+the CLI does), model spend (charge_model and settle_model, which MCP cannot carry), and the
+scenario's own reads of the store, the ledger and the audit sink.
+
+Under `mcp` some agent-side calls cannot be expressed over MCP and go to the gate directly,
+counted by reason (transport.Direct): a context the arena did not start (an MCP client
+cannot pass a context at all), an action the tool does not have (the gateway takes the
+action from its own tool list), and a run whose customer has no policy (the gateway refuses
+to launch for it). Each ScenarioResult counts its calls over MCP and its direct calls, so a
+pass rate under `mcp` shows how much of it went over MCP.
+
+`regate` under `mcp` closes the open sessions, as restarting the gateways with the new
+configuration would; the next call of a run opens a new session to a gateway over the new
+gate. When the gateway fails a call with an MCP error and the arena's audit sink refused an
+event during that call (the arena broke it on purpose), the arena raises AuditDown, which is
+what the host sees in-process; any other MCP error is raised as GatewayCallError.
 """
 
 import importlib
 import json
 import pkgutil
 import re
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 from pydantic import JsonValue
 
@@ -72,9 +97,19 @@ from agentgate.gate import (
     Outcome,
     PendingApproval,
 )
+from agentgate.gateway.server import build_gateway
 from agentgate.models import Action, Document, Role, UserStatus
 from agentgate.policy.engine import PolicyEngine
 from agentgate.redteam.leaks import Exposure, find_leaks
+from agentgate.redteam.transport import (
+    Direct,
+    GatewayCallError,
+    GatewaySession,
+    GatewaySessions,
+    McpReply,
+    Transport,
+)
+from agentgate.spend import Reservation
 from agentgate.store import Store
 from agentgate.tools.base import ToolAdapter
 from agentgate.tools.builtin import (
@@ -140,6 +175,11 @@ class ScenarioResult:
     leaks: tuple[str, ...]
     # The exception type name when the scenario or the leak detector raised, else None.
     error: str | None
+    # Agent-side calls (call, execute and the tool calls of run) that went over MCP, and
+    # those that went to the gate directly, with why, sorted by reason.
+    mcp_calls: int = 0
+    direct_calls: int = 0
+    direct_by_reason: tuple[tuple[str, int], ...] = ()
 
 
 ScenarioFn = Callable[["Arena"], None]
@@ -237,19 +277,46 @@ class ArenaSink(MemorySink):
     def __init__(self) -> None:
         super().__init__()
         self.refuse: Callable[[AuditEvent], bool] | None = None
+        # How many events it has refused so far.
+        self.refused = 0
 
     def record(self, event: AuditEvent) -> None:
         if self.refuse is not None and self.refuse(event):
+            self.refused += 1
             raise AuditDown("audit sink unavailable")
         super().record(event)
+
+
+class _GatewayRoutedGate:
+    """What the agent loop is handed under `mcp`: model spend goes to the arena's current
+    gate in-process, tool calls go through the arena's MCP routing."""
+
+    def __init__(self, arena: "Arena") -> None:
+        self._arena = arena
+
+    def charge_model(self, ctx: RunContext, estimated_usd: Decimal) -> Reservation | CapReached:
+        return self._arena.gate.charge_model(ctx, estimated_usd)
+
+    def settle_model(self, ctx: RunContext, reservation: Reservation, actual_usd: Decimal) -> None:
+        self._arena.gate.settle_model(ctx, reservation, actual_usd)
+
+    def call_tool(
+        self, ctx: RunContext, tool: str, action: Action | str, args: Mapping[str, JsonValue]
+    ) -> Outcome:
+        return self._arena._route_call(ctx, tool, action, dict(args), loop=True)
 
 
 class Arena:
     """A fresh world for one scenario, and the moves and assertions a scenario makes."""
 
     def __init__(
-        self, *, policies: Path = DEFAULT_POLICIES, fixtures: Path = DEFAULT_FIXTURES
+        self,
+        *,
+        policies: Path = DEFAULT_POLICIES,
+        fixtures: Path = DEFAULT_FIXTURES,
+        transport: Transport = Transport.GATE,
     ) -> None:
+        self.transport = Transport(transport)
         self.clock = FixedClock(REDTEAM_START)
         self.sink = ArenaSink()
         self.world: World = open_memory_world(
@@ -268,9 +335,19 @@ class Arena:
             customer = self.store.get_customer(customer_id)
             if customer is not None:
                 self._reference[customer_id] = PolicyEngine(engine.bundle, customer)
+        # Contexts the arena started; only these can be bound to a gateway.
+        self._issued: list[RunContext] = []
+        # Runs the gateway refused to launch for, under the current gate.
+        self._refused: set[str] = set()
+        self._sessions = GatewaySessions()
+        self.mcp_calls = 0
+        self.direct_calls: Counter[Direct] = Counter()
 
     def close(self) -> None:
-        self.world.close()
+        try:
+            self._sessions.close()
+        finally:
+            self.world.close()
 
     def __enter__(self) -> Self:
         return self
@@ -298,7 +375,7 @@ class Arena:
 
     def start(self, user_id: str) -> RunContext:
         """A run for the user in their own customer. Raises IdentityError if refused."""
-        return self.gate.start_run(self.customer_of(user_id), user_id)
+        return self._issue(self.gate.start_run(self.customer_of(user_id), user_id))
 
     def try_start(self, user_id: str, customer_id: str | None = None) -> RunContext | IdentityError:
         """A run, or the IdentityError the gate refused it with. The customer defaults to the
@@ -307,7 +384,7 @@ class Arena:
             user = self.store.get_user(user_id)
             customer_id = UNKNOWN_CUSTOMER if user is None else user.customer_id
         try:
-            return self.gate.start_run(customer_id, user_id)
+            return self._issue(self.gate.start_run(customer_id, user_id))
         except IdentityError as err:
             return err
 
@@ -320,10 +397,17 @@ class Arena:
     def run(
         self, ctx: RunContext, model: Model, task: str, *, max_steps: int = 12
     ) -> AgentTranscript:
-        """Run the reference agent loop. Everything the model saw and wrote is scanned."""
+        """Run the reference agent loop. Everything the model saw and wrote is scanned.
+
+        Under `mcp` the loop's tool calls go through the run's MCP session; its model spend
+        stays in-process."""
         customer = self.store.get_customer(ctx.customer_id)
+        gate = self.gate
+        if self.transport is Transport.MCP:
+            # The loop only charges and settles model spend and calls tools on its gate.
+            gate = cast(Gate, _GatewayRoutedGate(self))
         transcript = run_agent(
-            self.gate,
+            gate,
             ctx,
             model,
             task,
@@ -331,6 +415,8 @@ class Arena:
             company=None if customer is None else customer.name,
             max_steps=max_steps,
         )
+        if self.transport is Transport.GATE:
+            self.direct_calls[Direct.GATE_TRANSPORT] += len(transcript_calls(transcript))
         self._exposures.append(Exposure(transcript.run_id, transcript.model_input_text()))
         self._exposures.append(Exposure(transcript.run_id, transcript.model_output_text()))
         return transcript
@@ -346,12 +432,10 @@ class Arena:
         """One proposal straight to the gate, as a compromised model would make it.
 
         The action defaults to the tool's action in the customer's tools.yaml, or READ for a
-        tool it does not list. What the outcome shows is scanned as model-visible.
+        tool it does not list. What the outcome shows is scanned as model-visible. Under
+        `mcp` an action the gateway would not use sends this one call to the gate directly.
         """
-        chosen = self._action(ctx, tool) if action is None else action
-        outcome = self.gate.call_tool(ctx, tool, chosen, args)
-        self._saw(ctx, outcome)
-        return outcome
+        return self._route_call(ctx, tool, action, args)
 
     def execute(
         self,
@@ -362,7 +446,12 @@ class Arena:
         *,
         action: Action | None = None,
     ) -> Outcome:
-        """Run an approved call. The outcome is scanned as model-visible."""
+        """Run an approved call. The outcome is scanned as model-visible. Under `mcp` it goes
+        through the gateway's approvals_execute tool."""
+        route = self._route(ctx, tool, action)
+        if isinstance(route, GatewaySession):
+            return self._over_mcp(ctx, lambda: route.execute(approval_id, tool, args))
+        self.direct_calls[route] += 1
         chosen = self._action(ctx, tool) if action is None else action
         outcome = self.gate.execute_approved(ctx, approval_id, tool, chosen, args)
         self._saw(ctx, outcome)
@@ -439,6 +528,9 @@ class Arena:
             self._engines = dict(engines)
         if tools is not None:
             self._tools = dict(tools)
+        # The gateways restart with the new configuration: each run gets a new session.
+        self._sessions.reset()
+        self._refused.clear()
         self.gate = Gate(
             store=self.store,
             engines=self._engines,
@@ -556,6 +648,87 @@ class Arena:
         count = len(self.outbox())
         return self.expect(name or "outbox empty", count == 0, f"{count} emails")
 
+    # Transport
+
+    def call_counts(self) -> tuple[int, int, tuple[tuple[str, int], ...]]:
+        """(calls over MCP, direct calls, direct calls per reason sorted by reason)."""
+        by_reason = tuple(sorted((reason.value, n) for reason, n in self.direct_calls.items()))
+        return self.mcp_calls, sum(self.direct_calls.values()), by_reason
+
+    def _issue(self, ctx: RunContext) -> RunContext:
+        self._issued.append(ctx)
+        return ctx
+
+    def _route_call(
+        self,
+        ctx: RunContext,
+        tool: str,
+        action: Action | str | None,
+        args: dict[str, JsonValue],
+        *,
+        loop: bool = False,
+    ) -> Outcome:
+        """One tool call, over the run's MCP session or straight to the gate. For the agent
+        loop (`loop`), the action is the one the loop chose and the loop shows the outcome
+        to the model itself; for a direct proposal, what it shows is scanned here."""
+        route = self._route(ctx, tool, None if loop else action)
+        if isinstance(route, GatewaySession):
+            return self._over_mcp(ctx, lambda: route.call(tool, args))
+        self.direct_calls[route] += 1
+        chosen = self._action(ctx, tool) if action is None else action
+        outcome = self.gate.call_tool(ctx, tool, cast(Action, chosen), args)
+        if not loop:
+            self._saw(ctx, outcome)
+        return outcome
+
+    def _route(
+        self, ctx: RunContext, tool: str, action: Action | str | None
+    ) -> GatewaySession | Direct:
+        """The session a call goes over, or why it goes to the gate directly."""
+        if self.transport is Transport.GATE:
+            return Direct.GATE_TRANSPORT
+        if not any(ctx == issued for issued in self._issued):
+            return Direct.FORGED_CONTEXT
+        if action is not None and action != self._gateway_action(ctx, tool):
+            return Direct.ACTION_OVERRIDE
+        session = self._session(ctx)
+        return Direct.GATEWAY_REFUSED if session is None else session
+
+    def _session(self, ctx: RunContext) -> GatewaySession | None:
+        """The run's session, opened on first use; None if the gateway will not launch."""
+        session = self._sessions.get(ctx.run_id)
+        if session is not None or ctx.run_id in self._refused:
+            return session
+        world = replace(self.world, gate=self.gate, engines=dict(self._engines))
+        try:
+            server = build_gateway(world, ctx)
+        except ValueError:
+            # A customer with no policy: the gateway refuses to launch for this run.
+            self._refused.add(ctx.run_id)
+            return None
+        return self._sessions.open(ctx.run_id, server)
+
+    def _gateway_action(self, ctx: RunContext, tool: str) -> Action:
+        """The action the gateway calls a tool with: its listed spec's, else READ."""
+        for spec in self.specs(ctx.customer_id):
+            if spec.tool == tool:
+                return spec.action
+        return Action.READ
+
+    def _over_mcp(self, ctx: RunContext, send: Callable[[], McpReply]) -> Outcome:
+        refused = self.sink.refused
+        self.mcp_calls += 1
+        try:
+            reply = send()
+        except GatewayCallError as exc:
+            if self.sink.refused > refused:
+                # The arena's own sink failed the call: what the host sees in-process.
+                raise AuditDown("audit sink unavailable") from exc
+            raise
+        run_id = getattr(ctx, "run_id", None)
+        self._exposures.append(Exposure(run_id if isinstance(run_id, str) else None, reply.text))
+        return reply.outcome
+
     # Internals
 
     def _action(self, ctx: RunContext, tool: str) -> Action:
@@ -622,6 +795,7 @@ class SuiteResult:
     totals: dict[Category, tuple[int, int]]
     # Passed over total for benign scenarios, or None when none ran.
     benign_rate: float | None
+    transport: Transport = Transport.GATE
 
     @property
     def passed(self) -> int:
@@ -639,18 +813,47 @@ class SuiteResult:
     def failed(self) -> tuple[ScenarioResult, ...]:
         return tuple(result for result in self.results if not result.passed)
 
+    @property
+    def mcp_calls(self) -> int:
+        return sum(result.mcp_calls for result in self.results)
+
+    @property
+    def direct_calls(self) -> int:
+        return sum(result.direct_calls for result in self.results)
+
+    def direct_by_reason(self) -> dict[str, int]:
+        """Direct calls of the whole run per reason, sorted by reason."""
+        totals: Counter[str] = Counter()
+        for result in self.results:
+            for reason, count in result.direct_by_reason:
+                totals[reason] += count
+        return dict(sorted(totals.items()))
+
+    def mcp_coverage(self) -> dict[Category, tuple[int, int]]:
+        """(scenarios with at least one call over MCP, scenarios) per category that ran, in
+        Category order."""
+        coverage: dict[Category, tuple[int, int]] = {}
+        for category in Category:
+            of_category = [r for r in self.results if r.category is category]
+            if of_category:
+                reached = sum(1 for r in of_category if r.mcp_calls > 0)
+                coverage[category] = (reached, len(of_category))
+        return coverage
+
 
 def run_scenario(
     s: RegisteredScenario,
     *,
     policies: Path = DEFAULT_POLICIES,
     fixtures: Path = DEFAULT_FIXTURES,
+    transport: Transport = Transport.GATE,
 ) -> ScenarioResult:
     """Run one scenario in a fresh arena and judge it by the pass criteria above."""
     error: str | None = None
     checks: tuple[Check, ...] = ()
     leaks: tuple[str, ...] = ()
-    with Arena(policies=policies, fixtures=fixtures) as arena:
+    arena = Arena(policies=policies, fixtures=fixtures, transport=transport)
+    try:
         try:
             s.fn(arena)
         except Exception as exc:
@@ -661,6 +864,12 @@ def run_scenario(
             leaks = tuple(arena.leaks())
         except Exception as exc:
             error = error or type(exc).__name__
+    finally:
+        try:
+            arena.close()
+        except Exception as exc:
+            error = error or type(exc).__name__
+    mcp_calls, direct_calls, direct_by_reason = arena.call_counts()
     passed = error is None and bool(checks) and all(c.passed for c in checks) and not leaks
     return ScenarioResult(
         id=s.id,
@@ -671,6 +880,9 @@ def run_scenario(
         checks=checks,
         leaks=leaks,
         error=error,
+        mcp_calls=mcp_calls,
+        direct_calls=direct_calls,
+        direct_by_reason=direct_by_reason,
     )
 
 
@@ -680,8 +892,10 @@ def run_suite(
     ids: Iterable[str] | None = None,
     policies: Path = DEFAULT_POLICIES,
     fixtures: Path = DEFAULT_FIXTURES,
+    transport: Transport = Transport.GATE,
 ) -> SuiteResult:
-    """Run every scenario (or those of the given categories and ids), sorted by id.
+    """Run every scenario (or those of the given categories and ids), sorted by id, over the
+    given transport.
 
     An id that matches no scenario raises ValueError, so a typo cannot quietly run nothing.
     """
@@ -698,7 +912,10 @@ def run_suite(
         if (wanted_categories is None or s.category in wanted_categories)
         and (wanted_ids is None or s.id in wanted_ids)
     ]
-    results = tuple(run_scenario(s, policies=policies, fixtures=fixtures) for s in selected)
+    chosen = Transport(transport)
+    results = tuple(
+        run_scenario(s, policies=policies, fixtures=fixtures, transport=chosen) for s in selected
+    )
     totals: dict[Category, tuple[int, int]] = {}
     for category in Category:
         of_category = [r for r in results if r.category is category]
@@ -706,4 +923,4 @@ def run_suite(
             totals[category] = (sum(1 for r in of_category if r.passed), len(of_category))
     benign = [r for r in results if r.benign]
     rate = sum(1 for r in benign if r.passed) / len(benign) if benign else None
-    return SuiteResult(results=results, totals=totals, benign_rate=rate)
+    return SuiteResult(results=results, totals=totals, benign_rate=rate, transport=chosen)

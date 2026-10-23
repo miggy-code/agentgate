@@ -38,6 +38,7 @@ jobs:
       - name: Policy tests
         run: make policy
 
+      # Runs the suite twice: in-process, then through the MCP gateway.
       - name: Red-team suite
         run: make redteam
 
@@ -46,5 +47,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: reports-python-${{ matrix.python-version }}
+          # reports/redteam.{json,md} (gate), reports/redteam-mcp.{json,md} (mcp), and the rest.
           path: reports/
           if-no-files-found: warn

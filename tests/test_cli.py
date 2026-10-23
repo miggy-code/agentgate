@@ -624,6 +624,70 @@ def test_redteam_write_baseline_needs_the_whole_suite(
     assert result.stdout == ""
 
 
+def test_redteam_over_mcp(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    result = _redteam(tmp_path, "--transport", "mcp", "--baseline", str(tmp_path / "none.json"))
+    assert result.exit_code == 0, result.output
+    assert "# agentgate red-team report (transport: mcp)" in result.stdout
+    assert "| **attacks total** | 1 | 1 | 1/1 (100%) |" in result.stdout
+    assert "calls over MCP: 2, direct: 0" in result.stdout.splitlines()
+    assert "| privilege_escalation | 1 | 1 | 1 | 0 |" in result.stdout
+    markdown = (tmp_path / "reports" / "redteam.md").read_text()
+    assert "- Command: `agentgate redteam --transport mcp --json " in markdown
+    data = json.loads((tmp_path / "reports" / "redteam.json").read_text())
+    assert data["transport"] == "mcp"
+    assert data["mcp"]["calls_over_mcp"] == 2
+    assert [s["calls"]["mcp"] for s in data["scenarios"]] == [1, 1]
+
+
+def test_redteam_default_reports_per_transport(
+    tmp_path: Path, scenarios: Callable[[], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    missing = ["--baseline", str(tmp_path / "none.json")]
+    over_mcp = runner.invoke(app, ["redteam", "--transport", "mcp", *WORLD_ARGS, *missing])
+    assert over_mcp.exit_code == 0, over_mcp.output
+    reports = tmp_path / "reports"
+    assert sorted(p.name for p in reports.iterdir()) == ["redteam-mcp.json", "redteam-mcp.md"]
+    assert "reports written: reports/redteam-mcp.json, reports/redteam-mcp.md" in over_mcp.stdout
+    assert (
+        "- Command: `agentgate redteam --transport mcp --baseline "
+        in (reports / "redteam-mcp.md").read_text()
+    )
+    in_process = runner.invoke(app, ["redteam", *WORLD_ARGS, *missing])
+    assert in_process.exit_code == 0, in_process.output
+    assert sorted(p.name for p in reports.iterdir()) == [
+        "redteam-mcp.json",
+        "redteam-mcp.md",
+        "redteam.json",
+        "redteam.md",
+    ]
+    assert json.loads((reports / "redteam.json").read_text())["transport"] == "gate"
+    assert json.loads((reports / "redteam-mcp.json").read_text())["transport"] == "mcp"
+
+
+def test_redteam_baseline_applies_over_mcp(tmp_path: Path, scenarios: Callable[[], None]) -> None:
+    scenarios()
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"format": 1, "categories": {"privilege_escalation": ["pe-989", "pe-990"]}})
+    )
+    result = _redteam(tmp_path, "--transport", "mcp", "--baseline", str(baseline))
+    assert result.exit_code == 1, result.output
+    assert result.stdout.splitlines()[-3:] == [
+        "BASELINE pe-989 (privilege_escalation) is in the baseline but did not run:"
+        " deleted or renamed (transport mcp)",
+        "BASELINE pe-991 (privilege_escalation) is new and failed (transport mcp)",
+        f"baseline {baseline}: 2 problems",
+    ]
+
+
+def test_redteam_rejects_an_unknown_transport(tmp_path: Path) -> None:
+    result = _redteam(tmp_path, "--transport", "stdio")
+    assert result.exit_code == 2
+    assert "Invalid value for '--transport'" in plain_text(result.output)
+    assert not (tmp_path / "reports").exists()
+
+
 # bench
 
 

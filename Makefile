@@ -21,8 +21,11 @@ policy:
 	uv run agentgate policy lint
 	uv run agentgate policy test
 
+# Both transports: in-process (reports/redteam.*) and through the MCP gateway
+# (reports/redteam-mcp.*).
 redteam:
 	uv run agentgate redteam
+	uv run agentgate redteam --transport mcp
 
 bench:
 	uv run agentgate bench
