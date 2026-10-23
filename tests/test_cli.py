@@ -19,7 +19,7 @@ from agentgate.policy.schema import load_bundle
 from agentgate.policy.version import bundle_version
 from agentgate.redteam import core as redteam_core
 from agentgate.redteam.core import Arena, Category, RegisteredScenario, ScenarioFn
-from conftest import FIXTURES, POLICIES
+from conftest import FIXTURES, POLICIES, plain_text
 from test_policy_testing import CASES, case, write_fixtures, write_policies, write_tree
 
 runner = CliRunner()
@@ -377,7 +377,7 @@ def test_agent_run_unknown_model(monkeypatch: pytest.MonkeyPatch) -> None:
         app, ["agent", "run", "--as", "kc-staff-nadine", "--task", "Hi", "--model", "gpt"]
     )
     assert result.exit_code == 2
-    assert "Invalid value for '--model'" in result.stderr
+    assert "Invalid value for '--model'" in plain_text(result.stderr)
     assert result.stdout == ""
 
 

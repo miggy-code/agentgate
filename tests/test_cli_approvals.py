@@ -19,7 +19,7 @@ from agentgate.gate import Denied, Executed, PendingApproval
 from agentgate.models import Action
 from agentgate.tools.builtin import list_outbox
 from agentgate.world import World, open_world
-from conftest import FIXTURES, KC, POLICIES
+from conftest import FIXTURES, KC, POLICIES, plain_text
 
 runner = CliRunner()
 
@@ -150,7 +150,7 @@ def test_list_is_scoped_to_the_acting_users_customer(queued: Queued) -> None:
 def test_as_is_required(queued: Queued) -> None:
     result = runner.invoke(app, ["approvals", "list", "--db", str(queued.tmp / "x.db")])
     assert result.exit_code == 2
-    assert "--as" in result.stderr
+    assert "--as" in plain_text(result.stderr)
 
 
 # show

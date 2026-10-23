@@ -3,6 +3,7 @@ clock. Every test that uses `world` also checks, on teardown, that no audit even
 produced carries a fixture canary.
 """
 
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +29,18 @@ KC = "kettle-creek-hvac"
 JR = "juniper-row-apothecary"
 # 10:00 in Chicago and 09:00 in Denver, well inside one local day for both customers.
 START = datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_BOX = re.compile("[\u2500-\u257f]")
+
+
+def plain_text(text: str) -> str:
+    """Click usage errors with colour codes, box drawing and wrapping removed.
+
+    Typer draws usage errors with rich, and some environments (GitHub Actions among them)
+    force colour, which splits option names across escape codes.
+    """
+    return " ".join(_BOX.sub(" ", _ANSI.sub("", text)).split())
 
 
 @dataclass
