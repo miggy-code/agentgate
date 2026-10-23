@@ -459,6 +459,33 @@ class Gate:
             allow_recorded=True,
         )
 
+    def refuse(
+        self,
+        ctx: RunContext,
+        *,
+        tool: str | None = None,
+        reason: str = GateReason.INVALID_ARGS.value,
+        details: Mapping[str, JsonValue] | None = None,
+    ) -> Denied:
+        """Refuse, on record, a request a front end could not turn into a gate call at all.
+
+        For a front end such as the MCP gateway, whose own request wrapper can be malformed
+        (a missing field, a wrong type, an extra key): the refusal is still the gate's, so
+        it is audited like any other. The run and user are checked as for call_tool, so a
+        forged context or a suspended user is denied with that reason instead; otherwise
+        one DENY with the bound run's identity and `reason`, which must be a gate reason
+        code, is recorded. `tool` is recorded only in the tool-id shape. `details` may hold
+        only `error_types` and `fields`, as lists of strings: reason codes and field names
+        the front end defines, never a caller's key names or values. Nothing is reserved.
+        """
+        code = GateReason(reason).value
+        checked = _refusal_details(details)
+        call = self._begin(ctx, tool, None)
+        run = self._check_run(ctx, call)
+        if isinstance(run, Denied):
+            return run
+        return self._deny(_bind(call, run), code, details=checked)
+
     # Model spend
 
     def charge_model(self, ctx: RunContext, estimated_usd: Decimal) -> Reservation | CapReached:
@@ -1123,6 +1150,23 @@ def _validate_args(
         fields = sorted({str(e["loc"][0]) for e in errors if e["loc"] and e["loc"][0] in known})
         types = sorted({e["type"] for e in errors})
         return {"error_types": list(types), "fields": list(fields)}
+
+
+_REFUSAL_DETAIL_KEYS = frozenset({"error_types", "fields"})
+
+
+def _refusal_details(details: Mapping[str, JsonValue] | None) -> dict[str, JsonValue] | None:
+    """Refusal details as `refuse` accepts them, or ValueError."""
+    if details is None:
+        return None
+    if not set(details) <= _REFUSAL_DETAIL_KEYS:
+        raise ValueError("refusal details may only hold error_types and fields")
+    checked: dict[str, JsonValue] = {}
+    for key, value in details.items():
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError(f"refusal detail {key} must be a list of strings")
+        checked[key] = [*sorted(str(item) for item in value)]
+    return checked
 
 
 def _model_reason(reason: str) -> str:

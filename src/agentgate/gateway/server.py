@@ -18,6 +18,17 @@ refuse them. One gateway tool, `approvals_execute`, runs an approved call throug
 policy again. It cannot approve anything: approvals are decided out of band, with
 `agentgate approvals approve`.
 
+Every refusal a client gets is the gate's, on record with the bound run's identity. The
+gateway refuses nothing itself: an approval id or tool name of any length or shape goes to
+`execute_approved`, which looks it up and audits `approval_not_found` and the rest, and an
+approvals_execute request whose wrapper cannot be read at all (a missing field, a wrong type,
+an extra key such as `user_id`) goes to `gate.refuse`, which checks the run and user like any
+call and records the `invalid_args` denial, naming only the wrapper's own fields. Two
+failures reach a client without a gate record: an exception inside the gate (the client gets
+a generic internal error; when it is the audit sink that failed, nothing can be recorded),
+and requests the MCP SDK rejects before this server's handlers run (a malformed JSON-RPC
+request or params that are not an object).
+
 `call_tool` maps the name back to a tool id and takes the action from that tool's spec,
 never from the client. A name that maps to no listed tool goes to the gate unchanged, so the
 gate denies it as an unknown tool and the denial is audited. The result is the same
@@ -54,13 +65,13 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
 import agentgate
 from agentgate.agent.loop import tool_specs
 from agentgate.agent.model import ToolSpec
 from agentgate.context import RunContext
-from agentgate.gate import Denied, Executed, GateReason, Outcome, PendingApproval
+from agentgate.gate import Denied, Executed, Outcome, PendingApproval
 from agentgate.models import Action
 from agentgate.tools.builtin import default_tools
 from agentgate.world import World
@@ -85,9 +96,13 @@ class _ExecuteArgs(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    approval_id: str = Field(min_length=1, max_length=128)
-    tool: str = Field(min_length=1, max_length=128)
+    # No length or shape limits here: the gate checks the id and the tool, and audits them.
+    approval_id: str
+    tool: str
     args: dict[str, JsonValue]
+
+
+_EXECUTE_FIELDS = frozenset(_ExecuteArgs.model_fields)
 
 
 _EXECUTE_SCHEMA: dict[str, Any] = {
@@ -95,14 +110,10 @@ _EXECUTE_SCHEMA: dict[str, Any] = {
     "properties": {
         "approval_id": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
             "description": "The approval id a pending call returned.",
         },
         "tool": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
             "description": "The name of the approved tool, as this server lists it.",
         },
         "args": {
@@ -151,10 +162,12 @@ def build_gateway(world: World, ctx: RunContext) -> Server[Any]:
     def execute(args: Mapping[str, JsonValue]) -> Outcome:
         try:
             checked = _ExecuteArgs.model_validate(args, strict=True)
-        except ValidationError:
-            # Only the wrapper's shape: the approval id, tool and args inside it are checked
-            # and audited by the gate.
-            return Denied(GateReason.INVALID_ARGS.value)
+        except ValidationError as exc:
+            # The wrapper cannot be read, so there is no call to hand execute_approved; the
+            # gate still refuses it, checking the run and recording the denial.
+            named = args.get("tool")
+            tool = by_name.get(named, named) if isinstance(named, str) else None
+            return gate.refuse(ctx, tool=tool, details=_wrapper_errors(exc))
         tool = by_name.get(checked.tool, checked.tool)
         spec = by_tool.get(tool)
         action = Action.READ if spec is None else spec.action
@@ -214,6 +227,17 @@ def _specs(world: World, ctx: RunContext) -> list[ToolSpec]:
         raise ValueError(f"customer {ctx.customer_id!r} has no policy")
     # The same adapters open_world's gate runs, so the list matches what the gate accepts.
     return tool_specs(engine, default_tools())
+
+
+def _wrapper_errors(exc: ValidationError) -> dict[str, JsonValue]:
+    """Why an approvals_execute wrapper was refused: error types and the wrapper's own field
+    names only, never a key the client chose or any value, as the gate reports tool args."""
+    errors = exc.errors(include_url=False, include_input=False, include_context=False)
+    fields = sorted(
+        {str(e["loc"][0]) for e in errors if e["loc"] and e["loc"][0] in _EXECUTE_FIELDS}
+    )
+    types = sorted({e["type"] for e in errors})
+    return {"error_types": list(types), "fields": list(fields)}
 
 
 def _listed(spec: ToolSpec) -> Tool:

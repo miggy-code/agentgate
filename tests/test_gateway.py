@@ -234,8 +234,20 @@ def test_identity_keys_are_invalid_args(gw: Gateway, key: str, value: str) -> No
     async def scenario(client: Client) -> None:
         read = {"document_id": "kc-payroll-summary", key: value}
         assert await call(client, "docs_read", read) == (True, {"error": "invalid_args"})
+        before = len(gw.events)
         execute = {"approval_id": "apr_x", "tool": "docs_read", "args": {}, key: value}
         assert await call(client, EXECUTE_TOOL, execute) == (True, {"error": "invalid_args"})
+        # The wrapper's refusal is the gate's own, audited with the bound identity, and
+        # names neither the key the client added nor its value.
+        [refused] = gw.events[before:]
+        assert (refused.kind, refused.reason, refused.tool) == (
+            EventKind.DENY,
+            "invalid_args",
+            "docs.read",
+        )
+        assert refused.details == {"error_types": ["extra_forbidden"], "fields": []}
+        assert key not in json.dumps(refused.details)
+        assert value not in refused.model_dump_json()
         error, _ = await call(client, "docs_read", {"document_id": "kc-service-menu"})
         assert not error
 
@@ -245,6 +257,104 @@ def test_identity_keys_are_invalid_args(gw: Gateway, key: str, value: str) -> No
         (e.customer_id, e.user_id, e.role, e.run_id) == (KC, "kc-staff-nadine", "staff", ctx.run_id)
         for e in gw.events
     )
+
+
+# (wrapper, model-facing error, audited reason, audited tool, audited details or None)
+WRAPPERS: list[tuple[dict[str, Any], str, str, str | None, dict[str, Any] | None]] = [
+    (
+        {"approval_id": "", "tool": "email_send", "args": {}},
+        "not_found",
+        "approval_not_found",
+        "email.send",
+        None,
+    ),
+    (
+        {"approval_id": "x" * 500, "tool": "email_send", "args": {}},
+        "not_found",
+        "approval_not_found",
+        "email.send",
+        None,
+    ),
+    (
+        {"approval_id": "apr_x", "tool": "", "args": {}},
+        "not_found",
+        "approval_not_found",
+        None,
+        None,
+    ),
+    (
+        {"tool": "email_send", "args": {}},
+        "invalid_args",
+        "invalid_args",
+        "email.send",
+        {"error_types": ["missing"], "fields": ["approval_id"]},
+    ),
+    (
+        {"approval_id": 7, "tool": "email_send", "args": []},
+        "invalid_args",
+        "invalid_args",
+        "email.send",
+        {"error_types": ["dict_type", "string_type"], "fields": ["approval_id", "args"]},
+    ),
+    (
+        {"approval_id": "apr_x", "tool": ["AGCANARY-3F9A0C71B2D4"], "args": {}},
+        "invalid_args",
+        "invalid_args",
+        None,
+        {"error_types": ["string_type"], "fields": ["tool"]},
+    ),
+    (
+        {},
+        "invalid_args",
+        "invalid_args",
+        None,
+        {"error_types": ["missing"], "fields": ["approval_id", "args", "tool"]},
+    ),
+]
+
+
+@pytest.mark.parametrize(("wrapper", "error", "reason", "tool", "details"), WRAPPERS)
+def test_every_execute_refusal_is_audited_by_the_gate(
+    gw: Gateway,
+    wrapper: dict[str, Any],
+    error: str,
+    reason: str,
+    tool: str | None,
+    details: dict[str, Any] | None,
+) -> None:
+    ctx = gw.start("kc-staff-nadine")
+    before = len(gw.events)
+
+    async def scenario(client: Client) -> None:
+        assert await call(client, EXECUTE_TOOL, wrapper) == (True, {"error": error})
+
+    gw.run(ctx, scenario)
+    [event] = gw.events[before:]
+    assert (event.kind, event.reason, event.tool) == (EventKind.DENY, reason, tool)
+    assert (event.customer_id, event.user_id, event.role, event.run_id) == (
+        KC,
+        "kc-staff-nadine",
+        "staff",
+        ctx.run_id,
+    )
+    if details is not None:
+        assert event.details == details
+
+
+def test_a_malformed_execute_from_a_suspended_user_is_denied_as_suspended(gw: Gateway) -> None:
+    ctx = gw.start("kc-staff-nadine")
+    with gw.world.store.transaction():
+        gw.world.store.connection.execute(
+            "UPDATE users SET status = 'suspended' WHERE id = ?", ("kc-staff-nadine",)
+        )
+
+    async def scenario(client: Client) -> None:
+        refused = await call(client, EXECUTE_TOOL, {"user_id": "kc-owner-dale"})
+        assert refused == (True, {"error": "suspended_user"})
+
+    gw.run(ctx, scenario)
+    event = last(gw, EventKind.DENY)
+    assert (event.reason, event.run_id) == ("suspended_user", ctx.run_id)
 
 
 def test_unknown_tool_is_denied_by_the_gate(gw: Gateway) -> None:

@@ -289,6 +289,68 @@ def test_invalid_args_details_name_known_fields_only(world: World) -> None:
     assert details["error_types"] == ["extra_forbidden", "int_type"]
 
 
+# Refusals of requests a front end could not turn into a call
+
+
+def test_refuse_records_one_deny_with_the_bound_identity(world: World) -> None:
+    ctx = world.run("kc-staff-nadine")
+    details: dict[str, Any] = {"error_types": ["missing", "extra_forbidden"], "fields": ["tool"]}
+    assert world.gate.refuse(ctx, tool="email.send", details=details) == Denied("invalid_args")
+    [event] = world.events(EventKind.DENY)
+    assert (event.reason, event.tool, event.action, event.subject) == (
+        "invalid_args",
+        "email.send",
+        None,
+        None,
+    )
+    assert (event.customer_id, event.user_id, event.role, event.run_id) == (
+        KC,
+        "kc-staff-nadine",
+        Role.STAFF,
+        ctx.run_id,
+    )
+    assert event.details == {"error_types": ["extra_forbidden", "missing"], "fields": ["tool"]}
+    assert world.gate.ledger.run_calls(ctx.run_id) == 0
+
+
+def test_refuse_records_a_tool_only_in_the_tool_id_shape(world: World) -> None:
+    ctx = world.run("kc-staff-nadine")
+    world.gate.refuse(ctx, tool="Send AGCANARY-3F9A0C71B2D4 now")
+    assert world.last(EventKind.DENY).tool is None
+    world.gate.refuse(ctx)
+    assert world.last(EventKind.DENY).tool is None
+
+
+def test_refuse_checks_the_run_first(world: World) -> None:
+    ctx = world.run("kc-staff-nadine")
+    forged = replace(ctx, role=Role.OWNER)
+    assert world.gate.refuse(forged, tool="docs.read") == Denied("invalid_run")
+    event = world.last(EventKind.DENY)
+    assert (event.reason, event.run_id, event.role) == ("invalid_run", ctx.run_id, Role.STAFF)
+    world.set_user("kc-staff-nadine", status="suspended")
+    assert world.gate.refuse(ctx) == Denied("suspended_user")
+    assert world.last(EventKind.DENY).reason == "suspended_user"
+    assert len(world.events(EventKind.DENY)) == 2
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"user_id": ["kc-owner-dale"]},
+        {"fields": "tool"},
+        {"fields": [7]},
+        {"error_types": ["missing"], "args": {"AGCANARY-3F9A0C71B2D4": 1}},
+    ],
+)
+def test_refuse_takes_only_codes_and_field_names(world: World, details: Any) -> None:
+    ctx = world.run("kc-staff-nadine")
+    with pytest.raises(ValueError, match="refusal detail"):
+        world.gate.refuse(ctx, details=details)
+    with pytest.raises(ValueError):
+        world.gate.refuse(ctx, reason="free text from a caller")
+    assert world.events(EventKind.DENY) == []
+
+
 def test_unsupported_actions(world: World) -> None:
     ctx = world.run("kc-owner-dale")
     doc = {"document_id": "kc-service-menu"}
