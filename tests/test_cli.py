@@ -2,6 +2,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,9 +12,10 @@ from typer.testing import CliRunner
 import agentgate
 from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.audit.panoptes import PanoptesSink
-from agentgate.cli import app
+from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.policy.schema import load_bundle
 from agentgate.policy.version import bundle_version
+from conftest import FIXTURES, POLICIES
 from test_policy_testing import CASES, case, write_fixtures, write_policies, write_tree
 
 runner = CliRunner()
@@ -231,3 +233,159 @@ def test_audit_verify_defaults_to_data_audit_db(
     result = runner.invoke(app, ["audit", "verify"])
     assert result.exit_code == 0, result.output
     assert result.stdout == f"{Path('data/audit.db')}  1 events  chain intact\n"
+
+
+# demo
+
+GOLDEN = Path(__file__).resolve().parent / "golden" / "demo.txt"
+WORLD_ARGS = ["--policies", str(POLICIES), "--fixtures", str(FIXTURES)]
+
+
+def test_demo_prints_the_golden_output() -> None:
+    result = runner.invoke(app, ["demo", *WORLD_ARGS])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == GOLDEN.read_text(encoding="utf-8")
+    assert result.stderr == ""
+
+
+def test_demo_audit_dir_keeps_a_log_that_verifies(tmp_path: Path) -> None:
+    audit_dir = tmp_path / "audit"
+    result = runner.invoke(app, ["demo", "--audit-dir", str(audit_dir), *WORLD_ARGS])
+    assert result.exit_code == 0, result.output
+    db = audit_dir / "audit.db"
+    lines = result.stdout.splitlines()
+    assert lines[-2] == "demo: all 10 scenarios behaved as expected"
+    assert lines[-1] == f"audit kept at {db}; verify with: agentgate audit verify --db {db}"
+    assert result.stdout.removesuffix(lines[-1] + "\n") == GOLDEN.read_text(encoding="utf-8")
+
+    verified = runner.invoke(app, ["audit", "verify", "--db", str(db)])
+    assert verified.exit_code == 0, verified.output
+    assert verified.stdout.endswith("events  chain intact\n")
+
+    again = runner.invoke(app, ["demo", "--audit-dir", str(audit_dir), *WORLD_ARGS])
+    assert again.exit_code == 1
+    assert again.stderr == f"error: {db} already exists; use an empty directory\n"
+
+
+def test_demo_exits_1_when_a_scenario_misbehaves(tmp_path: Path) -> None:
+    policies = tmp_path / "policies"
+    shutil.copytree(POLICIES, policies)
+    policy = policies / "kettle-creek-hvac" / "policy.yaml"
+    text = policy.read_text(encoding="utf-8")
+    # Contractors may now read every internal document, not only their own tickets.
+    loosened = text.replace(
+        "  - id: contractor-read-public\n",
+        "  - id: contractor-read-all\n"
+        "    effect: allow\n"
+        "    roles: [contractor]\n"
+        "    tools: [docs.search, docs.read]\n"
+        "    actions: [read]\n"
+        "    labels: {max: internal}\n\n"
+        "  - id: contractor-read-public\n",
+    )
+    assert loosened != text
+    policy.write_text(loosened, encoding="utf-8")
+    result = runner.invoke(app, ["demo", "--policies", str(policies), "--fixtures", str(FIXTURES)])
+    assert result.exit_code == 1
+    assert "UNEXPECTED: other ticket not_found" in result.stdout
+    assert result.stdout.endswith("demo: 1 of 10 scenarios UNEXPECTED\n")
+
+
+# agent run
+
+
+def test_agent_run_with_the_mock_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENTGATE_MODEL", raising=False)
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "run",
+            "--as",
+            "kc-staff-nadine",
+            "--task",
+            "Why does the furnace click?",
+            *WORLD_ARGS,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stderr == DEMO_IDENTITY_NOTE + "\n"
+    lines = result.stdout.splitlines()
+    assert lines[0] == (
+        "acting: kc-staff-nadine (role staff, customer kettle-creek-hvac), run #1, model naive-mock"
+    )
+    assert lines[1] == "task: Why does the furnace click?"
+    assert lines[2] == '  [1] docs.search query="Why does the furnace click?"'
+    assert "filter: 20 documents in the tenant, 13 permitted" in result.stdout
+    # The naive model obeys the inbox email; the gate denies the export.
+    assert "gate: denied, model told default_deny (audit: deny default_deny)" in result.stdout
+    assert "  stop: final after 5 model calls" in lines
+    assert "final answer: I read: " in result.stdout
+    assert "AGCANARY-" not in result.stdout
+
+
+def test_agent_run_max_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENTGATE_MODEL", raising=False)
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "run",
+            "--as",
+            "kc-staff-nadine",
+            "--task",
+            "Hi",
+            "--max-steps",
+            "1",
+            *WORLD_ARGS,
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert "  stop: max_steps after 1 model calls" in result.stdout.splitlines()
+
+
+@pytest.mark.parametrize("from_env", [False, True])
+def test_agent_run_anthropic_without_the_sdk(
+    monkeypatch: pytest.MonkeyPatch, from_env: bool
+) -> None:
+    # None in sys.modules makes the import fail, as if the extra were not installed.
+    monkeypatch.setitem(sys.modules, "agentgate.agent.anthropic_model", None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-not-a-real-key")
+    args = ["agent", "run", "--as", "kc-staff-nadine", "--task", "Hi", *WORLD_ARGS]
+    if from_env:
+        monkeypatch.setenv("AGENTGATE_MODEL", "anthropic")
+    else:
+        monkeypatch.delenv("AGENTGATE_MODEL", raising=False)
+        args += ["--model", "anthropic"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        f"{DEMO_IDENTITY_NOTE}\nerror: install the anthropic extra: uv sync --extra anthropic\n"
+    )
+    assert "sk-ant" not in result.output
+
+
+def test_agent_run_unknown_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENTGATE_MODEL", raising=False)
+    result = runner.invoke(
+        app, ["agent", "run", "--as", "kc-staff-nadine", "--task", "Hi", "--model", "gpt"]
+    )
+    assert result.exit_code == 2
+    assert "Invalid value for '--model'" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    ("user_id", "error"),
+    [
+        ("nobody", "error: unknown user 'nobody'"),
+        ("kc-staff-gavin", "error: suspended_user: user is suspended"),
+    ],
+)
+def test_agent_run_refuses_unknown_and_suspended_users(user_id: str, error: str) -> None:
+    result = runner.invoke(app, ["agent", "run", "--as", user_id, "--task", "Hi", *WORLD_ARGS])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert result.stderr == f"{DEMO_IDENTITY_NOTE}\n{error}\n"
