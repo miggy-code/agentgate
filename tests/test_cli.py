@@ -395,6 +395,44 @@ def test_agent_run_refuses_unknown_and_suspended_users(user_id: str, error: str)
     assert result.stderr == f"{DEMO_IDENTITY_NOTE}\n{error}\n"
 
 
+# gateway
+
+
+def _gateway_args(tmp_path: Path) -> list[str]:
+    data = tmp_path / "data"
+    return ["--db", str(data / "agentgate.db"), "--audit-db", str(data / "audit.db"), *WORLD_ARGS]
+
+
+@pytest.mark.parametrize(
+    ("user_id", "error", "audited"),
+    [
+        ("nobody", "error: unknown user 'nobody'", 0),
+        ("kc-staff-gavin", "error: suspended_user: user is suspended", 1),
+    ],
+)
+def test_gateway_serve_refuses_unknown_and_suspended_users(
+    tmp_path: Path, user_id: str, error: str, audited: int
+) -> None:
+    result = runner.invoke(app, ["gateway", "serve", "--as", user_id, *_gateway_args(tmp_path)])
+    assert result.exit_code == 1
+    # Nothing reaches stdout, which would be the MCP stream.
+    assert result.stdout == ""
+    assert result.stderr == f"{DEMO_IDENTITY_NOTE}\n{error}\n"
+    sink = PanoptesSink(tmp_path / "data" / "audit.db", create=False)
+    try:
+        # The gate records the suspended user's refused run; an unknown id never reaches it.
+        assert sink.count() == audited
+    finally:
+        sink.close()
+
+
+def test_gateway_serve_needs_a_user() -> None:
+    result = runner.invoke(app, ["gateway", "serve"])
+    assert result.exit_code == 2
+    assert "Missing option '--as'" in plain_text(result.stderr)
+    assert result.stdout == ""
+
+
 # red team
 
 

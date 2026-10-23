@@ -1,5 +1,5 @@
 """The agentgate command line: policy lint and test, audit verify, the approval queue, the
-demo, one-off agent runs, the red-team suite and the latency bench.
+demo, one-off agent runs, the MCP gateway, the red-team suite and the latency bench.
 
 Output is plain, deterministic text (customers sorted, cases in file order, no colour), so
 it reads the same in a terminal, a CI log and a diff. Problems that stop a command go to
@@ -72,6 +72,11 @@ approvals_app = typer.Typer(
 app.add_typer(approvals_app, name="approvals")
 agent_app = typer.Typer(help="Run the reference agent through the gate.", no_args_is_help=True)
 app.add_typer(agent_app, name="agent")
+gateway_app = typer.Typer(
+    help="Serve a user's tools to an MCP client, every call through the gate.",
+    no_args_is_help=True,
+)
+app.add_typer(gateway_app, name="gateway")
 
 PoliciesOption = Annotated[
     Path, typer.Option("--policies", help="Directory holding one folder per customer policy.")
@@ -489,6 +494,45 @@ def agent_run(
         )
         for line in format_transcript(transcript, sink.events, names, world.store):
             typer.echo(line)
+
+
+# gateway
+
+
+@gateway_app.command("serve")
+def gateway_serve(
+    as_user: AsOption,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Serve MCP over stdio for one run of the acting user until the client disconnects.
+
+    The run starts before anything is served, so an unknown or suspended user exits 1
+    without a byte on stdout. stdout carries only the MCP stream; everything else, the
+    banner included, goes to stderr.
+    """
+    # Imported here, so the other commands do not pay for loading the MCP SDK.
+    from agentgate.gateway import gateway_tools, serve_stdio
+
+    with _world(db, audit_db, policies, fixtures) as world:
+        user = world.store.get_user(as_user)
+        if user is None:
+            _fail(f"unknown user {as_user!r}")
+        try:
+            ctx = world.gate.start_run(user.customer_id, user.id)
+        except IdentityError as err:
+            _fail(f"{err.reason}: {err}")
+        tools = gateway_tools(world, ctx)
+        typer.echo(
+            f"gateway: run {ctx.run_id} for {user.id} ({user.customer_id}), {len(tools)} tools",
+            err=True,
+        )
+        try:
+            serve_stdio(world, ctx)
+        except KeyboardInterrupt:
+            raise typer.Exit(code=130) from None
 
 
 # red team
