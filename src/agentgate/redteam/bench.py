@@ -491,8 +491,8 @@ def run_bench(
         " max_calls_per_run) and, in sections 2 to 5, moves the fixed clock forward one day"
         f" at the same time, so a timed call sees at most {max_calls - 1} earlier"
         " reservations in its run and in its customer day.",
-        "The customer-day spend check sums every reservation of that day, so a gated call"
-        " costs more the busier the customer's day; section 6 measures that.",
+        "The customer-day spend check reads a running daily total, so a busy day should cost"
+        " the same as a quiet one; section 6 measures that.",
         "Each iteration calls every subject of a section once, back to back, alternating"
         " which goes first. Warmup iterations are not counted. Percentiles are nearest-rank.",
         "Added latency is the median minus the median (and p95 minus p95), not a percentile"
