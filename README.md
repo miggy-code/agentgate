@@ -17,9 +17,26 @@ agentgate is a permissions, approval and audit layer between an AI agent and a c
 | **attacks total** | 111 | 111 | 111/111 (100%) |
 | benign_control | 20 | 20 | 20/20 (100%) |
 
-Produced by `uv run agentgate redteam` at commit `87a4801`: 131 scenarios, 1364 checks, baseline check 0 problems. The benign_control rows are legitimate tasks the gate must still allow; they are not counted in the attack total.
+Produced by `uv run agentgate redteam` at commit `908f704`: 131 scenarios, 1364 checks, baseline check 0 problems. Every call goes to the gate in-process. The benign_control rows are legitimate tasks the gate must still allow; they are not counted in the attack total.
 
-The threat model is a fully compromised model: in most attack scenarios the test proposes the harmful tool call directly, and some prompt injection scenarios also run a mock model that obeys any instruction it reads. A scenario passes only if it ran to the end without an exception, recorded at least one check, every check passed, and the leak detector found nothing. Every attack scenario has a mutation test that removes the protection it relies on and shows the scenario then fails, so a pass is not vacuous. CI runs the suite and fails on any failed scenario or any scenario missing from `redteam/baseline.json`.
+The same suite through the MCP gateway, with every agent-side tool call sent through an MCP client session to a gateway bound to the run:
+
+| Category | Scenarios | Passed | Pass rate |
+| --- | ---: | ---: | ---: |
+| cross_tenant | 13 | 13 | 13/13 (100%) |
+| privilege_escalation | 15 | 15 | 15/15 (100%) |
+| prompt_injection_exfil | 14 | 14 | 14/14 (100%) |
+| approval_bypass | 15 | 15 | 15/15 (100%) |
+| spend_runaway | 14 | 14 | 14/14 (100%) |
+| identity_spoofing | 14 | 14 | 14/14 (100%) |
+| fail_closed | 14 | 14 | 14/14 (100%) |
+| audit_integrity | 12 | 12 | 12/12 (100%) |
+| **attacks total** | 111 | 111 | 111/111 (100%) |
+| benign_control | 20 | 20 | 20/20 (100%) |
+
+Produced by `uv run agentgate redteam --transport mcp` at commit `908f704`: 131 scenarios, 1364 checks, baseline check 0 problems, calls over MCP: 1261, direct: 58. A call goes to the gate directly only when MCP cannot express it: 29 use a forged run context (an MCP client cannot pass a context at all), 23 use an action the tool does not have (over MCP the action comes from the gateway's own tool list), and 6 belong to a run whose customer has no policy (the gateway will not launch for it). 11 of the 111 attack scenarios make no MCP call: id-005, id-006, id-007, fc-002, fc-003 and pe-014 send only such direct calls, and id-001, xt-013, sr-003, sr-006 and sr-007 test only run starts and model spend, which stay in-process because a gateway's identity is bound at launch and it never sees model calls. Every benign_control scenario makes at least one MCP call. The suite's sessions use the MCP SDK's in-memory transport, one gateway per run; the stdio launch is covered by a test (see Integration).
+
+The threat model is a fully compromised model: in most attack scenarios the test proposes the harmful tool call directly, and some prompt injection scenarios also run a mock model that obeys any instruction it reads. A scenario passes only if it ran to the end without an exception, recorded at least one check, every check passed, and the leak detector found nothing. Every attack scenario has a mutation test that removes the protection it relies on and shows the scenario then fails, so a pass is not vacuous. CI runs the suite over both transports and fails on any failed scenario or any scenario missing from `redteam/baseline.json`.
 
 The results are deterministic. 100% means every scripted attack in this suite was stopped, not that every possible attack is. All scenarios, by category: [docs/redteam-scenarios.md](docs/redteam-scenarios.md).
 
@@ -170,7 +187,9 @@ The default sink is [Panoptes](https://pypi.org/project/panoptes-observe/) (`pan
 
 ### Integration
 
-Today agentgate is in-process middleware: a Python library the host application calls. The host builds a world (store, fixtures, index, policies, audit sink, gate) with `open_world`, starts a run for a user it has already authenticated, and sends every tool call the model proposes through `call_tool`:
+agentgate runs in one of two ways: as in-process middleware, a Python library the host application calls, or as an MCP gateway in its own process.
+
+In-process, the host builds a world (store, fixtures, index, policies, audit sink, gate) with `open_world`, starts a run for a user it has already authenticated, and sends every tool call the model proposes through `call_tool`:
 
 ```python
 from pathlib import Path
@@ -196,7 +215,34 @@ with open_world(
 
 `call_tool` returns `Executed`, `Denied`, `PendingApproval` or `CapReached`. An approved call runs through `gate.execute_approved(ctx, approval_id, tool, action, args)`. Model spend goes through `gate.charge_model` and `gate.settle_model`. `src/agentgate/agent/loop.py` is a reference loop that does all of this. `open_memory_world` builds the same world in memory with an in-memory audit sink.
 
-An MCP gateway is planned but not built; there is no MCP code in the repository. It matters because in-process middleware only protects tools that are reachable solely through the gate. A gateway in its own process, holding the tool credentials, would enforce the policy even against code in the host process.
+#### The MCP gateway
+
+In-process middleware only protects tools that are reachable solely through the gate. The gateway moves the tools, the database and their side effects into their own process, so an agent gets nothing but an MCP connection. Code is in `src/agentgate/gateway/server.py`.
+
+`agentgate gateway serve --as USER` serves MCP over stdio. It opens the same on-disk world as the CLI (`data/agentgate.db` and `data/audit.db` by default) and starts one run for that user before it serves anything; every call on the connection belongs to that run. The identity is bound at launch: the MCP client never names a user, role or customer, no tool takes an identity argument, and an extra key such as `user_id` or `role` is denied `invalid_args`. `--as` is the same demo identity as on the CLI: it names a fixture user, it is not a login, and the gateway prints the same note on stderr. An unknown or suspended user exits 1 before anything is written to stdout. One gateway process serves one connection and one run.
+
+The gateway lists the run customer's tools under MCP-safe names (`docs.search` becomes `docs_search`), plus `approvals_execute`. For a Kettle Creek user such as `kc-staff-nadine` the list is `docs_read`, `docs_search`, `email_send`, `notes_write`, `parts_order` and `approvals_execute`. The action of each call is taken from that tool's entry in the customer's tool list, never from the client. A name the gateway does not list goes to the gate unchanged and is denied there as an unknown tool.
+
+`approvals_execute` runs a call a person has already approved, with exactly the approved tool and arguments, through `gate.execute_approved`, which checks the run, the arguments hash, the expiry and the current policy again. It cannot approve anything: approvals are decided out of band with `agentgate approvals approve`. An approval belongs to the run that requested it, so it is executed on the same gateway connection.
+
+Every call and every refusal goes through the gate and is recorded there with the bound run's identity; the gateway refuses nothing itself. An `approvals_execute` request whose fields cannot be read (a missing field, a wrong type, an extra key) goes to `gate.refuse`, which checks the run and user like any call and records an `invalid_args` denial. Calls are decided one at a time, in order. The client gets the outcome the reference loop shows its model, as JSON text: the tool's content, `{"error": reason}`, a pending approval's id and expiry, or the cap that was reached. Two failures reach a client without a gate record; see Limits.
+
+The tools, the database and every side effect live in the gateway process, as would the credentials of real tools. An agent that holds only the MCP connection has no path to a tool except through the gate.
+
+An example MCP client configuration, in the `mcpServers` format many clients use for stdio servers (replace the path with your checkout):
+
+```json
+{
+  "mcpServers": {
+    "agentgate": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/agentgate", "agentgate", "gateway", "serve", "--as", "kc-staff-nadine"]
+    }
+  }
+}
+```
+
+`uv run --directory` runs the command from the checkout, so the default `data/`, `policies/` and `fixtures/` paths resolve there. At commit `908f704` this command line, launched from another directory with `--db` and `--audit-db` added to point at a scratch folder, answered `initialize`, `tools/list` and a `docs_read` over stdio and wrote 4 audit events. `tests/test_gateway.py::test_cli_serves_over_stdio` launches `agentgate gateway serve --as kc-staff-nadine` as a subprocess and checks the same on every test run.
 
 ## Policy format
 
@@ -358,7 +404,7 @@ uv run agentgate audit verify [--db data/audit.db]
 
 `--as` is a demo identity: it names a fixture user and is not a login. Every approvals command prints `note: --as is a demo identity; agentgate does not authenticate users`. The commands use `data/agentgate.db` (created and seeded from the fixtures if missing) and `data/audit.db` by default. `list` and `show` only show the acting approver's customer, and `show` prints the exact arguments that would run. A staff user who tries to approve gets `approver_not_allowed: role 'staff' may not decide approvals`. `expire` expires every overdue approval for all customers and prints only the count; the acting user must be an active owner.
 
-There is no CLI command that queues an approval. A pending approval comes from an agent run against an on-disk world: the host calls `call_tool` as in the integration sample, and a call that needs approval returns `PendingApproval`. `agentgate agent run` uses a fresh in-memory world that is discarded when it exits, so an approval it creates cannot be decided afterwards. After approval, the requester's run executes the call through `gate.execute_approved`.
+No approvals command queues an approval. A pending approval comes from an agent run against an on-disk world: the host calls `call_tool` as in the integration sample and a call that needs approval returns `PendingApproval`, or an MCP client calls a tool through `agentgate gateway serve`, which uses the same files by default. `agentgate agent run` uses a fresh in-memory world that is discarded when it exits, so an approval it creates cannot be decided afterwards. After approval, the requester's run executes the call through `gate.execute_approved`, or over MCP through `approvals_execute` on the same gateway connection.
 
 `agentgate audit verify` checks the Panoptes hash chain and prints `<path>  N events  chain intact`, or `chain BROKEN: ...` and exits 1. It has no checkpoint option; see Limits.
 
@@ -381,12 +427,20 @@ Two caveats. The spend caps in the shipped policies are sized for the mock model
 
 ### Identity and deployment
 
-- `--as` on the CLI names a user; it is not a login. agentgate trusts the host application to authenticate users before it calls `start_run`.
+- `--as` on the CLI, `agentgate gateway serve` included, names a user; it is not a login. agentgate trusts the host application, or whoever launches the gateway, to authenticate users before a run starts.
 - The run id is the run's only credential. `RunContext` is a plain dataclass, not signed. Altered fields, unknown run ids and look-alike objects are refused, but anything in the host process that holds a live run id and its fields can act as that run. Runs never expire; there is no call that ends one, and a run is bounded only by its spend caps.
-- agentgate is in-process middleware. It only protects tools that are reachable solely through the gate: code in the same process that holds a tool's credentials, or the database, can skip it. An out-of-process MCP gateway that holds the credentials would close that gap; it is planned, not built, and there is no MCP code.
+- In-process, agentgate only protects tools that are reachable solely through the gate: code in the same process that holds a tool's credentials, or the database, can skip it. The MCP gateway closes that gap for an agent that holds only the MCP connection, since the tools and the database live in the gateway process. Code that can open the database or the tools directly can still skip the gate.
 - State lives in one SQLite file per world, plus a separate Panoptes SQLite file for the audit log. Several processes on the same machine can share them (the approvals CLI does). There is no server database and no multi-host support.
 - Side effects are simulated. Email goes to an `outbox` table and is never sent. Parts orders and refunds are rows in the store; a refund does not check that the order exists or that the amount matches it.
 - Every customer, person and document is invented. Some Juniper Row records are tagged `health-adjacent`; that data is made up too. agentgate has not been audited and makes no compliance claim of any kind.
+
+### MCP gateway
+
+- Stdio only. There is no HTTP transport; one needs real client authentication, which is not built.
+- The gateway's `--as` is a demo identity, as on the rest of the CLI. One gateway process serves one user's run.
+- Model spend is not metered through the gateway. It never sees the model's calls, so the per-run and per-customer-day USD caps count tool costs only. Tool costs and `max_calls_per_run` still apply to every tool call.
+- Requests so malformed that the MCP SDK rejects them before any gateway handler runs (a malformed JSON-RPC request, params that are not an object, or a numeric tool name) leave no audit record. Nothing runs for them; the client gets an MCP error.
+- An exception inside the gate, for example the audit sink failing while an approval is created, reaches the client only as a generic `internal error`. The gateway logs the exception type on stderr. When the sink itself failed, nothing is recorded.
 
 ### Audit
 
@@ -409,7 +463,8 @@ Two caveats. The spend caps in the shipped policies are sized for the mock model
 - Most attack scenarios assume a fully compromised model proposing calls directly. The leak detector looks for exact canary tokens; a model that paraphrased, re-encoded or split a canary would not be caught by it, and public and internal documents carry no canary.
 - No test, CI job or report in this repository calls the live Claude API. The Anthropic adapter is tested only with a fake client, and no result here comes from a real model.
 - Spend figures in the demo and the red-team suite come from a made-up mock price list (1 USD and 5 USD per million input and output tokens, 4 characters per token) and invented per-tool costs. They show the caps working, not what a real model would cost.
-- CI runs lint, type checks, tests, policy tests and the red-team suite on Python 3.12 and 3.13. It does not run the benchmark.
+- The red-team suite's MCP run uses the MCP SDK's in-memory transport. The stdio launch is covered by one test in `tests/test_gateway.py`, not by the suite.
+- CI runs lint, type checks, tests, policy tests and the red-team suite over both transports on Python 3.12 and 3.13. It does not run the benchmark.
 
 ## Development
 
@@ -417,12 +472,14 @@ Two caveats. The spend caps in the shipped policies are sized for the mock model
 make install   # uv sync
 make check     # lint (ruff check, ruff format --check), type (mypy strict), test (pytest),
                # policy (policy lint, policy test), redteam
-make redteam   # red-team suite, reports in reports/
+make redteam   # red-team suite over both transports, in-process and through the MCP gateway,
+               # reports in reports/ (redteam.* and redteam-mcp.*)
 make bench     # latency benchmark, reports in reports/
 make demo      # the ten demo scenarios
+uv run agentgate gateway serve --as kc-staff-nadine   # MCP gateway over stdio for one run
 ```
 
-`uv run pytest` at commit `87a4801`: 1129 passed.
+`uv run pytest` at commit `908f704`: 1238 passed.
 
 ### Project layout
 
@@ -438,7 +495,8 @@ make demo      # the ten demo scenarios
 | `src/agentgate/tools/` | tool adapter interface and the built-in tools |
 | `src/agentgate/agent/` | model protocol, reference agent loop, mock models, optional Anthropic adapter |
 | `src/agentgate/store.py`, `world.py` | SQLite store; `open_world` and `open_memory_world` |
-| `src/agentgate/redteam/` | scenario registry, leak detector, baseline check, reports, benchmark |
+| `src/agentgate/gateway/` | MCP gateway: one run per process, every tool call through the gate |
+| `src/agentgate/redteam/` | scenario registry, leak detector, baseline check, reports, benchmark, MCP transport |
 | `src/agentgate/demo.py`, `cli.py` | `make demo` and the `agentgate` CLI |
 | `policies/` | one folder per customer: `policy.yaml`, `tools.yaml`, `tests.yaml` |
 | `fixtures/` | the synthetic customers, users and documents |
