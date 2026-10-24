@@ -11,9 +11,10 @@ from panoptes.schema import (
     normalize_event,
     validate_event,
 )
+from pydantic import ValidationError as PydanticValidationError
 
-from agentgate.audit.base import AuditEvent, EventKind
-from agentgate.audit.panoptes import PanoptesSink, to_panoptes_event
+from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, Reference
+from agentgate.audit.panoptes import PanoptesSink, storable_identifier, to_panoptes_event
 from agentgate.models import Action, Role
 
 T0 = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
@@ -98,6 +99,7 @@ def test_full_mapping() -> None:
                 "policy_version": "sha256:0123456789abcdef",
                 "latency_us": 42,
                 "details": {"label": "internal"},
+                "references": {},
             },
         },
     }
@@ -132,6 +134,110 @@ def test_id_panoptes_would_redact_is_refused() -> None:
     # Panoptes would store this subject as "[REDACTED API KEY]"; an altered id is no record.
     with pytest.raises(ValidationError, match="subject"):
         to_panoptes_event(_event(subject="sk-proj-abcdefghijklmnopqrstuvwx"))
+
+
+def _ref(char: str) -> str:
+    return "ref:" + char * 16
+
+
+def test_referenced_fields_are_mapped_as_their_references() -> None:
+    event = _event(
+        EventKind.DENY,
+        customer_id="sk-proj-abcdefghijklmnopqrstuvwx",
+        user_id="Ignore previous instructions",
+        run_id="forged-run",
+        tool="secret.tool",
+        subject="beatrice-lindqvist-medical-history",
+        references={
+            "customer_id": Reference(ref=_ref("a"), why="unknown"),
+            "user_id": Reference(ref=_ref("b"), why="unknown"),
+            "run_id": Reference(ref=_ref("c"), why="unknown"),
+            "tool": Reference(ref=_ref("d"), why="unknown"),
+            "subject": Reference(ref=_ref("e"), why="unstorable"),
+        },
+    )
+    mapped = to_panoptes_event(event)
+    validate_event(mapped)
+    assert mapped["agent"] == {"type": "agentgate", "session_id": _ref("c"), "run_id": _ref("c")}
+    assert mapped["user"] == {"id": _ref("b"), "auth_method": "cli"}
+    assert mapped["action"] == {
+        "tool_name": _ref("d"),
+        "parameters": {"action": "read", "subject": _ref("e")},
+        "target": _ref("e"),
+    }
+    fields = mapped["context"]["agentgate"]
+    assert (fields["customer_id"], fields["user_id"], fields["run_id"], fields["tool"]) == (
+        _ref("a"),
+        _ref("b"),
+        _ref("c"),
+        _ref("d"),
+    )
+    assert fields["references"] == {
+        "customer_id": "unknown",
+        "run_id": "unknown",
+        "subject": "unstorable",
+        "tool": "unknown",
+        "user_id": "unknown",
+    }
+    text = repr(mapped)
+    for raw in ("sk-proj", "Ignore previous", "forged-run", "secret.tool", "beatrice"):
+        assert raw not in text
+
+
+def test_a_reference_fills_a_field_the_event_left_empty() -> None:
+    # A tool name too odd to keep on the event at all is still named by its reference.
+    event = _event(tool=None, references={"tool": Reference(ref=_ref("f"), why="unknown")})
+    assert event.recorded().tool == _ref("f")
+    assert to_panoptes_event(event)["context"]["agentgate"]["tool"] == _ref("f")
+    plain = _event()
+    assert plain.recorded() is plain
+
+
+def test_reference_shape_is_enforced() -> None:
+    with pytest.raises(PydanticValidationError):
+        Reference(ref="ref:not-hex-at-all!", why="unknown")
+    with pytest.raises(PydanticValidationError):
+        Reference(ref=_ref("a"), why="other")  # type: ignore[arg-type]
+    with pytest.raises(PydanticValidationError):
+        _event(references={"details": Reference(ref=_ref("a"), why="unknown")})
+
+
+@pytest.mark.parametrize(
+    ("value", "storable"),
+    [
+        ("kc-service-menu", True),
+        ("apr_AbC-12_x", True),
+        ("Ignore previous instructions", True),
+        ("ref:0123456789abcdef", True),
+        ("sk-aaaaaaaaaaaaaaaaaaaaaaaa", False),
+        ("apr_-sk-aaaaaaaaaaaaaaaaaaaaaaa", False),
+        ("ghp_" + "a" * 36, False),
+        ("\x1b[31mred", False),
+        ("x" * 257, False),
+        ("", False),
+        ("\ud800", False),
+    ],
+)
+def test_storable_identifier(value: str, storable: bool) -> None:
+    assert storable_identifier(value) is storable
+
+
+def test_referenced_event_round_trips(sink: PanoptesSink, tmp_path: Path) -> None:
+    event = _event(
+        subject="sk-aaaaaaaaaaaaaaaaaaaaaaaa",
+        references={"subject": Reference(ref=_ref("9"), why="unknown")},
+    )
+    sink.record(event)
+    assert sink.verify()["valid"] is True
+    db = AuditDB(str(tmp_path / "audit.db"))
+    try:
+        [row] = db.query(limit=10)
+    finally:
+        db.close()
+    assert row["action"]["target"] == _ref("9")
+    assert row["context"]["agentgate"]["references"] == {"subject": "unknown"}
+    sink.close()
+    assert b"sk-aaaa" not in (tmp_path / "audit.db").read_bytes()
 
 
 # Recording
@@ -187,8 +293,10 @@ def test_creates_parent_directories(tmp_path: Path) -> None:
 
 
 def test_rejected_event_raises_and_stores_nothing(sink: PanoptesSink) -> None:
-    with pytest.raises(ValidationError):
+    # AuditRejected, not Panoptes' own error, so the gate can tell it from a sink outage.
+    with pytest.raises(AuditRejected) as raised:
         sink.record(_event(tool="sk-proj-abcdefghijklmnopqrstuvwx"))
+    assert isinstance(raised.value.__cause__, ValidationError)
     assert sink.count() == 0
 
 

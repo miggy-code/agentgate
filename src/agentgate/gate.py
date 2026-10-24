@@ -29,10 +29,27 @@ call that names a document (a missing id, another customer's document, or one of
 own customer that the run may not read) reads as `not_found`, so document ids, which
 reveal titles, cannot be probed within or across tenants. Such calls are decided before
 spend, so a cap cannot tell them apart either. The audit event keeps the real reason.
+
+Values a caller chose (a document or approval id, a tool name, a claimed run, user or
+customer, an approver's name) can be probes: a guessed slug that names a person, or text
+aimed at whoever reads the log. Only ids the store knows go into the durable audit log as
+written. Every other caller value, and any real id the log would refuse (Panoptes refuses
+secret-shaped and control-character identifiers), is attached to the event as a Reference,
+`ref:` plus the first 16 hex characters of HMAC-SHA256 under a key kept in this store, and
+the durable sink stores the reference instead. The same value always gives the same
+reference, so repeated probes can be counted and an operator holding the store can check a
+value with `audit_reference`; a reader of the audit log alone cannot test guesses against
+it, and deleting the key leaves past references pointing at nothing. If a sink still
+refuses an event for its content, a reference-only version of it is recorded instead, so a
+refusal never turns into an unrecorded exception; only a sink that is down raises.
 """
 
+import hashlib
+import hmac
 import json
 import re
+import secrets
+import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -40,7 +57,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import NoReturn
+from typing import NoReturn, TypeGuard
 
 from pydantic import BaseModel, JsonValue, ValidationError
 
@@ -51,10 +68,20 @@ from agentgate.approvals import (
     ApprovalQueue,
     args_hash,
 )
-from agentgate.audit.base import AuditEvent, AuditSink, EventKind
+from agentgate.audit.base import (
+    REFERENCED_FIELDS,
+    AuditEvent,
+    AuditRejected,
+    AuditSink,
+    EventKind,
+    Reference,
+    ReferencedField,
+)
+from agentgate.audit.panoptes import storable_identifier
 from agentgate.clock import Clock
 from agentgate.context import RunContext
 from agentgate.models import Action, Customer, Role, Tool, User, UserStatus
+from agentgate.policy.addresses import parse_address
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Effect, Policy
 from agentgate.retrieval import DocumentIndex, RetrievalInvariantError, RetrievalResult
@@ -84,11 +111,21 @@ CREATE TABLE IF NOT EXISTS runs (
 ) STRICT
 """
 
+# The key audit references are computed with. One row, made once per store database.
+_KEY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS audit_key (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    key BLOB NOT NULL
+) STRICT
+"""
+REFERENCE_PREFIX = "ref:"
+# Hex characters of the HMAC kept in a reference: 64 bits, far from colliding at audit volumes.
+REFERENCE_HEX = 16
+
 # Values the model chose (a tool name) go into events only in this shape, which cannot
 # carry free text or a canary.
 _TOOL_ID = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 _APPROVAL_ID = re.compile(r"^apr_[A-Za-z0-9_-]{1,64}$")
-_ADDRESS = re.compile(r"^[^@\s,;:<>()\[\]\"\\]+@([a-z0-9-]+(?:\.[a-z0-9-]+)+)$")
 # Customer id for audit events about a caller that matches no customer at all.
 UNKNOWN_CUSTOMER = "unknown"
 
@@ -185,6 +222,11 @@ class _Call:
     tool: str | None = None
     action: Action | None = None
     policy_version: str | None = None
+    # Fields still holding the caller's claim, not yet confirmed against the store.
+    claimed: frozenset[str] = frozenset()
+    # The tool name the caller asked for, as given, when it differs from `tool` or may be
+    # unknown; None when the tool came from the gate's own records.
+    asked_tool: str | None = None
 
     def latency_us(self) -> int:
         return (time.perf_counter_ns() - self.started_ns) // 1000
@@ -242,10 +284,24 @@ class Gate:
         self._approvals = ApprovalQueue(store, clock)
         with store.locked():
             store.connection.execute(_SCHEMA)
+        self._audit_key = _load_audit_key(store)
+        self._known_tools = frozenset(adapters) | frozenset(
+            tool_id for engine in self._engines.values() for tool_id in engine.bundle.tools
+        )
 
     @property
     def approvals(self) -> ApprovalQueue:
         return self._approvals
+
+    def audit_reference(self, value: str) -> str:
+        """The reference the durable audit log stores for this value in place of it.
+
+        Stable per store database, so an operator can ask whether a value was ever probed.
+        """
+        digest = hmac.new(
+            self._audit_key, value.encode("utf-8", "surrogatepass"), hashlib.sha256
+        ).hexdigest()
+        return REFERENCE_PREFIX + digest[:REFERENCE_HEX]
 
     @property
     def ledger(self) -> SpendLedger:
@@ -256,17 +312,25 @@ class Gate:
     def start_run(self, customer_id: str, user_id: str) -> RunContext:
         engine = self._engines.get(customer_id)
         version = None if engine is None else engine.version
-        call = _Call(time.perf_counter_ns(), customer_id, user_id=user_id, policy_version=version)
-        user = self._store.get_user(user_id)
+        call = _Call(
+            time.perf_counter_ns(),
+            customer_id,
+            user_id=user_id,
+            policy_version=version,
+            claimed=frozenset({"customer_id", "user_id"}),
+        )
+        user = self._get_user(user_id)
         if user is None:
             self._identity_denied(call, GateReason.UNKNOWN_USER, "unknown user")
+        call = replace(call, claimed=frozenset({"customer_id"}))
         # Checked before status, so nothing about another customer's user is revealed.
         if user.customer_id != customer_id:
             self._identity_denied(call, GateReason.WRONG_CUSTOMER, "user of another customer")
-        call = replace(call, role=user.role)
+        # The user's own customer: from here every field names something the store knows.
+        call = replace(call, role=user.role, claimed=frozenset())
         if user.status is not UserStatus.ACTIVE:
             self._identity_denied(call, GateReason.SUSPENDED_USER, "user is suspended")
-        customer = self._store.get_customer(customer_id)
+        customer = self._get_customer(customer_id)
         if engine is None or customer is None:
             self._identity_denied(call, GateReason.NO_POLICY, "customer has no policy")
 
@@ -391,14 +455,15 @@ class Gate:
         if isinstance(run, Denied):
             return run
         call = _bind(call, run)
-        safe_id = approval_id if _APPROVAL_ID.fullmatch(approval_id) else None
-        approval = self._approvals.get(approval_id)
+        safe_id = _safe_approval_id(approval_id)
+        approval = self._get_approval(approval_id)
         if approval is None:
             return self._deny(
                 call,
                 GateReason.APPROVAL_NOT_FOUND,
                 model_reason=GateReason.NOT_FOUND,
                 subject=safe_id,
+                unknown_subject=_text(approval_id),
             )
         # Another run's approval, even the same user's, looks exactly like a missing one.
         if approval.customer_id != run.ctx.customer_id or approval.run_id != run.ctx.run_id:
@@ -542,14 +607,24 @@ class Gate:
         self, approval_id: str, approver_user_id: str, note: str | None, *, approve: bool
     ) -> Approval:
         started = time.perf_counter_ns()
-        approver = self._store.get_user(approver_user_id)
-        approval = self._approvals.get(approval_id)
+        approver = self._get_user(approver_user_id)
+        approval = self._get_approval(approval_id)
         safe_id = approval_id if _APPROVAL_ID.fullmatch(approval_id) else None
+        # An id the queue does not know is the caller's value, recorded as a reference.
+        unknown_id = _text(approval_id) if approval is None else None
         if approver is None:
             customer_id = UNKNOWN_CUSTOMER if approval is None else approval.customer_id
-            call = _Call(started, customer_id, user_id=approver_user_id)
+            claimed_user = _text(approver_user_id)
+            call = _Call(started, customer_id, user_id=claimed_user, claimed=frozenset({"user_id"}))
             err = ApprovalError(ApprovalErrorReason.APPROVER_NOT_ALLOWED, "unknown approver")
-            self._emit(call, EventKind.DENY, err.reason.value, subject=safe_id, decision=True)
+            self._emit(
+                call,
+                EventKind.DENY,
+                err.reason.value,
+                subject=safe_id,
+                unknown_subject=unknown_id,
+                decision=True,
+            )
             raise err
 
         call = _Call(started, approver.customer_id, user_id=approver.id, role=approver.role)
@@ -590,6 +665,9 @@ class Gate:
                 raise ApprovalError(
                     ApprovalErrorReason.APPROVER_NOT_ALLOWED, "approver's customer has no policy"
                 )
+            if not _lookupable(approval_id):
+                # The queue would look it up in SQLite, which cannot bind it.
+                raise ApprovalError(ApprovalErrorReason.NOT_FOUND, "approval not found")
             settings = engine.bundle.policy.approvals
             # The decision commits only if its event is recorded; a sink error propagates
             # and leaves the approval as it was.
@@ -598,7 +676,14 @@ class Gate:
                 approval_id, approver, settings, note, record_decision, self._record_expired
             )
         except ApprovalError as err:
-            self._emit(call, EventKind.DENY, err.reason.value, subject=safe_id, decision=True)
+            self._emit(
+                call,
+                EventKind.DENY,
+                err.reason.value,
+                subject=safe_id,
+                unknown_subject=unknown_id,
+                decision=True,
+            )
             raise
 
     # Steps
@@ -616,11 +701,15 @@ class Gate:
             run_id=claimed_run if isinstance(claimed_run, str) else None,
             tool=tool if tool is not None and _TOOL_ID.fullmatch(tool) else None,
             action=_safe_action(action),
+            claimed=frozenset({"customer_id", "user_id", "run_id"}),
+            asked_tool=_text(tool),
         )
 
     def _check_run(self, ctx: RunContext, call: _Call) -> _Run | Denied:
         if not isinstance(ctx, RunContext) or not isinstance(ctx.run_id, str):
             return self._deny(call, GateReason.INVALID_RUN)
+        if not _lookupable(ctx.run_id):
+            return self._deny(call, GateReason.INVALID_RUN, details={"run_known": False})
         with self._store.locked():
             row = self._store.connection.execute(
                 "SELECT * FROM runs WHERE run_id = ?", (ctx.run_id,)
@@ -635,6 +724,7 @@ class Gate:
             user_id=row["user_id"],
             role=Role(row["role"]),
             policy_version=None if engine is None else engine.version,
+            claimed=frozenset(),
         )
         mismatched: list[JsonValue] = [
             name
@@ -694,13 +784,18 @@ class Gate:
         facts = adapter.facts(validated)
         document: DocumentFacts | None = None
         if facts.document_id is not None:
-            stored = self._store.get_document(facts.document_id)
+            stored = (
+                self._store.get_document(facts.document_id)
+                if _lookupable(facts.document_id)
+                else None
+            )
             if stored is None:
                 return self._deny(
                     call,
                     GateReason.DOCUMENT_NOT_FOUND,
                     model_reason=GateReason.NOT_FOUND,
                     subject=facts.document_id,
+                    unknown_subject=facts.document_id,
                 )
             document = DocumentFacts.from_document(stored)
             if stored.customer_id != run.ctx.customer_id:
@@ -1028,6 +1123,7 @@ class Gate:
         *,
         model_reason: str | None = None,
         subject: str | None = None,
+        unknown_subject: str | None = None,
         rule_ids: tuple[str, ...] = (),
         policy_version: str | None = None,
         details: dict[str, JsonValue] | None = None,
@@ -1037,6 +1133,7 @@ class Gate:
             EventKind.DENY,
             reason,
             subject=subject,
+            unknown_subject=unknown_subject,
             rule_ids=rule_ids,
             policy_version=policy_version,
             decision=True,
@@ -1051,32 +1148,166 @@ class Gate:
         reason: str,
         *,
         subject: str | None = None,
+        unknown_subject: str | None = None,
         rule_ids: tuple[str, ...] = (),
         policy_version: str | None = None,
         decision: bool = False,
         latency_us: int | None = None,
         details: dict[str, JsonValue] | None = None,
     ) -> None:
+        """Record one event. `unknown_subject` is a caller's value that names nothing the
+        store knows; it is recorded only as a reference, whatever `subject` shows."""
         if latency_us is None and decision:
             latency_us = call.latency_us()
-        self._sink.record(
-            AuditEvent(
-                timestamp=self._clock.now(),
-                kind=kind,
-                customer_id=call.customer_id,
-                user_id=call.user_id,
-                role=call.role,
-                run_id=call.run_id,
-                tool=call.tool,
-                action=call.action,
-                subject=subject,
-                reason=str(reason),
-                rule_ids=rule_ids,
-                policy_version=policy_version or call.policy_version,
-                latency_us=latency_us,
-                details=details or {},
-            )
+        event = AuditEvent(
+            timestamp=self._clock.now(),
+            kind=kind,
+            customer_id=call.customer_id,
+            user_id=call.user_id,
+            role=call.role,
+            run_id=call.run_id,
+            tool=call.tool,
+            action=call.action,
+            subject=subject,
+            reason=str(reason),
+            rule_ids=rule_ids,
+            policy_version=policy_version or call.policy_version,
+            latency_us=latency_us,
+            details=details or {},
+            references=self._references(call, subject, unknown_subject),
         )
+        try:
+            self._sink.record(event)
+        except AuditRejected:
+            # The sink refused the event's content and stored nothing. Its reference-only
+            # version is recorded instead; if that fails too, the sink is down and its
+            # error propagates, as it does for any other event.
+            self._sink.record(self._reference_only(event))
+
+    def _references(
+        self, call: _Call, subject: str | None, unknown_subject: str | None
+    ) -> dict[ReferencedField, Reference]:
+        """The fields of an event about `call` that the durable log stores as references."""
+        refs: dict[ReferencedField, Reference] = {}
+        claimed: tuple[tuple[ReferencedField, str | None], ...] = (
+            ("customer_id", call.customer_id),
+            ("user_id", call.user_id),
+            ("run_id", call.run_id),
+        )
+        for name, value in claimed:
+            if value is not None:
+                known = name not in call.claimed or self._knows(name, value)
+                self._reference_unless(refs, name, value, known)
+        asked = call.asked_tool
+        if asked is not None:
+            self._reference_unless(refs, "tool", asked, asked in self._known_tools)
+        elif call.tool is not None:
+            self._reference_unless(refs, "tool", call.tool, True)
+        if unknown_subject is not None:
+            self._reference_unless(refs, "subject", unknown_subject, False)
+        elif subject is not None:
+            self._reference_unless(refs, "subject", subject, True)
+        return refs
+
+    def _reference_unless(
+        self,
+        refs: dict[ReferencedField, Reference],
+        name: ReferencedField,
+        value: str,
+        known: bool,
+    ) -> None:
+        if not known:
+            refs[name] = Reference(ref=self.audit_reference(value), why="unknown")
+        elif not storable_identifier(value):
+            refs[name] = Reference(ref=self.audit_reference(value), why="unstorable")
+
+    def _knows(self, name: str, value: str) -> bool:
+        """Whether a claimed customer, user or run id names a row the store holds."""
+        if name == "customer_id":
+            return value == UNKNOWN_CUSTOMER or self._get_customer(value) is not None
+        if name == "user_id":
+            return self._get_user(value) is not None
+        if not _lookupable(value):
+            return False
+        with self._store.locked():
+            row = self._store.connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?", (value,)
+            ).fetchone()
+        return row is not None
+
+    def _reference_only(self, event: AuditEvent) -> AuditEvent:
+        """The event with every id a caller or the configuration supplied as a reference,
+        and no details: what is recorded when a sink refuses the event as it was."""
+        recorded = event.recorded()
+        refs: dict[ReferencedField, Reference] = dict(event.references)
+        for name in REFERENCED_FIELDS:
+            value = getattr(recorded, name)
+            if value is not None and name not in refs:
+                refs[name] = Reference(ref=self.audit_reference(value), why="unstorable")
+        version = event.policy_version
+        return AuditEvent(
+            timestamp=event.timestamp,
+            kind=event.kind,
+            customer_id=refs["customer_id"].ref,
+            user_id=None if "user_id" not in refs else refs["user_id"].ref,
+            role=event.role,
+            run_id=None if "run_id" not in refs else refs["run_id"].ref,
+            tool=None if "tool" not in refs else refs["tool"].ref,
+            action=event.action,
+            subject=None if "subject" not in refs else refs["subject"].ref,
+            reason=event.reason if storable_identifier(event.reason) else "audit_refused",
+            rule_ids=tuple(self.audit_reference(rule_id) for rule_id in event.rule_ids),
+            policy_version=(
+                version
+                if version is None or storable_identifier(version)
+                else self.audit_reference(version)
+            ),
+            latency_us=event.latency_us,
+            details={"reference_only": True},
+            references=refs,
+        )
+
+    # Lookups of caller values. A value SQLite cannot bind (a lone surrogate from a JSON
+    # escape) names nothing, so it is unknown rather than an exception.
+
+    def _get_user(self, user_id: object) -> User | None:
+        return self._store.get_user(user_id) if _lookupable(user_id) else None
+
+    def _get_customer(self, customer_id: object) -> Customer | None:
+        return self._store.get_customer(customer_id) if _lookupable(customer_id) else None
+
+    def _get_approval(self, approval_id: object) -> Approval | None:
+        return self._approvals.get(approval_id) if _lookupable(approval_id) else None
+
+
+def _load_audit_key(store: Store) -> bytes:
+    """The store's audit reference key, made on first use.
+
+    Read first, so a read-only store that already has its key opens without a write. A
+    read-only store from before keys existed gets a key for this process only: references
+    then hold within the process, and the store gets its own key once it is opened writable.
+    """
+    select = "SELECT key FROM audit_key WHERE id = 1"
+    with store.locked():
+        try:
+            row = store.connection.execute(select).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+    if row is not None:
+        return bytes(row["key"])
+    try:
+        with store.locked():
+            store.connection.execute(_KEY_SCHEMA)
+        with store.transaction():
+            # INSERT OR IGNORE, so gates opening the same database at once agree on one key.
+            store.connection.execute(
+                "INSERT OR IGNORE INTO audit_key (id, key) VALUES (1, ?)",
+                (secrets.token_bytes(32),),
+            )
+            row = store.connection.execute(select).fetchone()
+    except sqlite3.OperationalError:
+        return secrets.token_bytes(32)
+    return bytes(row["key"])
 
 
 class _Unrecorded(Exception):
@@ -1104,6 +1335,7 @@ def _bind(call: _Call, run: _Run) -> _Call:
         role=run.ctx.role,
         run_id=run.ctx.run_id,
         policy_version=run.engine.version,
+        claimed=frozenset(),
     )
 
 
@@ -1201,9 +1433,31 @@ def _higher(policy: Policy, current: str | None, label: str) -> str | None:
 
 
 def _is_external(raw: str, domains: frozenset[str]) -> bool:
-    match = _ADDRESS.fullmatch(raw.strip().lower())
-    # Anything that is not one plain address counts as leaving the company.
-    return match is None or match.group(1) not in domains
+    # The engine's and the email tool's address rule: anything that is not one plain
+    # address (a look-alike such as the Kelvin sign, a control character, a second "@")
+    # counts as leaving the company.
+    parsed = parse_address(raw)
+    return parsed is None or parsed[1] not in domains
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _lookupable(value: object) -> TypeGuard[str]:
+    """Whether value is a string SQLite can bind, so a lookup cannot raise."""
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _safe_approval_id(value: object) -> str | None:
+    """The approval id for an event subject when it has the approval-id shape, else None."""
+    return value if isinstance(value, str) and _APPROVAL_ID.fullmatch(value) else None
 
 
 def _safe_role(value: object) -> Role | None:

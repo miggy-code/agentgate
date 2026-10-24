@@ -10,18 +10,25 @@ storing. Tags only add information, but redaction would silently rewrite an id, 
 identifier is checked with Panoptes' own identifier rule first and an id that Panoptes would
 rewrite is refused instead of being stored altered. Free-form details are redacted as
 Panoptes sees fit. Panoptes keeps timestamps to the millisecond.
+
+What is stored is the event's `recorded()` form: a field the gate referenced (a caller's
+value that names nothing real, or a real id Panoptes would refuse) holds its `ref:`
+reference, and context["agentgate"]["references"] says which fields those are and why. The
+gate checks values with `storable_identifier`, Panoptes' own rule, before it emits them. A
+refused event raises AuditRejected, so the gate can tell it from a storage failure.
 """
 
 import sqlite3
 from datetime import UTC
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from panoptes.db import AuditDB
-from panoptes.schema import validate_identifier
+from panoptes.schema import ValidationError, validate_identifier
 
-from agentgate.audit.base import AuditEvent, EventKind
+from agentgate.audit.base import AuditEvent, AuditRejected, EventKind
 
 # Panoptes needs a session and run id on every event; this marks events outside any run.
 NO_RUN = "no-run"
@@ -45,8 +52,25 @@ _STATUS: dict[EventKind, str] = {
 }
 
 
+@lru_cache(maxsize=4096)
+def storable_identifier(value: str) -> bool:
+    """Whether Panoptes stores this value as an identifier exactly as written.
+
+    False for empty, over-long, control-character and secret-shaped values, which Panoptes
+    refuses as identifiers (and would rewrite as "[REDACTED ...]" anywhere else).
+    """
+    try:
+        validate_identifier(value, "value")
+    except ValidationError:
+        return False
+    return True
+
+
 def to_panoptes_event(event: AuditEvent) -> dict[str, Any]:
-    """Map one AuditEvent to a Panoptes event. Raises if an id would not survive storage."""
+    """Map one AuditEvent, in its recorded form, to a Panoptes event. Raises Panoptes'
+    ValidationError if an id would not survive storage."""
+    references = {name: ref.why for name, ref in sorted(event.references.items())}
+    event = event.recorded()
     _check_ids(event)
     run_id = event.run_id or NO_RUN
     mapped: dict[str, Any] = {
@@ -78,6 +102,8 @@ def to_panoptes_event(event: AuditEvent) -> dict[str, Any]:
                 "policy_version": event.policy_version,
                 "latency_us": event.latency_us,
                 "details": event.details,
+                # Fields holding a reference instead of a value, and why.
+                "references": references,
             },
         },
     }
@@ -131,7 +157,11 @@ class PanoptesSink:
         if self._closed:
             raise RuntimeError("audit sink is closed")
         # Panoptes raises on a rejected event, a conflicting event_id or a storage error.
-        self._db.insert_event(to_panoptes_event(event))
+        # Only a rejection becomes AuditRejected; it is raised before anything is written.
+        try:
+            self._db.insert_event(to_panoptes_event(event))
+        except ValidationError as exc:
+            raise AuditRejected("Panoptes refused the event") from exc
 
     def verify(self) -> dict[str, Any]:
         """Panoptes' chain verification result; result["valid"] is True when intact."""

@@ -27,13 +27,13 @@ never quote a document body, an email body or a random id, so the same scenario 
 same strings on every run.
 """
 
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.fixtures import find_canaries
 from agentgate.models import Action, Document, Role
+from agentgate.policy.addresses import parse_address
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Request
 from agentgate.policy.schema import Effect
 from agentgate.store import Store
@@ -42,9 +42,6 @@ from agentgate.tools.builtin import list_outbox, list_parts_orders, list_refunds
 READ_TOOL = "docs.read"
 NOTE_TAG = "note"
 UNKNOWN_RUN = "run#? (no known run)"
-
-# One plain address with a dotted domain, as the gate parses recipients.
-_ADDRESS = re.compile(r"^[^@\s,;:<>()\[\]\"\\]+@([a-z0-9-]+(?:\.[a-z0-9-]+)+)$")
 
 
 @dataclass(frozen=True)
@@ -295,10 +292,11 @@ def _run_name(runs: Mapping[str, RunInfo], run_id: str) -> str:
 
 def _external_domain(raw: str, domains: frozenset[str]) -> str | None:
     """The recipient's domain when it is outside `domains`, or "an unparseable address"."""
-    match = _ADDRESS.fullmatch(raw.strip().lower())
-    if match is None:
+    # The engine's and the email tool's address rule, so a look-alike is never internal here.
+    parsed = parse_address(raw)
+    if parsed is None:
         return "an unparseable address"
-    domain = match.group(1)
+    domain = parsed[1]
     return None if domain in domains else domain
 
 
