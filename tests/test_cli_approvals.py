@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from agentgate.approvals import Approval, ApprovalStatus
+from agentgate.audit.panoptes import PanoptesSink
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.clock import Clock, FixedClock
 from agentgate.context import RunContext
@@ -303,12 +304,39 @@ def test_expire_marks_stale_approvals(tmp_path: Path) -> None:
     assert verify.exit_code == 0, verify.output
 
 
-def test_list_expires_stale_approvals_first(tmp_path: Path) -> None:
+def _audit_count(tmp: Path) -> int:
+    sink = PanoptesSink(tmp / "data" / "audit.db", create=False)
+    try:
+        return sink.count()
+    finally:
+        sink.close()
+
+
+def test_list_and_show_compute_expiry_without_writing(tmp_path: Path) -> None:
     stale = _queue(tmp_path, clock=FixedClock(datetime.now(UTC) - timedelta(hours=2)))
+    events = _audit_count(tmp_path)
+
     result = _cli(tmp_path, "list", "--as", "kc-owner-dale", "--status", "pending")
     assert result.stdout == f"{KC}  0 approvals\n"
     result = _cli(tmp_path, "list", "--as", "kc-owner-dale", "--status", "expired")
-    assert result.stdout.splitlines() == [_line(stale.approval, "expired"), f"{KC}  1 approvals"]
+    assert result.stdout.splitlines() == [
+        _line(stale.approval, "expired (pending sweep)"),
+        f"{KC}  1 approvals",
+    ]
+    result = _cli(tmp_path, "list", "--as", "kc-mgr-marisol")
+    assert result.stdout.splitlines()[0] == _line(stale.approval, "expired (pending sweep)")
+    shown = _cli(tmp_path, "show", stale.id, "--as", "kc-owner-dale").stdout.splitlines()
+    assert "status          expired (pending sweep)" in shown
+
+    # Nothing was marked or recorded: the sweep is still the owner's expire command.
+    assert _audit_count(tmp_path) == events
+    with _open(tmp_path) as world:
+        approval = world.gate.approvals.get(stale.id)
+        assert approval is not None and approval.status is ApprovalStatus.PENDING
+    assert _cli(tmp_path, "expire", "--as", "kc-owner-dale").stdout == "expired 1 approvals\n"
+    assert _audit_count(tmp_path) == events + 1
+    result = _cli(tmp_path, "list", "--as", "kc-owner-dale", "--status", "expired")
+    assert result.stdout.splitlines()[0] == _line(stale.approval, "expired")
 
 
 # world errors

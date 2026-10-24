@@ -443,3 +443,175 @@ def test_day_totals_are_rebuilt_for_a_ledger_written_before_they_existed(
         store.connection.execute("DELETE FROM spend_day_totals")
     reopened = SpendLedger(store, clock)
     assert reopened.customer_day_spent("acme", TODAY) == Decimal("0.65")
+
+
+# Stale reservations: the lease
+
+LEASE = timedelta(minutes=15)
+
+
+def test_release_stale_reclaims_only_open_reservations_past_the_lease(
+    ledger: SpendLedger, clock: FixedClock
+) -> None:
+    _ok(_reserve(ledger, "0.30", run_id="crashed"))
+    settled = _ok(_reserve(ledger, "0.20", run_id="done"))
+    ledger.settle(settled, Decimal("0.10"))
+    released = _ok(_reserve(ledger, "0.05", run_id="done"))
+    ledger.release(released)
+    clock.advance(timedelta(minutes=10))
+    young = _ok(_reserve(ledger, "0.40", run_id="slow"))
+    clock.advance(timedelta(minutes=6))
+
+    assert ledger.customer_day_spent("acme", TODAY) == Decimal("0.80")
+    # 16 minutes for the crashed run, 6 for the slow one: only the first is past the lease.
+    assert ledger.release_stale(LEASE) == 1
+    assert ledger.customer_day_spent("acme", TODAY) == Decimal("0.50")
+    assert ledger.run_spent("crashed") == 0
+    assert ledger.run_spent("slow") == Decimal("0.40")
+    assert ledger.release_stale(LEASE) == 0
+    # The young one is still open and settles normally.
+    ledger.settle(young, Decimal("0.40"))
+    assert ledger.customer_day_spent("acme", TODAY) == Decimal("0.50")
+
+
+def test_reclaimed_reservations_free_the_day_cap(ledger: SpendLedger, clock: FixedClock) -> None:
+    limits = _limits(run="1.00", day="2.00")
+    for i in range(4):
+        _ok(_reserve(ledger, "0.50", run_id=f"crash-{i}", limits=limits))
+    assert _hit(_reserve(ledger, "0.01", run_id="fresh", limits=limits)).cap is (
+        CapKind.CUSTOMER_DAY
+    )
+    clock.advance(timedelta(minutes=16))
+    assert ledger.release_stale(LEASE) == 4
+    _ok(_reserve(ledger, "0.50", run_id="fresh", limits=limits))
+
+
+def test_a_reclaimed_call_still_counts_toward_its_run(
+    ledger: SpendLedger, clock: FixedClock
+) -> None:
+    limits = _limits(calls=2)
+    _ok(_reserve(ledger, "0.10", limits=limits))
+    clock.advance(timedelta(minutes=16))
+    ledger.release_stale(LEASE)
+    assert ledger.run_calls("run-1") == 1
+    assert ledger.run_spent("run-1") == 0
+    _ok(_reserve(ledger, "0.10", limits=limits))
+    assert _hit(_reserve(ledger, "0.10", limits=limits)).cap is CapKind.CALLS
+
+
+def test_a_late_settle_after_the_sweep_records_the_actual_cost(
+    ledger: SpendLedger, clock: FixedClock
+) -> None:
+    slow = _ok(_reserve(ledger, "0.30"))
+    clock.advance(timedelta(minutes=16))
+    assert ledger.release_stale(LEASE) == 1
+    assert ledger.customer_day_spent("acme", TODAY) == 0
+    ledger.settle(slow, Decimal("0.25"))
+    assert ledger.customer_day_spent("acme", TODAY) == Decimal("0.25")
+    assert ledger.run_spent("run-1") == Decimal("0.25")
+    assert ledger.run_calls("run-1") == 1
+    with pytest.raises(SpendError, match="already settled"):
+        ledger.settle(slow, Decimal("0.25"))
+
+
+def test_a_late_release_after_the_sweep_is_a_no_op(ledger: SpendLedger, clock: FixedClock) -> None:
+    never_ran = _ok(_reserve(ledger, "0.30"))
+    clock.advance(timedelta(minutes=16))
+    ledger.release_stale(LEASE)
+    ledger.release(never_ran)
+    ledger.release(never_ran)
+    assert ledger.customer_day_spent("acme", TODAY) == 0
+
+
+def test_release_stale_rejects_a_negative_age(ledger: SpendLedger) -> None:
+    with pytest.raises(SpendError, match="must not be negative"):
+        ledger.release_stale(timedelta(minutes=-1))
+
+
+def test_release_stale_with_zero_age_reclaims_every_open_reservation(
+    ledger: SpendLedger, clock: FixedClock
+) -> None:
+    _ok(_reserve(ledger, "0.30"))
+    clock.advance(timedelta(microseconds=1))
+    assert ledger.release_stale(timedelta(0)) == 1
+
+
+def test_reclaimed_rows_keep_an_audit_trail(tmp_path: Path, clock: FixedClock) -> None:
+    db = tmp_path / "agentgate.db"
+    with Store(db) as store:
+        ledger = SpendLedger(store, clock)
+        _ok(_reserve(ledger, "0.30"))
+        clock.advance(timedelta(minutes=16))
+        ledger.release_stale(LEASE)
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute(
+            "SELECT status, reserved_usd, actual_usd, finished_at, reclaimed_at"
+            " FROM spend_reservations"
+        ).fetchone()
+    finally:
+        conn.close()
+    swept = (NOON_CHICAGO.astimezone(UTC) + timedelta(minutes=16)).isoformat()
+    assert row == ("released", "0.30", None, swept, swept)
+
+
+def test_running_day_total_matches_a_recount_with_sweeps(clock: FixedClock) -> None:
+    store = Store()
+    ledger = SpendLedger(store, clock)
+    acme, beta = _customer("acme"), _customer("beta")
+    limits = _limits(run="100", day="1000", calls=1000)
+    kept: list[Reservation] = []
+    for i in range(300):
+        customer = acme if i % 3 else beta
+        reservation = _ok(
+            _reserve(
+                ledger, f"0.{i % 89:02d}", run_id=f"run-{i % 7}", customer=customer, limits=limits
+            )
+        )
+        if i % 5 == 0:
+            ledger.release(reservation)
+        elif i % 4 == 0:
+            ledger.settle(reservation, reservation.amount_usd * 2)
+        else:
+            kept.append(reservation)
+        clock.advance(timedelta(minutes=1))
+        if i % 40 == 39:
+            ledger.release_stale(LEASE)
+            # Some hosts were only slow: they settle or release after the sweep.
+            for late in kept[:3]:
+                if i % 80 == 39:
+                    ledger.settle(late, Decimal("0.01"))
+                else:
+                    ledger.release(late)
+            kept = kept[3:]
+    days = {TODAY + timedelta(days=n) for n in range(2)}
+    for customer in (acme, beta):
+        for day in days:
+            assert ledger.customer_day_spent(customer.id, day) == _recount(store, customer.id, day)
+
+
+def test_release_stale_across_connections(tmp_path: Path, clock: FixedClock) -> None:
+    db = tmp_path / "agentgate.db"
+    with Store(db) as host, Store(db) as operator:
+        crashed = SpendLedger(host, clock)
+        _ok(_reserve(crashed, "0.50"))
+        clock.advance(timedelta(minutes=16))
+        assert SpendLedger(operator, clock).release_stale(LEASE) == 1
+        assert crashed.customer_day_spent("acme", TODAY) == 0
+
+
+def test_a_ledger_without_reclaimed_at_is_migrated(tmp_path: Path, clock: FixedClock) -> None:
+    path = tmp_path / "old.db"
+    with Store(path) as store:
+        old = _ok(_reserve(SpendLedger(store, clock), "0.40"))
+        with store.transaction():
+            # The column did not exist before reservations were leases.
+            store.connection.execute("DROP INDEX spend_reservations_open")
+            store.connection.execute("ALTER TABLE spend_reservations DROP COLUMN reclaimed_at")
+    with Store(path) as store:
+        ledger = SpendLedger(store, clock)
+        assert ledger.run_spent("run-1") == Decimal("0.40")
+        clock.advance(timedelta(minutes=16))
+        assert ledger.release_stale(LEASE) == 1
+        ledger.settle(old, Decimal("0.35"))
+        assert ledger.customer_day_spent("acme", TODAY) == Decimal("0.35")

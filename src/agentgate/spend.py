@@ -14,12 +14,28 @@ stored as TEXT, because summing floats would let rounding drift past a cap.
 The customer-day bucket is the customer's local calendar date when the reservation was
 made. A reservation keeps that day when it is settled, even after local midnight, so a call
 that straddles midnight is charged to the day that allowed it.
+
+Reservations are leases. A host killed between reserve and settle (a deploy restart, an OOM
+kill) leaves its reservation open, and an open reservation counts against the customer's
+day, so enough crashed runs would lock the customer out until local midnight.
+`release_stale(older_than)` reclaims every reservation still open after that long:
+`open_world` calls it with a 15 minute lease on every open, and `agentgate spend
+release-stale` lets an operator choose the age. A reclaimed row is `released` with
+`reclaimed_at` set, which keeps it apart from a release the gate asked for:
+
+- money: it no longer counts toward the run or the customer day, like any release;
+- calls: it still counts toward the run's call limit, since the call may well have
+  happened, and a run is never handed back a call by the sweep;
+- late settle: if the host was only slow and settles after the sweep, the actual cost is
+  recorded (the row becomes `settled`, `reclaimed_at` stays as the trail) and added back to
+  the day, because that money was spent;
+- late release: a release after the sweep is a no-op, as the budget is already free.
 """
 
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from zoneinfo import ZoneInfo
@@ -40,13 +56,19 @@ _SCHEMA = (
         reserved_usd TEXT NOT NULL,
         actual_usd TEXT,
         reserved_at TEXT NOT NULL,
-        finished_at TEXT
+        finished_at TEXT,
+        reclaimed_at TEXT
     ) STRICT
     """,
     "CREATE INDEX IF NOT EXISTS spend_reservations_run ON spend_reservations(run_id)",
     """
     CREATE INDEX IF NOT EXISTS spend_reservations_customer_day
         ON spend_reservations(customer_id, day)
+    """,
+    # The stale sweep reads only open rows, which are few however long the ledger grows.
+    """
+    CREATE INDEX IF NOT EXISTS spend_reservations_open
+        ON spend_reservations(reserved_at) WHERE status = 'open'
     """,
     # A running total per customer day, kept in the same transaction as every reservation
     # change, so the daily cap check reads one row instead of summing the whole day.
@@ -103,6 +125,18 @@ class SpendLedger:
         self._store = store
         self._clock = clock
         with store.locked():
+            columns = {
+                str(row[1])
+                for row in store.connection.execute(
+                    "PRAGMA table_info(spend_reservations)"
+                ).fetchall()
+            }
+            if columns and "reclaimed_at" not in columns:
+                # A ledger written before reservations were leases. Added before the
+                # schema below, whose index names the column's table.
+                store.connection.execute(
+                    "ALTER TABLE spend_reservations ADD COLUMN reclaimed_at TEXT"
+                )
             for statement in _SCHEMA:
                 # Each CREATE commits on its own; IF NOT EXISTS makes a second ledger on the
                 # same database, or a reopened file, a no-op.
@@ -179,6 +213,30 @@ class SpendLedger:
         """Drop an open reservation whose call never happened, freeing its budget and call."""
         self._finish(reservation, _RELEASED, None)
 
+    def release_stale(self, older_than: timedelta) -> int:
+        """Reclaim every reservation still open older_than after it was made, and return
+        how many. Each one stops counting toward its run's and customer day's spend in the
+        same transaction, so the running day total stays equal to a recount."""
+        if older_than < timedelta(0):
+            raise SpendError(f"older_than must not be negative, got {older_than}")
+        now = self._clock.now()
+        cutoff = now - older_than
+        with self._store.transaction():
+            rows = self._store.connection.execute(
+                "SELECT id, customer_id, day, reserved_usd, reserved_at FROM spend_reservations"
+                " WHERE status = 'open' ORDER BY reserved_at, id"
+            ).fetchall()
+            # Compared as datetimes, not as text, so a different UTC offset cannot misorder.
+            stale = [row for row in rows if datetime.fromisoformat(row["reserved_at"]) < cutoff]
+            for row in stale:
+                self._store.connection.execute(
+                    "UPDATE spend_reservations SET status = ?, finished_at = ?, reclaimed_at = ?"
+                    " WHERE id = ? AND status = ?",
+                    (_RELEASED, now.isoformat(), now.isoformat(), row["id"], _OPEN),
+                )
+                self._add_to_day(row["customer_id"], row["day"], -Decimal(row["reserved_usd"]))
+        return len(stale)
+
     def run_spent(self, run_id: str) -> Decimal:
         """Settled actuals plus open reservations for one run."""
         with self._store.locked():
@@ -190,10 +248,12 @@ class SpendLedger:
         return _total(rows)
 
     def run_calls(self, run_id: str) -> int:
-        """Reservations for one run that were not released, open or settled."""
+        """Reservations for one run that were not released by the gate: open, settled, or
+        reclaimed by the stale sweep (whose call may have happened)."""
         with self._store.locked():
             (count,) = self._store.connection.execute(
-                "SELECT COUNT(*) FROM spend_reservations WHERE run_id = ? AND status != ?",
+                "SELECT COUNT(*) FROM spend_reservations"
+                " WHERE run_id = ? AND (status != ? OR reclaimed_at IS NOT NULL)",
                 (run_id, _RELEASED),
             ).fetchone()
         return int(count)
@@ -210,8 +270,8 @@ class SpendLedger:
     def _finish(self, reservation: Reservation, status: str, actual: str | None) -> None:
         with self._store.transaction():
             row = self._store.connection.execute(
-                "SELECT run_id, customer_id, day, status, reserved_usd FROM spend_reservations"
-                " WHERE id = ?",
+                "SELECT run_id, customer_id, day, status, reserved_usd, reclaimed_at"
+                " FROM spend_reservations WHERE id = ?",
                 (reservation.id,),
             ).fetchone()
             if row is None:
@@ -220,6 +280,9 @@ class SpendLedger:
             # whose id points at another run's or customer's row.
             if row["run_id"] != reservation.run_id or row["customer_id"] != reservation.customer_id:
                 raise SpendError(f"reservation {reservation.id!r} does not match the ledger")
+            if row["status"] == _RELEASED and row["reclaimed_at"] is not None:
+                self._finish_reclaimed(reservation, row, status, actual)
+                return
             if row["status"] != _OPEN:
                 raise SpendError(f"reservation {reservation.id!r} is already {row['status']}")
             self._store.connection.execute(
@@ -232,6 +295,20 @@ class SpendLedger:
             reserved = Decimal(row["reserved_usd"])
             change = (Decimal(0) if actual is None else Decimal(actual)) - reserved
             self._add_to_day(row["customer_id"], row["day"], change)
+
+    def _finish_reclaimed(
+        self, reservation: Reservation, row: sqlite3.Row, status: str, actual: str | None
+    ) -> None:
+        # The sweep already took the reserved amount off the day. A late release has nothing
+        # left to free; a late settle records the money that was spent after all.
+        if status != _SETTLED or actual is None:
+            return
+        self._store.connection.execute(
+            "UPDATE spend_reservations SET status = ?, actual_usd = ?, finished_at = ?"
+            " WHERE id = ? AND status = ?",
+            (_SETTLED, actual, self._clock.now().isoformat(), reservation.id, _RELEASED),
+        )
+        self._add_to_day(row["customer_id"], row["day"], Decimal(actual))
 
     def _add_to_day(self, customer_id: str, day: str, change: Decimal) -> None:
         # Only called inside a store transaction, alongside the reservation row it mirrors.

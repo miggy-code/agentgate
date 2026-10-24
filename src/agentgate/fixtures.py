@@ -3,6 +3,16 @@
 Loading parses and cross-checks every file before writing anything, then inserts all rows
 in one store transaction. A fixture mistake therefore fails with the offending file named
 and leaves the store unchanged.
+
+`sync_fixtures` applies the fixtures to a store that already holds data, the same way: all
+checks first, then one transaction. It adds customers, users and documents the store does
+not have, and updates the ones it has: customer name, domains and timezone; user name,
+email, role and status; document title, label, tags, assignment and body. It never deletes
+a row. A user no longer in the fixtures is suspended. A document no longer in the fixtures
+is left in place and reported, except notes written at runtime (tag "note"), which were
+never fixtures. A user suspended by an operator (Store.suspend_user) stays suspended even
+when the fixtures say active; see Store.reinstate_user. A user or document whose fixture
+names another customer than the store does is refused, since tenancy never moves.
 """
 
 import re
@@ -15,7 +25,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from agentgate._yaml import parse_yaml
-from agentgate.models import Customer, Document, User
+from agentgate.models import Customer, Document, User, UserStatus
 from agentgate.store import Store
 
 # A fixture canary line. The red-team suite reuses this to recognise the planted secrets.
@@ -57,16 +67,63 @@ def find_canaries(text: str) -> list[str]:
     return CANARY_TOKEN_RE.findall(text)
 
 
+@dataclass(frozen=True)
+class FixtureSync:
+    """What sync_fixtures changed, and what it found but left alone. Ids are sorted."""
+
+    customers_added: tuple[str, ...] = ()
+    customers_updated: tuple[str, ...] = ()
+    users_added: tuple[str, ...] = ()
+    # (user id, the fields that changed), for users in the fixtures.
+    users_updated: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Users no longer in the fixtures, suspended by this sync.
+    users_suspended: tuple[str, ...] = ()
+    # Users the fixtures call active whom an operator suspended; they stay suspended.
+    users_kept_suspended: tuple[str, ...] = ()
+    documents_added: tuple[str, ...] = ()
+    documents_updated: tuple[str, ...] = ()
+    # Documents no longer in the fixtures (runtime notes aside), left in the store.
+    documents_not_in_fixtures: tuple[str, ...] = ()
+
+    @property
+    def changed(self) -> bool:
+        """Whether the sync wrote anything."""
+        return bool(
+            self.customers_added
+            or self.customers_updated
+            or self.users_added
+            or self.users_updated
+            or self.users_suspended
+            or self.documents_changed
+        )
+
+    @property
+    def documents_changed(self) -> bool:
+        """Whether any document was added or updated, so the search index is stale."""
+        return bool(self.documents_added or self.documents_updated)
+
+    def lines(self) -> list[str]:
+        """A short summary, one line per kind of change, ids only (never document text)."""
+        parts: list[tuple[str, tuple[str, ...]]] = [
+            ("customers added", self.customers_added),
+            ("customers updated", self.customers_updated),
+            ("users added", self.users_added),
+            (
+                "users updated",
+                tuple(f"{uid} ({', '.join(fields)})" for uid, fields in self.users_updated),
+            ),
+            ("users suspended, no longer in fixtures", self.users_suspended),
+            ("users kept suspended by an operator", self.users_kept_suspended),
+            ("documents added", self.documents_added),
+            ("documents updated", self.documents_updated),
+            ("documents no longer in fixtures, kept", self.documents_not_in_fixtures),
+        ]
+        return [f"{label}: {', '.join(ids)}" for label, ids in parts if ids]
+
+
 def load_fixtures(store: Store, root: Path) -> FixtureSummary:
     """Load every customer directory under root, in sorted order, as one transaction."""
-    bundles = [
-        _load_customer_dir(path)
-        for path in sorted(root.iterdir())
-        if path.is_dir() and not path.name.startswith(".")
-    ]
-    _check_unique_ids(bundles)
-    _check_assignments(bundles)
-    _check_canaries(bundles)
+    bundles = _load_bundles(root)
 
     with store.transaction():
         for bundle in bundles:
@@ -76,6 +133,120 @@ def load_fixtures(store: Store, root: Path) -> FixtureSummary:
             CustomerCounts(b.customer.id, len(b.users), len(b.documents)) for b in bundles
         )
     )
+
+
+def sync_fixtures(store: Store, root: Path) -> FixtureSync:
+    """Apply the fixtures under root to a store that may already hold them (see the module
+    docstring for what changes). Everything is checked before the one transaction, and a
+    conflict with the store rolls all of it back."""
+    bundles = _load_bundles(root)
+    with store.transaction():
+        return _sync(store, bundles)
+
+
+def _load_bundles(root: Path) -> list["_CustomerBundle"]:
+    bundles = [
+        _load_customer_dir(path)
+        for path in sorted(root.iterdir())
+        if path.is_dir() and not path.name.startswith(".")
+    ]
+    _check_unique_ids(bundles)
+    _check_assignments(bundles)
+    _check_canaries(bundles)
+    return bundles
+
+
+_USER_FIELDS = ("name", "email", "role", "status")
+
+
+def _sync(store: Store, bundles: list["_CustomerBundle"]) -> FixtureSync:
+    customers_added: list[str] = []
+    customers_updated: list[str] = []
+    for bundle in bundles:
+        current = store.get_customer(bundle.customer.id)
+        if current is None:
+            _write(bundle.customer_path, partial(store.add_customer, bundle.customer))
+            customers_added.append(bundle.customer.id)
+        elif current != bundle.customer:
+            _write(bundle.customer_path, partial(store.update_customer, bundle.customer))
+            customers_updated.append(bundle.customer.id)
+
+    users_added: list[str] = []
+    users_updated: list[tuple[str, tuple[str, ...]]] = []
+    kept: list[str] = []
+    in_fixtures: set[str] = set()
+    for bundle in bundles:
+        for user in bundle.users:
+            in_fixtures.add(user.id)
+            stored = store.get_user(user.id)
+            if stored is None:
+                _write(bundle.users_path, partial(store.add_user, user))
+                users_added.append(user.id)
+                continue
+            if stored.customer_id != user.customer_id:
+                raise FixtureError(
+                    f"{bundle.users_path}: user {user.id!r} belongs to customer"
+                    f" {stored.customer_id!r} in the store"
+                )
+            wanted = user
+            if user.status is UserStatus.ACTIVE and store.operator_suspended(user.id):
+                wanted = user.model_copy(update={"status": UserStatus.SUSPENDED})
+                kept.append(user.id)
+            fields = tuple(f for f in _USER_FIELDS if getattr(stored, f) != getattr(wanted, f))
+            if fields:
+                _write(bundle.users_path, partial(store.update_user, wanted))
+                users_updated.append((user.id, fields))
+
+    suspended: list[str] = []
+    for customer in store.list_customers():
+        for user in store.list_users(customer.id):
+            if user.id not in in_fixtures and user.status is UserStatus.ACTIVE:
+                store.update_user(user.model_copy(update={"status": UserStatus.SUSPENDED}))
+                suspended.append(user.id)
+
+    documents_added: list[str] = []
+    documents_updated: list[str] = []
+    doc_ids: set[str] = set()
+    for bundle in bundles:
+        for path, document in bundle.documents:
+            doc_ids.add(document.id)
+            stored_doc = store.get_document(document.id)
+            if stored_doc is None:
+                _write(path, partial(store.add_document, document))
+                documents_added.append(document.id)
+            elif stored_doc.customer_id != document.customer_id:
+                raise FixtureError(
+                    f"{path}: document {document.id!r} belongs to customer"
+                    f" {stored_doc.customer_id!r} in the store"
+                )
+            elif stored_doc != document:
+                _write(path, partial(store.update_document, document))
+                documents_updated.append(document.id)
+
+    left = [
+        document.id
+        for customer in store.list_customers()
+        for document in store.list_documents(customer.id)
+        if document.id not in doc_ids and "note" not in document.tags
+    ]
+    return FixtureSync(
+        customers_added=tuple(sorted(customers_added)),
+        customers_updated=tuple(sorted(customers_updated)),
+        users_added=tuple(sorted(users_added)),
+        users_updated=tuple(sorted(users_updated)),
+        users_suspended=tuple(sorted(suspended)),
+        users_kept_suspended=tuple(sorted(kept)),
+        documents_added=tuple(sorted(documents_added)),
+        documents_updated=tuple(sorted(documents_updated)),
+        documents_not_in_fixtures=tuple(sorted(left)),
+    )
+
+
+def _write(path: Path, write: Callable[[], None]) -> None:
+    try:
+        write()
+    except sqlite3.IntegrityError as exc:
+        raise FixtureError(f"{path}: conflicts with existing store data: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -245,7 +416,4 @@ def _insert(store: Store, bundle: _CustomerBundle) -> None:
         *((path, partial(store.add_document, doc)) for path, doc in bundle.documents),
     ]
     for path, write in writes:
-        try:
-            write()
-        except sqlite3.IntegrityError as exc:
-            raise FixtureError(f"{path}: conflicts with existing store data: {exc}") from exc
+        _write(path, write)

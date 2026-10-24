@@ -8,10 +8,23 @@ Other components (spend ledger, approvals, retrieval index) keep their own table
 same database through `connection`, always inside `transaction()` or `locked()`. One
 connection is shared across threads behind a re-entrant lock, because with autocommit off a
 statement from a second thread would otherwise land inside the first thread's transaction.
+
+The database holds every document, approval argument and email body, so a store file is
+owner-only: a new file is created 0600, and an existing file that other users can read is
+tightened to 0600 when it is opened (`tightened_from` keeps the mode it had, for callers
+that want to say so). A database that is a Panoptes audit log is refused before anything is
+written to it, so a mistyped path cannot mix store tables into the audit log.
+
+A user suspended by an operator (`suspend_user`, behind `agentgate users suspend`) carries a
+flag, `suspended_by_operator`. Fixture sync never reactivates a flagged user; only
+`reinstate_user` clears the flag, after which the user's status comes from fixtures again.
 """
 
+import contextlib
 import json
+import os
 import sqlite3
+import stat
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -35,7 +48,8 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
     role TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    suspended_by_operator INTEGER NOT NULL DEFAULT 0 CHECK (suspended_by_operator IN (0, 1))
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS users_customer_id ON users(customer_id);
@@ -54,6 +68,18 @@ CREATE INDEX IF NOT EXISTS documents_customer_id ON documents(customer_id);
 """
 
 
+# Mode bits a store file may keep: owner read and write. Execute and every group and other
+# bit are removed when an existing file is opened.
+_FILE_MODE = 0o600
+_DIR_MODE = 0o700
+# SQLite's side files, which hold copies of pages while a transaction is open.
+_SIDE_FILES = ("-journal", "-wal", "-shm")
+
+
+class StoreError(ValueError):
+    """The path does not hold an agentgate store, or a row does not match the store."""
+
+
 def _sorted_json(values: Iterable[str]) -> str:
     # Sets have no order; sorting keeps rows and any dumps byte-for-byte reproducible.
     return json.dumps(sorted(values))
@@ -63,13 +89,26 @@ class Store:
     """Customers, users and documents in one SQLite database."""
 
     def __init__(self, path: str | Path = ":memory:") -> None:
+        file_path = None if str(path) in {":memory:", ""} else Path(path)
+        # The mode an existing file had before it was tightened to owner-only, or None.
+        self.tightened_from: int | None = None
+        if file_path is not None:
+            self.tightened_from = _prepare_file(file_path)
         # isolation_level=None turns off sqlite3's implicit transactions, so single writes
         # commit immediately and transaction() alone decides multi-write boundaries.
         self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.executescript(_SCHEMA)
+        try:
+            self._conn.row_factory = sqlite3.Row
+            self._lock = threading.RLock()
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            if file_path is not None:
+                # Before the schema script, which would write store tables into the file.
+                _refuse_audit_database(self._conn, file_path)
+            self._conn.executescript(_SCHEMA)
+            _migrate(self._conn)
+        except BaseException:
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -159,6 +198,87 @@ class Store:
                 ),
             )
 
+    def update_customer(self, customer: Customer) -> None:
+        """Replace a stored customer's name, domains and timezone."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE customers SET name = ?, domains = ?, timezone = ? WHERE id = ?",
+                (customer.name, json.dumps(list(customer.domains)), customer.timezone, customer.id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError(f"unknown customer {customer.id!r}")
+
+    def update_user(self, user: User) -> None:
+        """Replace a stored user's name, email, role and status. The customer cannot change,
+        and the operator suspension flag is left as it is."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE users SET name = ?, email = ?, role = ?, status = ?"
+                " WHERE id = ? AND customer_id = ?",
+                (
+                    user.name,
+                    user.email,
+                    user.role.value,
+                    user.status.value,
+                    user.id,
+                    user.customer_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError(f"unknown user {user.id!r} in customer {user.customer_id!r}")
+
+    def update_document(self, document: Document) -> None:
+        """Replace a stored document's title, label, tags, assignment and body. The customer
+        cannot change."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE documents SET title = ?, label = ?, tags = ?, assigned_user_ids = ?,"
+                " body = ? WHERE id = ? AND customer_id = ?",
+                (
+                    document.title,
+                    document.label,
+                    _sorted_json(document.tags),
+                    _sorted_json(document.assigned_user_ids),
+                    document.body,
+                    document.id,
+                    document.customer_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError(
+                    f"unknown document {document.id!r} in customer {document.customer_id!r}"
+                )
+
+    def suspend_user(self, user_id: str) -> User | None:
+        """Suspend a user as an operator: status suspended, and flagged so that fixture sync
+        does not reactivate them. Returns the updated user, or None if there is none.
+
+        Takes effect on the user's next gate call, in this process or any other, since the
+        gate reads the user again on every call."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET status = 'suspended', suspended_by_operator = 1 WHERE id = ?",
+                (user_id,),
+            )
+            return self.get_user(user_id)
+
+    def reinstate_user(self, user_id: str) -> User | None:
+        """Clear an operator suspension. The status is left for fixture sync to set, so a
+        user the fixtures suspend stays suspended. Returns the user, or None."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET suspended_by_operator = 0 WHERE id = ?", (user_id,)
+            )
+            return self.get_user(user_id)
+
+    def operator_suspended(self, user_id: str) -> bool:
+        """Whether an operator suspended this user (see suspend_user)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT suspended_by_operator FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            return row is not None and bool(row["suspended_by_operator"])
+
     def get_customer(self, customer_id: str) -> Customer | None:
         with self._lock:
             row = self._conn.execute(
@@ -215,7 +335,10 @@ def _customer(row: sqlite3.Row) -> Customer:
 
 
 def _user(row: sqlite3.Row) -> User:
-    return User.model_validate(dict(row))
+    # The operator flag is the store's bookkeeping, not part of the model.
+    fields = dict(row)
+    fields.pop("suspended_by_operator", None)
+    return User.model_validate(fields)
 
 
 def _document(row: sqlite3.Row) -> Document:
@@ -230,3 +353,90 @@ def _document(row: sqlite3.Row) -> Document:
             "body": row["body"],
         }
     )
+
+
+def make_private_dirs(directory: Path) -> None:
+    """Create directory and any missing parents owner-only (0700, less any umask bits).
+
+    Directories that already exist are left exactly as they are."""
+    missing: list[Path] = []
+    current = directory
+    while not current.exists() and current != current.parent:
+        missing.append(current)
+        current = current.parent
+    for path in reversed(missing):
+        # Another process may create it in between; it is theirs to keep as made.
+        with contextlib.suppress(FileExistsError):
+            path.mkdir(mode=_DIR_MODE)
+
+
+def table_names(path: Path) -> set[str] | None:
+    """The table names in the SQLite file at path, opened read-only, or None when there is
+    no such file or it is not an SQLite database."""
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return None
+    return {str(name) for (name,) in rows}
+
+
+def _prepare_file(path: Path) -> int | None:
+    """Create path owner-only if it is missing; tighten it if other users can read it.
+
+    Returns the mode an existing file had when it was tightened, else None."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _FILE_MODE)
+    except FileExistsError:
+        tightened = _tighten(path)
+        for suffix in _SIDE_FILES:
+            side = path.with_name(path.name + suffix)
+            if side.exists():
+                _tighten(side)
+        return tightened
+    os.close(fd)
+    return None
+
+
+def _tighten(path: Path) -> int | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    # Anything but a regular file is left for SQLite to refuse.
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & ~_FILE_MODE == 0:
+        return None
+    try:
+        os.chmod(path, mode & _FILE_MODE)
+    except OSError:
+        # Not the owner: nothing this process can change, and SQLite decides access.
+        return None
+    return mode
+
+
+def _refuse_audit_database(conn: sqlite3.Connection, path: Path) -> None:
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    }
+    # The store never has an events table; Panoptes keeps its hash chain beside one.
+    if "events" in tables:
+        raise StoreError(f"{path}: is a Panoptes audit database, not an agentgate store")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "suspended_by_operator" not in columns:
+        # A store written before operator suspensions existed.
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN suspended_by_operator INTEGER NOT NULL DEFAULT 0"
+            " CHECK (suspended_by_operator IN (0, 1))"
+        )

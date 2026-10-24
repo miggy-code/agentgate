@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,8 +9,10 @@ from agentgate.fixtures import (
     CustomerCounts,
     FixtureError,
     FixtureSummary,
+    FixtureSync,
     find_canaries,
     load_fixtures,
+    sync_fixtures,
 )
 from agentgate.models import Customer, Document, Role, User, UserStatus
 from agentgate.store import Store
@@ -464,3 +467,237 @@ def test_canary_helpers() -> None:
     assert find_canaries(text) == [CANARY_A, CANARY_B, CANARY_A]
     assert CANARY_RE.findall(text) == [CANARY_A]
     assert find_canaries("nothing to see") == []
+
+
+# Sync into an existing store
+
+
+def _two_customers(root: Path) -> None:
+    write_customer(root, "acme")
+    write_users(
+        root,
+        "acme",
+        [
+            user_entry("acme-owner", "acme", role="owner"),
+            user_entry("acme-staff", "acme"),
+            user_entry("acme-temp", "acme"),
+        ],
+    )
+    write_doc(root, "acme", "acme-sop", tags=["sop"])
+    write_doc(root, "acme", "acme-old")
+    write_customer(root, "beta")
+    write_users(root, "beta", [user_entry("beta-owner", "beta", role="owner")])
+
+
+@pytest.fixture
+def synced(tmp_path: Path) -> tuple[Store, Path]:
+    root = tmp_path / "fixtures"
+    _two_customers(root)
+    store = Store()
+    load_fixtures(store, root)
+    return store, root
+
+
+def test_sync_without_changes_reports_nothing(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    result = sync_fixtures(store, root)
+    assert result == FixtureSync()
+    assert not result.changed and result.lines() == []
+
+
+def test_sync_adds_customers_users_and_documents(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    write_customer(root, "gamma")
+    write_users(root, "gamma", [user_entry("gamma-owner", "gamma", role="owner")])
+    write_doc(root, "gamma", "gamma-faq", label="public")
+    write_users(
+        root,
+        "acme",
+        [
+            user_entry("acme-owner", "acme", role="owner"),
+            user_entry("acme-staff", "acme"),
+            user_entry("acme-temp", "acme"),
+            user_entry("acme-new", "acme"),
+        ],
+    )
+    result = sync_fixtures(store, root)
+    assert result.customers_added == ("gamma",)
+    assert result.users_added == ("acme-new", "gamma-owner")
+    assert result.documents_added == ("gamma-faq",)
+    assert result.changed and result.documents_changed
+    assert store.get_customer("gamma") is not None
+    assert [u.id for u in store.list_users("gamma")] == ["gamma-owner"]
+    assert result.lines() == [
+        "customers added: gamma",
+        "users added: acme-new, gamma-owner",
+        "documents added: gamma-faq",
+    ]
+
+
+def test_sync_updates_users_customers_and_documents(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    write_customer(root, "acme", name="Acme Renamed", timezone="America/Denver")
+    write_users(
+        root,
+        "acme",
+        [
+            user_entry("acme-owner", "acme", role="owner", name="Owner Renamed"),
+            user_entry("acme-staff", "acme", role="manager", email="staff@acme.example"),
+            user_entry("acme-temp", "acme", status="suspended"),
+        ],
+    )
+    write_doc(
+        root,
+        "acme",
+        "acme-sop",
+        body=secret_body(CANARY_A),
+        title="SOP v2",
+        label="confidential",
+        tags=["sop", "assigned"],
+        assigned_user_ids=["acme-staff"],
+    )
+    result = sync_fixtures(store, root)
+    assert result.customers_updated == ("acme",)
+    assert result.users_updated == (
+        ("acme-owner", ("name",)),
+        ("acme-staff", ("email", "role")),
+        ("acme-temp", ("status",)),
+    )
+    assert result.documents_updated == ("acme-sop",)
+    customer = store.get_customer("acme")
+    assert customer is not None and customer.timezone == "America/Denver"
+    staff = store.get_user("acme-staff")
+    assert staff is not None and staff.role is Role.MANAGER
+    assert staff.email == "staff@acme.example"
+    temp = store.get_user("acme-temp")
+    assert temp is not None and temp.status is UserStatus.SUSPENDED
+    doc = store.get_document("acme-sop")
+    assert doc is not None
+    assert (doc.title, doc.label, doc.assigned_user_ids) == (
+        "SOP v2",
+        "confidential",
+        frozenset({"acme-staff"}),
+    )
+    assert find_canaries(doc.body) == [CANARY_A]
+    # Applied once: a second sync finds nothing left to do.
+    assert not sync_fixtures(store, root).changed
+
+
+def test_sync_suspends_removed_users_and_keeps_removed_documents(
+    synced: tuple[Store, Path],
+) -> None:
+    store, root = synced
+    write_users(
+        root,
+        "acme",
+        [user_entry("acme-owner", "acme", role="owner"), user_entry("acme-staff", "acme")],
+    )
+    (root / "acme" / "docs" / "acme-old.md").unlink()
+    store.add_document(
+        Document(
+            id="note-1", customer_id="acme", title="N", label="internal", tags={"note"}, body="x"
+        )
+    )
+    result = sync_fixtures(store, root)
+    assert result.users_suspended == ("acme-temp",)
+    assert result.documents_not_in_fixtures == ("acme-old",)
+    assert result.lines() == [
+        "users suspended, no longer in fixtures: acme-temp",
+        "documents no longer in fixtures, kept: acme-old",
+    ]
+    temp = store.get_user("acme-temp")
+    assert temp is not None and temp.status is UserStatus.SUSPENDED
+    # Nothing is deleted, and runtime notes are not fixtures.
+    assert store.get_document("acme-old") is not None
+    assert store.get_document("note-1") is not None
+    again = sync_fixtures(store, root)
+    assert not again.changed
+    assert again.documents_not_in_fixtures == ("acme-old",)
+
+
+def test_a_removed_customer_has_its_users_suspended(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    shutil.rmtree(root / "beta")
+    result = sync_fixtures(store, root)
+    assert result.users_suspended == ("beta-owner",)
+    assert store.get_customer("beta") is not None
+
+
+def test_an_operator_suspension_survives_sync(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    store.suspend_user("acme-staff")
+    result = sync_fixtures(store, root)
+    assert result.users_kept_suspended == ("acme-staff",)
+    assert not result.changed
+    assert result.lines() == ["users kept suspended by an operator: acme-staff"]
+    staff = store.get_user("acme-staff")
+    assert staff is not None and staff.status is UserStatus.SUSPENDED
+    # Other fields still follow the fixtures.
+    write_users(
+        root,
+        "acme",
+        [
+            user_entry("acme-owner", "acme", role="owner"),
+            user_entry("acme-staff", "acme", role="manager"),
+            user_entry("acme-temp", "acme"),
+        ],
+    )
+    assert sync_fixtures(store, root).users_updated == (("acme-staff", ("role",)),)
+    staff = store.get_user("acme-staff")
+    assert staff is not None and staff.role is Role.MANAGER
+    assert staff.status is UserStatus.SUSPENDED
+    store.reinstate_user("acme-staff")
+    assert sync_fixtures(store, root).users_updated == (("acme-staff", ("status",)),)
+    staff = store.get_user("acme-staff")
+    assert staff is not None and staff.status is UserStatus.ACTIVE
+
+
+def test_sync_refuses_to_move_a_user_or_document_to_another_customer(
+    synced: tuple[Store, Path],
+) -> None:
+    store, root = synced
+    write_users(
+        root,
+        "beta",
+        [user_entry("beta-owner", "beta", role="owner"), user_entry("acme-temp", "beta")],
+    )
+    write_users(
+        root,
+        "acme",
+        [user_entry("acme-owner", "acme", role="owner"), user_entry("acme-staff", "acme")],
+    )
+    with pytest.raises(FixtureError, match="user 'acme-temp' belongs to customer 'acme'"):
+        sync_fixtures(store, root)
+
+    _two_customers(root)
+    (root / "beta" / "docs").mkdir()
+    (root / "acme" / "docs" / "acme-old.md").rename(root / "beta" / "docs" / "acme-old.md")
+    with pytest.raises(FixtureError, match="document 'acme-old' belongs to customer 'acme'"):
+        sync_fixtures(store, root)
+
+
+def test_a_conflicting_sync_rolls_back_everything(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    write_customer(root, "gamma")
+    # A new user taking the email of a user the fixtures no longer list.
+    write_users(
+        root,
+        "acme",
+        [user_entry("acme-owner", "acme", role="owner"), user_entry("acme-staff", "acme")],
+    )
+    write_users(root, "gamma", [user_entry("gamma-owner", "gamma", email="acme-temp@acme.example")])
+    with pytest.raises(FixtureError, match="conflicts with existing store data"):
+        sync_fixtures(store, root)
+    assert store.get_customer("gamma") is None
+    temp = store.get_user("acme-temp")
+    assert temp is not None and temp.status is UserStatus.ACTIVE
+
+
+def test_an_invalid_fixture_changes_nothing(synced: tuple[Store, Path]) -> None:
+    store, root = synced
+    write_customer(root, "gamma")
+    write_users(root, "gamma", [user_entry("gamma-owner", "gamma")])
+    write_doc_text(root, "acme", "acme-broken", "no front matter\n")
+    with pytest.raises(FixtureError, match="front matter"):
+        sync_fixtures(store, root)
+    assert store.get_customer("gamma") is None

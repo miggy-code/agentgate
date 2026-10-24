@@ -1,9 +1,17 @@
-"""The agentgate command line: policy lint and test, audit verify, the approval queue, the
-demo, one-off agent runs, the MCP gateway, the red-team suite and the latency bench.
+"""The agentgate command line: policy lint and test, audit verify, the approval queue, users,
+the spend ledger, the demo, one-off agent runs, the MCP gateway, the red-team suite and the
+latency bench.
 
 Output is plain, deterministic text (customers sorted, cases in file order, no colour), so
 it reads the same in a terminal, a CI log and a diff. Problems that stop a command go to
-stderr as one "error: ..." line with exit status 1.
+stderr as one "error: ..." line with exit status 1. That includes database problems while a
+command runs (a read-only, locked or corrupt file): never a traceback.
+
+Commands that open a world on disk refuse a --db and --audit-db that are the same file, a
+--db that is a Panoptes audit log and an --audit-db that is an agentgate store, before
+anything is written. Opening a world also syncs the fixtures, reclaims stale spend
+reservations and tightens a store file other users could read; when any of that changed
+something it says so on stderr, after the demo-identity note, and never on stdout.
 """
 
 import json
@@ -12,7 +20,7 @@ import sqlite3
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -51,9 +59,13 @@ from agentgate.world import (
     DEFAULT_DB,
     DEFAULT_FIXTURES,
     DEFAULT_POLICIES,
+    DEFAULT_RESERVATION_LEASE,
+    UserAdminError,
     World,
     open_memory_world,
     open_world,
+    reinstate_user,
+    suspend_user,
 )
 
 app = typer.Typer(
@@ -78,6 +90,12 @@ gateway_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(gateway_app, name="gateway")
+users_app = typer.Typer(
+    help="List, suspend and reinstate users. --as names the acting user.", no_args_is_help=True
+)
+app.add_typer(users_app, name="users")
+spend_app = typer.Typer(help="Operate the spend ledger.", no_args_is_help=True)
+app.add_typer(spend_app, name="spend")
 
 PoliciesOption = Annotated[
     Path, typer.Option("--policies", help="Directory holding one folder per customer policy.")
@@ -174,6 +192,8 @@ def verify(
     try:
         result = sink.verify()
         count = sink.count()
+    except sqlite3.Error as exc:
+        _fail(_database_error(exc))
     finally:
         sink.close()
     if result["valid"]:
@@ -205,18 +225,62 @@ NoteOption = Annotated[str | None, typer.Option("--note", help="Note stored with
 DEMO_IDENTITY_NOTE = "note: --as is a demo identity; agentgate does not authenticate users"
 
 
+def _database_error(exc: sqlite3.Error) -> str:
+    # sqlite3 messages name the problem ("database is locked", "attempt to write a readonly
+    # database") but not the data, so they are safe to print.
+    return f"database error: {exc}"
+
+
 @contextmanager
-def _world(db: Path, audit_db: Path, policies: Path, fixtures: Path) -> Iterator[World]:
+def _world(
+    db: Path,
+    audit_db: Path,
+    policies: Path,
+    fixtures: Path,
+    *,
+    reservation_lease: timedelta | None = DEFAULT_RESERVATION_LEASE,
+) -> Iterator[World]:
     # Printed before anything else, so even a failing command says it once.
     typer.echo(DEMO_IDENTITY_NOTE, err=True)
     try:
-        world = open_world(db_path=db, audit_path=audit_db, policies=policies, fixtures=fixtures)
-    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        world = open_world(
+            db_path=db,
+            audit_path=audit_db,
+            policies=policies,
+            fixtures=fixtures,
+            reservation_lease=reservation_lease,
+        )
+    except sqlite3.Error as exc:
+        _fail(_database_error(exc))
+    except (OSError, ValueError, RuntimeError) as exc:
         _fail(str(exc))
     try:
+        _report_open(world, db)
         yield world
+    except sqlite3.Error as exc:
+        _fail(_database_error(exc))
     finally:
         world.close()
+
+
+def _report_open(world: World, db: Path) -> None:
+    """Say on stderr what opening the world changed, if anything."""
+    before = world.store.tightened_from
+    if before is not None:
+        typer.echo(
+            f"warning: {db} was open to other users (mode {before:04o});"
+            f" tightened to {before & 0o600:04o}",
+            err=True,
+        )
+    synced = world.fixture_sync
+    if synced is not None and synced.changed:
+        for line in synced.lines():
+            typer.echo(f"fixtures: {line}", err=True)
+    if world.stale_released:
+        typer.echo(
+            f"note: released {world.stale_released} stale spend reservations",
+            err=True,
+        )
 
 
 def _approver(world: World, user_id: str) -> User:
@@ -231,6 +295,18 @@ def _approver(world: World, user_id: str) -> User:
         _fail(f"customer {user.customer_id!r} has no policy")
     if user.role not in engine.bundle.policy.approvals.approver_roles:
         _fail(f"role {user.role.value!r} may not review approvals")
+    return user
+
+
+def _owner(world: World, user_id: str) -> User:
+    """The acting user, if active and an owner of their customer."""
+    user = world.store.get_user(user_id)
+    if user is None:
+        _fail(f"unknown user {user_id!r}")
+    if user.status is not UserStatus.ACTIVE:
+        _fail(f"user {user_id!r} is not active")
+    if user.role is not Role.OWNER:
+        _fail(f"role {user.role.value!r} may not do this; owners only")
     return user
 
 
@@ -255,15 +331,21 @@ def approvals_list(
     policies: PoliciesOption = DEFAULT_POLICIES,
     fixtures: FixturesOption = DEFAULT_FIXTURES,
 ) -> None:
-    """List the acting approver's customer's approvals, oldest first."""
+    """List the acting approver's customer's approvals, oldest first.
+
+    Read-only: an approval past its expiry is shown as "expired (pending sweep)" and counts
+    as expired for --status, but only `approvals expire` marks it."""
     with _world(db, audit_db, policies, fixtures) as world:
         user = _approver(world, as_user)
-        # So approvals past their expiry show as expired, not pending.
-        world.gate.expire_due()
-        approvals = world.gate.approvals.list(user.customer_id, status)
+        now = world.clock.now()
+        approvals = [
+            approval
+            for approval in world.gate.approvals.list(user.customer_id)
+            if status is None or _effective_status(approval, now) is status
+        ]
     for approval in approvals:
         typer.echo(
-            f"{approval.id}  {approval.status.value}  {approval.tool}"
+            f"{approval.id}  {_shown_status(approval, now)}  {approval.tool}"
             f"  {approval.requested_by}  risk {approval.risk_score}"
             f"  created {_time(approval.created_at)}  expires {_time(approval.expires_at)}"
         )
@@ -279,23 +361,45 @@ def approvals_show(
     policies: PoliciesOption = DEFAULT_POLICIES,
     fixtures: FixturesOption = DEFAULT_FIXTURES,
 ) -> None:
-    """Show every field of one approval, including the exact args that would run."""
+    """Show every field of one approval, including the exact args that would run.
+
+    Read-only, like list: an overdue approval shows as "expired (pending sweep)"."""
     with _world(db, audit_db, policies, fixtures) as world:
         user = _approver(world, as_user)
-        world.gate.expire_due()
+        now = world.clock.now()
         approval = world.gate.approvals.get(approval_id)
     # Another customer's approval reads exactly like a missing one.
     if approval is None or approval.customer_id != user.customer_id:
         _fail("approval not found")
-    for line in _describe(approval):
+    for line in _describe(approval, now):
         typer.echo(line)
 
 
-def _describe(approval: Approval) -> list[str]:
+# Statuses an approval leaves when its expiry passes (ApprovalQueue.expire_due).
+_EXPIRING = frozenset({ApprovalStatus.PENDING, ApprovalStatus.APPROVED})
+PENDING_SWEEP = "expired (pending sweep)"
+
+
+def _effective_status(approval: Approval, now: datetime) -> ApprovalStatus:
+    """The status the approval has in effect: expired once past its expiry, swept or not.
+    The queue refuses to decide or run an overdue approval either way."""
+    if approval.status in _EXPIRING and now >= approval.expires_at:
+        return ApprovalStatus.EXPIRED
+    return approval.status
+
+
+def _shown_status(approval: Approval, now: datetime) -> str:
+    effective = _effective_status(approval, now)
+    if effective is not approval.status:
+        return PENDING_SWEEP
+    return approval.status.value
+
+
+def _describe(approval: Approval, now: datetime) -> list[str]:
     fields = [
         ("id", approval.id),
         ("customer", approval.customer_id),
-        ("status", approval.status.value),
+        ("status", _shown_status(approval, now)),
         ("tool", approval.tool),
         ("action", approval.action.value),
         ("requested_by", approval.requested_by),
@@ -389,6 +493,120 @@ def approvals_expire(
     typer.echo(f"expired {len(expired)} approvals")
 
 
+# users
+
+
+@users_app.command("list")
+def users_list(
+    as_user: AsOption,
+    customer: Annotated[
+        str | None,
+        typer.Option(
+            "--customer", metavar="ID", help="Must be the acting user's own customer, if given."
+        ),
+    ] = None,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """List the acting user's customer's users: id, role and status."""
+    with _world(db, audit_db, policies, fixtures) as world:
+        user = world.store.get_user(as_user)
+        if user is None:
+            _fail(f"unknown user {as_user!r}")
+        if user.status is not UserStatus.ACTIVE:
+            _fail(f"user {as_user!r} is not active")
+        # Another customer reads exactly like a missing one.
+        if customer is not None and customer != user.customer_id:
+            _fail(f"customer {customer!r} not found")
+        users = world.store.list_users(user.customer_id)
+        by_operator = {u.id for u in users if world.store.operator_suspended(u.id)}
+    for listed in users:
+        status = listed.status.value
+        if listed.id in by_operator:
+            status += " (by operator)"
+        typer.echo(f"{listed.id}  {listed.role.value}  {status}")
+    typer.echo(f"{user.customer_id}  {len(users)} users")
+
+
+UserIdArgument = Annotated[str, typer.Argument(metavar="USER_ID", help="The user to change.")]
+
+
+@users_app.command("suspend")
+def users_suspend(
+    user_id: UserIdArgument,
+    as_user: AsOption,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Suspend a user of the acting owner's customer, from their next gate call on.
+
+    Live runs are refused on their next call. The suspension is sticky: fixture sync does
+    not reactivate the user, whatever the fixtures say, until `users reinstate`. Nothing is
+    written to the fixtures."""
+    with _world(db, audit_db, policies, fixtures) as world:
+        try:
+            suspended = suspend_user(world, user_id, acting_user_id=as_user)
+        except UserAdminError as exc:
+            _fail(str(exc))
+    typer.echo(f"suspended {suspended.id}")
+
+
+@users_app.command("reinstate")
+def users_reinstate(
+    user_id: UserIdArgument,
+    as_user: AsOption,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Lift a suspension made with `users suspend`. The user's status is then what the
+    fixtures say, so a user the fixtures suspend stays suspended."""
+    with _world(db, audit_db, policies, fixtures) as world:
+        try:
+            reinstated = reinstate_user(world, user_id, acting_user_id=as_user)
+        except UserAdminError as exc:
+            _fail(str(exc))
+    typer.echo(f"reinstated {reinstated.id}  status {reinstated.status.value}")
+
+
+# spend
+
+
+@spend_app.command("release-stale")
+def spend_release_stale(
+    as_user: AsOption,
+    older_than: Annotated[
+        int,
+        typer.Option(
+            "--older-than",
+            metavar="MINUTES",
+            min=1,
+            help="Release reservations still open this many minutes after they were made.",
+        ),
+    ] = int(DEFAULT_RESERVATION_LEASE.total_seconds() // 60),
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Release spend reservations left open by hosts that died mid-call, for all customers.
+
+    An operator command: the acting user must be an active owner of some customer. Only the
+    count is printed, since the reservations may belong to other customers. Every open
+    already releases reservations older than 15 minutes; this one takes another age. A host
+    that was only slow and settles later still has its actual cost recorded."""
+    # The automatic sweep is off for this open, so the count covers everything released.
+    with _world(db, audit_db, policies, fixtures, reservation_lease=None) as world:
+        _owner(world, as_user)
+        released = world.gate.ledger.release_stale(timedelta(minutes=older_than))
+    typer.echo(f"released {released} stale reservations older than {older_than} minutes")
+
+
 # demo
 
 
@@ -466,7 +684,7 @@ def agent_run(
         world = open_memory_world(policies=policies, fixtures=fixtures, sink=sink)
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         _fail(str(exc))
-    with world:
+    with world, _database_errors():
         user = world.store.get_user(as_user)
         if user is None:
             _fail(f"unknown user {as_user!r}")
@@ -497,6 +715,14 @@ def agent_run(
             typer.echo(line)
 
 
+@contextmanager
+def _database_errors() -> Iterator[None]:
+    try:
+        yield
+    except sqlite3.Error as exc:
+        _fail(_database_error(exc))
+
+
 # gateway
 
 
@@ -512,7 +738,8 @@ def gateway_serve(
 
     The run starts before anything is served, so an unknown or suspended user exits 1
     without a byte on stdout. stdout carries only the MCP stream; everything else, the
-    banner included, goes to stderr.
+    banner included, goes to stderr. A suspension (`users suspend`, or the fixtures on a
+    later open) refuses the run's next call.
     """
     # Imported here, so the other commands do not pay for loading the MCP SDK.
     from agentgate.gateway import gateway_tools, serve_stdio

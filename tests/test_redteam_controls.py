@@ -649,10 +649,14 @@ def test_removing_a_protection_fails_its_scenarios(
 
 def test_every_attack_scenario_has_an_automated_mutation() -> None:
     covered = {scenario_id for m in mutations({}) for scenario_id in m.breaks}
+    # Scenarios in other modules (the hardening_* ones) carry their mutations in their own
+    # test files; this file covers its own modules.
     attacks = {
         s.id
         for s in all_scenarios()
-        if s.category in MINE and s.category is not Category.BENIGN and s.id not in KNOWN_GATE_BUGS
+        if s.module.rsplit(".", 1)[-1] in MODULES
+        and s.category is not Category.BENIGN
+        and s.id not in KNOWN_GATE_BUGS
     }
     assert attacks - covered == set()
 
