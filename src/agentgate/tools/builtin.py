@@ -8,6 +8,13 @@ back for tests and for the red-team leak detector.
 Every args model is strict (no coercion from strings or floats into ints, no bools as
 numbers), frozen, rejects unknown fields and bounds every string, so a call either matches
 the documented shape exactly or is refused before any decision.
+
+Recipients follow the shared address rule (agentgate.policy.addresses). A plain address is
+normalised during validation (spaces trimmed, lowercased), so the facts the engine decides on,
+the outbox row and what a mail adapter would send are the same string. A malformed recipient
+is kept as given so the engine decides on it (it is external and on no list, so a policy
+denies it and the audit log names the rule), and the tool refuses to store or send it even if
+a policy allowed it.
 """
 
 import json
@@ -17,10 +24,11 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, JsonValue
 
 from agentgate.context import RunContext
 from agentgate.models import Document, Label, Slug
+from agentgate.policy import addresses
 from agentgate.store import Store
 from agentgate.tools.base import ToolAdapter, ToolEnv, ToolFacts, ToolResult
 
@@ -66,7 +74,17 @@ _SCHEMA = (
 
 Title = Annotated[str, Field(min_length=1, max_length=300)]
 Text = Annotated[str, Field(min_length=1, max_length=MAX_TEXT_CHARS)]
-Recipient = Annotated[str, Field(min_length=3, max_length=254)]
+
+
+def _normalised_recipient(raw: str) -> str:
+    # Called through the module so the rule has one definition, also for tests that swap it.
+    address = addresses.normalize_address(raw)
+    return raw if address is None else address
+
+
+Recipient = Annotated[
+    str, Field(min_length=3, max_length=254), AfterValidator(_normalised_recipient)
+]
 # Money in cents. Zero and negative amounts are never a legitimate order or refund.
 Usd = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2, allow_inf_nan=False)]
 
@@ -190,7 +208,9 @@ class NotesWrite(_Adapter[NotesWriteArgs]):
             body=args.body,
         )
         env.store.add_document(note)
-        env.index.rebuild()
+        # Index this note alone: a full rebuild would hold the write lock over every
+        # customer's documents for as long as it takes.
+        env.index.add(note)
         return ToolResult(
             content={"document_id": note.id, "title": note.title, "label": note.label}
         )
@@ -204,6 +224,14 @@ class EmailSend(_Adapter[EmailSendArgs]):
         return ToolFacts(recipients=tuple(args.to))
 
     def _run(self, env: ToolEnv, ctx: RunContext, args: EmailSendArgs) -> ToolResult:
+        recipients: list[str] = []
+        for raw in args.to:
+            address = addresses.normalize_address(raw)
+            if address is None:
+                # Validation keeps a malformed recipient for the engine to deny; one gets here
+                # only if a policy allowed it anyway, and it is still never stored or sent.
+                raise ValueError("a recipient is not one plain address")
+            recipients.append(address)
         email_id = f"email-{uuid.uuid4().hex[:12]}"
         _insert(
             env.store,
@@ -213,14 +241,15 @@ class EmailSend(_Adapter[EmailSendArgs]):
                 email_id,
                 ctx.run_id,
                 ctx.customer_id,
-                json.dumps(list(args.to)),
+                json.dumps(recipients),
                 args.subject,
                 args.body,
                 env.clock.now().isoformat(),
             ),
         )
+        to: list[JsonValue] = [*recipients]
         return ToolResult(
-            content={"status": "queued", "email_id": email_id, "recipients": len(args.to)}
+            content={"status": "queued", "email_id": email_id, "recipients": len(to), "to": to}
         )
 
 

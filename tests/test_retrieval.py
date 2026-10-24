@@ -1,10 +1,12 @@
 """Permission-aware retrieval against the real fixtures and policies."""
 
+import random
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -569,4 +571,141 @@ def test_ranking_ignores_documents_the_run_cannot_read(user_id: str, query: str)
     # The noise is indexed and found by someone who may read it.
     owner = next(u for u in world.users(user.customer_id) if u.role is Role.OWNER)
     assert any("-noise-" in i for i in world.search(owner.id, noisy).trace.returned_ids)
+    world.store.close()
+
+
+# Incremental indexing: add and remove give exactly what a full rebuild gives
+
+VOCABULARY = (
+    *("furnace", "refrigerant", "thermostat", "warranty", "dispatch", "coil", "filter", "duct"),
+    *("heat", "pump", "tune-up", "refill", "shipping", "cold", "order", "delivery", "return"),
+    *("payroll", "customer", "list", "contacts", "pricing", "margin", "notes", "shelf"),
+    *("restock", "Caf\u00e9", "na\u00efve", "FURNACE", "Coil", "x2", "r-410a"),
+)
+LONG_TERM = "z" * 65
+
+
+def _random_documents(seed: int, count: int) -> list[Document]:
+    rng = random.Random(seed)
+    labels = ["public", "internal", "confidential", "restricted"]
+    documents: list[Document] = []
+    for i in range(count):
+        customer_id = KC if i % 2 else JR
+        words = [rng.choice(VOCABULARY) for _ in range(rng.randint(0, 60))]
+        if i % 7 == 0:
+            words.append(LONG_TERM)
+        documents.append(
+            Document(
+                id=f"{customer_id[:2]}-inc-{i:03d}",
+                customer_id=customer_id,
+                title=" ".join(rng.choice(VOCABULARY) for _ in range(rng.randint(1, 6))),
+                label=rng.choice(labels),
+                tags=frozenset({"note"}),
+                body=" ".join(words),
+            )
+        )
+    return documents
+
+
+def _index_rows(store: Store) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    conn = store.connection
+    postings = conn.execute("SELECT * FROM retrieval_postings ORDER BY term, doc_id").fetchall()
+    lengths = conn.execute("SELECT * FROM retrieval_lengths ORDER BY doc_id").fetchall()
+    return [tuple(r) for r in postings], [tuple(r) for r in lengths]
+
+
+INCREMENTAL_QUERIES = [
+    "furnace coil",
+    "refill shipping cold order",
+    "payroll customer list contacts",
+    "cafe naive",
+    "notes shelf restock pricing margin",
+    "heat pump tune-up warranty dispatch",
+]
+
+
+def _assert_same_searches(first: World, second: World) -> None:
+    for user_id in USER_IDS:
+        for query in INCREMENTAL_QUERIES:
+            assert first.search(user_id, query) == second.search(user_id, query), (user_id, query)
+
+
+def test_add_ranks_exactly_like_a_full_rebuild() -> None:
+    incremental = _build_world()
+    rebuilt = _build_world()
+    documents = _random_documents(seed=7, count=160)
+    for document in documents:
+        incremental.store.add_document(document)
+        incremental.index.add(document)
+        rebuilt.store.add_document(document)
+    rebuilt.index.rebuild()
+    assert _index_rows(incremental.store) == _index_rows(rebuilt.store)
+    _assert_same_searches(incremental, rebuilt)
+    # The added documents are really found, not just equally missing.
+    found = incremental.search("kc-owner-dale", "furnace coil").trace.returned_ids
+    assert any("-inc-" in doc_id for doc_id in found)
+
+    # Changing a document and adding it again replaces its rows.
+    changed = documents[1].model_copy(update={"title": "Brand new", "body": "zephyrine coil"})
+    for world in (incremental, rebuilt):
+        world.store.connection.execute(
+            "UPDATE documents SET title = ?, body = ? WHERE id = ?",
+            (changed.title, changed.body, changed.id),
+        )
+    incremental.index.add(changed)
+    rebuilt.index.rebuild()
+    assert _index_rows(incremental.store) == _index_rows(rebuilt.store)
+    _assert_same_searches(incremental, rebuilt)
+
+    # Removing a document drops its rows.
+    gone = documents[2].id
+    for world in (incremental, rebuilt):
+        world.store.connection.execute("DELETE FROM documents WHERE id = ?", (gone,))
+    incremental.index.remove(gone)
+    rebuilt.index.rebuild()
+    assert _index_rows(incremental.store) == _index_rows(rebuilt.store)
+    _assert_same_searches(incremental, rebuilt)
+    for world in (incremental, rebuilt):
+        world.store.close()
+
+
+def test_add_writes_only_that_documents_rows() -> None:
+    world = _build_world()
+    conn = world.store.connection
+    before = _index_rows(world.store)
+    note = Document(
+        id="kc-inc-note",
+        customer_id=KC,
+        title="Coil coil",
+        label="internal",
+        body="Coil filter, " + LONG_TERM,
+    )
+    world.store.add_document(note)
+    changes = conn.total_changes
+    world.index.add(note)
+    # One lengths row and two postings (coil, filter); the long term is counted in the body
+    # length but never posted. Nothing else is deleted or written.
+    assert conn.total_changes - changes == 1 + 2
+    postings, lengths = _index_rows(world.store)
+    assert [r for r in postings if r[1] != note.id] == before[0]
+    assert [r for r in lengths if r[0] != note.id] == before[1]
+    assert [r for r in postings if r[1] == note.id] == [
+        ("coil", note.id, 2, 1),
+        ("filter", note.id, 0, 1),
+    ]
+    assert [r for r in lengths if r[0] == note.id] == [(note.id, 2, 3)]
+    # Adding it again rewrites the same rows: two deletes of postings, one of lengths,
+    # and the same inserts.
+    changes = conn.total_changes
+    world.index.add(note)
+    assert conn.total_changes - changes == (2 + 1) * 2
+    assert _index_rows(world.store) == (postings, lengths)
+    world.store.close()
+
+
+def test_remove_of_an_unindexed_document_changes_nothing() -> None:
+    world = _build_world()
+    before = _index_rows(world.store)
+    world.index.remove("kc-not-there")
+    assert _index_rows(world.store) == before
     world.store.close()

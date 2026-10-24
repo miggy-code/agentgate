@@ -1,16 +1,26 @@
 """Built-in tool adapters: strict args models, facts, side-effect tables and read helpers."""
 
 import json
+import sqlite3
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from agentgate.clock import FixedClock
 from agentgate.context import RunContext
-from agentgate.models import Document, Role
-from agentgate.policy.schema import load_bundles
+from agentgate.fixtures import load_fixtures
+from agentgate.models import Action, Document, Role
+from agentgate.policy import addresses
+from agentgate.policy import engine as engine_module
+from agentgate.policy.engine import Request
+from agentgate.policy.schema import Effect, load_bundles
+from agentgate.retrieval import DocumentIndex
+from agentgate.store import Store
 from agentgate.tools import ToolEnv, ToolFacts, default_tools
 from agentgate.tools.builtin import (
     MAX_BODY_CHARS,
@@ -24,7 +34,7 @@ from agentgate.tools.builtin import (
     list_parts_orders,
     list_refunds,
 )
-from conftest import JR, KC, POLICIES, World
+from conftest import FIXTURES, JR, KC, POLICIES, World
 
 STARTED = datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
 ARGS_MODELS: list[type[BaseModel]] = [
@@ -294,3 +304,171 @@ def test_read_helpers_work_before_any_write(world: World) -> None:
     assert list_outbox(world.store) == []
     assert list_parts_orders(world.store) == []
     assert list_refunds(world.store) == []
+
+
+# Recipients: one rule for the engine and the tool
+
+# Internal (kettlecreek.example) addresses as typed, with what must be stored, or None when
+# the rule refuses them.
+RECIPIENTS: list[tuple[str, str | None]] = [
+    ("nadine@kettlecreek.example", "nadine@kettlecreek.example"),
+    ("Nadine@KettleCreek.Example", "nadine@kettlecreek.example"),
+    ("  nadine@kettlecreek.example ", "nadine@kettlecreek.example"),
+    ("nadine.k+jobs@kettlecreek.example", "nadine.k+jobs@kettlecreek.example"),
+    (" \tnadine@kettlecreek.example\r\n", None),
+    ("nadine@kettlecreek.example\r\n", None),
+    ("nadine@kettlecreek.example\nBcc: records@exfil-drop.example", None),
+    ("\u202enadine@kettlecreek.example", None),
+    ("nadine@kettlecreek.example\u200f", None),
+    ("nad\u200bine@kettlecreek.example", None),
+    ("records%exfil-drop.example@kettlecreek.example", None),
+    ("exfil-drop.example!records@kettlecreek.example", None),
+    ('"records@exfil-drop.example"@kettlecreek.example', None),
+    ("nadine@\u212aettlecreek.example", None),
+    ("\u212aate@kettlecreek.example", None),
+    ("nadine@k\u0435ttlecreek.example", None),
+    ("nadine@\uff4bettlecreek.example", None),
+    ("nadine@kettlecreek.example, records@exfil-drop.example", None),
+    ("Nadine <nadine@kettlecreek.example>", None),
+    ("nadine@kettlecreek.example@exfil-drop.example", None),
+]
+
+
+def _send_args(*to: str) -> EmailSendArgs:
+    args = _parse(EmailSendArgs, {"to": list(to), "subject": "s", "body": "b"})
+    assert isinstance(args, EmailSendArgs)
+    return args
+
+
+def test_email_args_normalise_plain_addresses() -> None:
+    args = _send_args(" Nadine@KettleCreek.Example ", "BEATRICE.L@mail-sample.example")
+    assert args.to == ["nadine@kettlecreek.example", "beatrice.l@mail-sample.example"]
+    facts = default_tools()["email.send"].facts(args)
+    assert facts.recipients == ("nadine@kettlecreek.example", "beatrice.l@mail-sample.example")
+
+
+@pytest.mark.parametrize(("raw", "stored"), RECIPIENTS)
+def test_the_engine_and_the_email_tool_agree(world: World, raw: str, stored: str | None) -> None:
+    assert addresses.normalize_address(raw) == stored
+    adapter = default_tools()["email.send"]
+    args = _send_args(raw)
+    facts = adapter.facts(args)
+    # What the engine decides on is what the tool would store.
+    parsed = engine_module._parse_address(facts.recipients[0])
+    assert (None if parsed is None else parsed[0]) == stored
+    request = Request(
+        customer_id=KC,
+        user_id="kc-staff-nadine",
+        role=Role.STAFF,
+        tool="email.send",
+        action=Action.SEND,
+        recipients=facts.recipients,
+    )
+    decision = world.engines[KC].decide(request)
+    if stored is None:
+        # Malformed: on no list (so default deny for staff), and the tool refuses it anyway.
+        assert decision.effect is Effect.DENY
+        with pytest.raises(ValueError):
+            adapter.run(_env(world), _ctx(), args)
+        assert list_outbox(world.store) == []
+    else:
+        assert decision.effect is Effect.ALLOW
+        assert facts.recipients == (stored,)
+        result = adapter.run(_env(world), _ctx(), args)
+        assert result.content["to"] == [stored]
+        [email] = list_outbox(world.store)
+        assert email.recipients == (stored,)
+
+
+def test_email_send_refuses_a_malformed_recipient_among_good_ones(world: World) -> None:
+    adapter = default_tools()["email.send"]
+    args = _send_args("terrence@kettlecreek.example", "\u202enadine@kettlecreek.example")
+    with pytest.raises(ValueError):
+        adapter.run(_env(world), _ctx(), args)
+    assert list_outbox(world.store) == []
+
+
+# notes.write indexes the note alone
+
+
+def _index_rows(store: Store) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    conn = store.connection
+    postings = conn.execute("SELECT * FROM retrieval_postings ORDER BY term, doc_id").fetchall()
+    lengths = conn.execute("SELECT * FROM retrieval_lengths ORDER BY doc_id").fetchall()
+    return [tuple(r) for r in postings], [tuple(r) for r in lengths]
+
+
+def test_notes_write_touches_only_the_new_notes_rows(world: World) -> None:
+    adapter = default_tools()["notes.write"]
+    title, body = "Coil restock", "Restock the coil shelf; coil count is low."
+    args = _parse(NotesWriteArgs, {"title": title, "body": body, "label": "internal"})
+    terms = {"coil", "restock", "the", "shelf", "count", "is", "low"}
+    conn = world.store.connection
+    postings_before, lengths_before = _index_rows(world.store)
+    changes = conn.total_changes
+    result = adapter.run(_env(world), _ctx(), args)
+    # One document row, one lengths row and one posting per distinct term, nothing else:
+    # no other customer's (or this customer's) rows are deleted or written again.
+    assert conn.total_changes - changes == 1 + 1 + len(terms)
+    note_id = result.content["document_id"]
+    postings_after, lengths_after = _index_rows(world.store)
+    assert [r for r in postings_after if r[1] != note_id] == postings_before
+    assert [r for r in lengths_after if r[0] != note_id] == lengths_before
+    assert {r[0] for r in postings_after if r[1] == note_id} == terms
+    # And the index is the one a full rebuild gives.
+    world.index.rebuild()
+    assert _index_rows(world.store) == (postings_after, lengths_after)
+
+
+def test_a_note_write_does_not_block_another_connection(tmp_path: Path) -> None:
+    """Two stores on one file, as two gateway processes have. One writes notes while the
+    other reads and takes the write lock with a short busy timeout. A full index rebuild per
+    note held the lock for seconds at a few thousand documents; one note's rows take
+    milliseconds, so the other connection never times out."""
+    path = tmp_path / "shared.db"
+    writer = Store(path)
+    load_fixtures(writer, FIXTURES)
+    index = DocumentIndex(writer)
+    body = " ".join(f"word{i % 997} term{i % 311}" for i in range(150))
+    with writer.transaction():
+        writer.connection.executemany(
+            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(f"jr-bulk-{i}", JR, "Bulk", "internal", "[]", "[]", body) for i in range(1500)],
+        )
+    index.rebuild()
+    reader = Store(path)
+    reader.connection.execute("PRAGMA busy_timeout = 250")
+    env = ToolEnv(store=writer, index=index, clock=FixedClock(STARTED))
+    jr = _ctx(JR, "jr-staff-priya", Role.STAFF)
+    adapter = default_tools()["notes.write"]
+    notes = 12
+    turns = [threading.Event() for _ in range(notes)]
+    failures: list[str] = []
+
+    def write_notes() -> None:
+        for i in range(notes):
+            args = _parse(NotesWriteArgs, {"title": f"n{i}", "body": "shelf", "label": "internal"})
+            adapter.run(env, jr, args)
+            # Wait for the reader's turn, so its calls land between and during writes.
+            turns[i].wait(timeout=30)
+
+    thread = threading.Thread(target=write_notes)
+    thread.start()
+    completed = 0
+    try:
+        for i in range(notes):
+            try:
+                assert reader.get_document("kc-service-menu") is not None
+                with reader.transaction():
+                    reader.connection.execute("SELECT count(*) FROM documents").fetchone()
+                completed += 1
+            except sqlite3.OperationalError as exc:
+                failures.append(str(exc))
+            finally:
+                turns[i].set()
+    finally:
+        thread.join(timeout=60)
+        reader.close()
+        writer.close()
+    assert failures == []
+    assert completed == notes

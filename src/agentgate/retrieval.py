@@ -25,8 +25,13 @@ Costs and limits:
   lengths of every permitted document plus the postings of the query terms. That is fine at
   MVP scale; compiling the read rules into a SQL predicate and caching per-permission-set
   statistics are the places to optimise later.
-- The index is rebuilt explicitly. Documents added after `rebuild()` are not searchable
-  until it runs again.
+- The index is kept explicitly. `add(document)` indexes one stored document (or re-indexes
+  it after an edit) and `remove(doc_id)` drops one, each in one short transaction that
+  touches only that document's rows; `rebuild()` re-indexes every document in the store and
+  holds the write lock for as long as that takes, so it is for loading fixtures and repairs,
+  not for every write. A document stored without either is not searchable until one runs.
+  Both paths write rows with the same function, so an index built up with `add` holds
+  exactly the rows a full rebuild would, and ranks identically.
 
 The trace returned with each search is for the audit log only. The model sees `documents`.
 """
@@ -34,6 +39,7 @@ The trace returned with each search is for the audit log only. The model sees `d
 import json
 import math
 import re
+import sqlite3
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -76,6 +82,10 @@ _SCHEMA = (
         title_len INTEGER NOT NULL,
         body_len INTEGER NOT NULL
     ) STRICT
+    """,
+    # For dropping one document's postings without scanning every customer's.
+    """
+    CREATE INDEX IF NOT EXISTS retrieval_postings_doc_id ON retrieval_postings (doc_id)
     """,
 )
 
@@ -229,29 +239,35 @@ class DocumentIndex:
                 store.connection.execute(statement)
 
     def rebuild(self) -> None:
-        """(Re)index every document in the store. Call after loading fixtures."""
+        """(Re)index every document in the store. Call after loading fixtures.
+
+        This holds the database write lock while it reads and indexes every customer's
+        documents. To index one new or changed document, use `add`.
+        """
         with self._store.transaction():
             conn = self._store.connection
             conn.execute("DELETE FROM retrieval_postings")
             conn.execute("DELETE FROM retrieval_lengths")
             rows = conn.execute("SELECT id, title, body FROM documents ORDER BY id").fetchall()
             for row in rows:
-                title = _tokens(row["title"])
-                body = _tokens(row["body"])
-                conn.execute(
-                    "INSERT INTO retrieval_lengths (doc_id, title_len, body_len) VALUES (?, ?, ?)",
-                    (row["id"], len(title), len(body)),
-                )
-                title_tf = Counter(t for t in title if len(t) <= MAX_TERM_LENGTH)
-                body_tf = Counter(t for t in body if len(t) <= MAX_TERM_LENGTH)
-                conn.executemany(
-                    "INSERT INTO retrieval_postings (term, doc_id, title_tf, body_tf)"
-                    " VALUES (?, ?, ?, ?)",
-                    [
-                        (term, row["id"], title_tf[term], body_tf[term])
-                        for term in sorted(title_tf.keys() | body_tf.keys())
-                    ],
-                )
+                _write_rows(conn, row["id"], row["title"], row["body"])
+
+    def add(self, document: Document) -> None:
+        """Index one stored document, replacing any rows it had, in one short transaction.
+
+        Only this document's rows are written, so the write lock is held for the time one
+        document takes, whatever the store holds. Call it after storing the document, and
+        again after changing its title or body.
+        """
+        with self._store.transaction():
+            conn = self._store.connection
+            _delete_rows(conn, document.id)
+            _write_rows(conn, document.id, document.title, document.body)
+
+    def remove(self, doc_id: str) -> None:
+        """Drop one document's rows from the index, in one short transaction."""
+        with self._store.transaction():
+            _delete_rows(self._store.connection, doc_id)
 
     def search(
         self,
@@ -366,6 +382,30 @@ class DocumentIndex:
                 f"ranked document {doc_id!r} is not readable: {decision.reason.value}"
             )
         return document
+
+
+def _delete_rows(conn: sqlite3.Connection, doc_id: str) -> None:
+    conn.execute("DELETE FROM retrieval_postings WHERE doc_id = ?", (doc_id,))
+    conn.execute("DELETE FROM retrieval_lengths WHERE doc_id = ?", (doc_id,))
+
+
+def _write_rows(conn: sqlite3.Connection, doc_id: str, title_text: str, body_text: str) -> None:
+    """Insert one document's lengths and postings. `rebuild` and `add` both use this."""
+    title = _tokens(title_text)
+    body = _tokens(body_text)
+    conn.execute(
+        "INSERT INTO retrieval_lengths (doc_id, title_len, body_len) VALUES (?, ?, ?)",
+        (doc_id, len(title), len(body)),
+    )
+    title_tf = Counter(t for t in title if len(t) <= MAX_TERM_LENGTH)
+    body_tf = Counter(t for t in body if len(t) <= MAX_TERM_LENGTH)
+    conn.executemany(
+        "INSERT INTO retrieval_postings (term, doc_id, title_tf, body_tf) VALUES (?, ?, ?, ?)",
+        [
+            (term, doc_id, title_tf[term], body_tf[term])
+            for term in sorted(title_tf.keys() | body_tf.keys())
+        ],
+    )
 
 
 def _read_request(

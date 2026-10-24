@@ -4,6 +4,8 @@ from typing import Any
 import pytest
 
 from agentgate.models import Action, Customer, Document, Role
+from agentgate.policy import addresses
+from agentgate.policy import engine as engine_module
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Conditions, Effect, PolicyBundle
 from agentgate.policy.version import bundle_version
@@ -286,6 +288,148 @@ def test_malformed_recipient_never_matches_a_list_and_counts_as_external() -> No
     )
     decision = engine.decide(_send("pat@home.example,a@acme.example"))
     assert (decision.effect, decision.rule_ids) == (Effect.DENY, ("external",))
+
+
+# The shared address rule (agentgate.policy.addresses)
+
+ACCEPTED_ADDRESSES = [
+    ("a@acme.example", "a@acme.example"),
+    ("A@ACME.Example", "a@acme.example"),
+    ("  Pat.Lee@Acme.Example  ", "pat.lee@acme.example"),
+    ("first.last+tag@acme-mail.example", "first.last+tag@acme-mail.example"),
+    ("o'brien_x-y@sub.home.example", "o'brien_x-y@sub.home.example"),
+    ("x" * 64 + "@acme.example", "x" * 64 + "@acme.example"),
+]
+# Each of these is an internal or listed address with something added to it.
+REFUSED_ADDRESSES = [
+    " \ta@acme.example\r\n",
+    "a@acme.example\r\n",
+    "a@acme.example\n",
+    "\ta@acme.example",
+    "a@acme.example\x00",
+    "a@acme.example\nBcc: x@evil.example",
+    "\u202ea@acme.example",
+    "a@acme.example\u200f",
+    "p\u200bat@home.example",
+    "\ufeffa@acme.example",
+    "a\u2066@acme.example",
+    "x%evil.example@acme.example",
+    "evil.example!x@acme.example",
+    '"x@evil.example"@acme.example',
+    '"pat"@home.example',
+    "pat\\@home.example",
+    "a@\u212acme.example",
+    "a@\u212ccme.example",
+    "\u212aa@acme.example",
+    "\u017fam@acme.example",
+    "a@\u0430cme.example",
+    "a@\uff41cme.example",
+    "a@acme.exampl\u00e9",
+    "a@acme.example\u00a0",
+    "\u3000a@acme.example",
+    "p at@home.example",
+    ".pat@home.example",
+    "pat.@home.example",
+    "p..at@home.example",
+    "a@acme.example.",
+    "a@[192.0.2.1]",
+    "a@acme",
+    "a@b@acme.example",
+    "x" * 65 + "@acme.example",
+    "a@" + "x" * 64 + ".example",
+    "",
+    "   ",
+]
+
+
+@pytest.mark.parametrize(("raw", "normalised"), ACCEPTED_ADDRESSES)
+def test_address_rule_accepts_and_normalises_plain_addresses(raw: str, normalised: str) -> None:
+    assert addresses.normalize_address(raw) == normalised
+    assert addresses.parse_address(raw) == (normalised, normalised.rsplit("@", 1)[1])
+    # The normalised form is a fixed point.
+    assert addresses.normalize_address(normalised) == normalised
+
+
+@pytest.mark.parametrize("raw", REFUSED_ADDRESSES)
+def test_address_rule_refuses_hostile_forms(raw: str) -> None:
+    assert addresses.parse_address(raw) is None
+    assert addresses.normalize_address(raw) is None
+
+
+def test_no_case_mapping_turns_a_refused_character_into_ascii() -> None:
+    # The rule checks ASCII before lowercasing, so these must stay refused although their
+    # lowercase or casefold is plain ASCII.
+    for char in ("\u212a", "\u017f", "\u0130", "\ufb00"):
+        folded = char.lower() + char.casefold()
+        assert addresses.normalize_address(f"{char}a@acme.example") is None, folded
+
+
+def test_address_rule_domains() -> None:
+    assert addresses.normalize_domain("Acme.Example") == "acme.example"
+    assert addresses.normalize_domain(" acme.example ") == "acme.example"
+    for raw in ("\u212acme.example", "acme", "acme.example.", "acme .example", "a\tb.example"):
+        assert addresses.normalize_domain(raw) is None, raw
+
+
+@pytest.mark.parametrize("raw", REFUSED_ADDRESSES)
+def test_a_hostile_form_is_external_and_on_no_list(raw: str) -> None:
+    listed = _engine(_send_rule("r", where={"recipient_in": "directory"}))
+    internal = _engine(_send_rule("r", where={"recipient_external": False}))
+    external = _engine(_send_rule("r", where={"recipient_external": True}))
+    assert _effect(listed, _send(raw)) is Effect.DENY
+    assert _effect(internal, _send(raw)) is Effect.DENY
+    assert _effect(external, _send(raw)) is Effect.ALLOW
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "\u202epat@home.example",
+        "pat@home.example\r\n",
+        "pat%evil.example@home.example",
+        "pat@h\u043eme.example",
+        "x@\u0440artner.example",
+        "x@partner.exampl\u212a",
+    ],
+)
+def test_a_hostile_form_of_a_listed_address_is_not_listed(raw: str) -> None:
+    engine = _engine(_send_rule("r", where={"recipient_in": "directory"}))
+    assert _effect(engine, _send(raw)) is Effect.DENY
+    assert _effect(engine, _send("pat@home.example")) is Effect.ALLOW
+
+
+@pytest.mark.parametrize("raw", [raw for raw, _ in ACCEPTED_ADDRESSES if "acme" in raw])
+def test_a_plain_internal_address_is_internal_in_any_case(raw: str) -> None:
+    internal = _engine(_send_rule("r", where={"recipient_external": False}))
+    assert _effect(internal, _send(raw)) is Effect.ALLOW
+
+
+def test_the_engine_parses_with_the_shared_rule() -> None:
+    for raw in [*REFUSED_ADDRESSES, *(raw for raw, _ in ACCEPTED_ADDRESSES)]:
+        assert engine_module._parse_address(raw) == addresses.parse_address(raw), raw
+
+
+@pytest.mark.parametrize(
+    "entry", ["pat%evil.example@home.example", '"pat"@home.example', "p..at@home.example"]
+)
+def test_a_list_entry_the_rule_refuses_stops_the_policy_loading(entry: str) -> None:
+    # The schema admits these; the engine refuses them rather than keep a list entry that
+    # could never match (which on a deny list would fail open).
+    bundle = _bundle(
+        _send_rule("r", where={"recipient_in": "directory"}), lists={"directory": [entry]}
+    )
+    with pytest.raises(ValueError, match="list 'directory'"):
+        PolicyEngine(bundle, CUSTOMER)
+
+
+def test_list_entries_are_normalised_with_the_rule() -> None:
+    bundle = _bundle(
+        _send_rule("r", where={"recipient_in": "directory"}),
+        lists={"directory": ["pat@home.example", "@partner.example"]},
+    )
+    engine = PolicyEngine(bundle, CUSTOMER)
+    assert _effect(engine, _send(" PAT@HOME.EXAMPLE ")) is Effect.ALLOW
+    assert _effect(engine, _send("Lee@Partner.Example")) is Effect.ALLOW
 
 
 # amount_usd_lte

@@ -5,15 +5,19 @@ cannot reason about (another customer, an unknown tool, an unknown label) before
 is consulted. A rule condition whose fact is missing never holds, whatever the rule's
 effect, so an allow rule cannot match on absent data. Deny beats require approval, which
 beats allow.
+
+Recipients are read with the shared rule in agentgate.policy.addresses, the one the email
+tool stores and sends by. A recipient that is not one plain address under it never matches
+a list and always counts as external.
 """
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 
 from agentgate.models import Action, Customer, Document, Role
+from agentgate.policy import addresses
 from agentgate.policy.schema import DOCUMENT_ACTIONS, Conditions, Effect, PolicyBundle, Rule
 from agentgate.policy.version import bundle_version
 
@@ -73,31 +77,37 @@ class Decision:
     policy_version: str
 
 
-# One plain address: no separators, quotes, brackets or whitespace that could smuggle a
-# second recipient past a check, and a dotted lowercase domain.
-_ADDRESS = re.compile(r"^([^@\s,;:<>()\[\]\"\\]+)@([a-z0-9-]+(?:\.[a-z0-9-]+)+)$")
-
-
 def _parse_address(raw: str) -> tuple[str, str] | None:
-    """Split a recipient into (address, domain), or None if it is not one plain address."""
-    match = _ADDRESS.fullmatch(raw.strip().lower())
-    if match is None:
-        return None
-    return match.group(0), match.group(2)
+    """Split a recipient into (address, domain), or None if it is not one plain address.
+
+    The rule is agentgate.policy.addresses, the same one the email tool stores and sends by.
+    """
+    return addresses.parse_address(raw)
 
 
 class _AddressList:
-    """A named recipient list: exact addresses plus "@domain" entries."""
+    """A named recipient list: exact addresses plus "@domain" entries.
 
-    def __init__(self, entries: Iterable[str]) -> None:
+    Entries are read with the shared address rule. An entry the rule refuses raises, so a
+    policy cannot load with a list that silently matches nothing: on a deny list that would
+    fail open.
+    """
+
+    def __init__(self, name: str, entries: Iterable[str]) -> None:
         self._addresses: set[str] = set()
         self._domains: set[str] = set()
         for entry in entries:
-            normalized = entry.strip().lower()
-            if normalized.startswith("@"):
-                self._domains.add(normalized[1:])
+            text = entry.strip(" ")
+            if text.startswith("@"):
+                domain = addresses.normalize_domain(text[1:])
+                if domain is None:
+                    raise ValueError(f"list {name!r} has an entry that is not a plain domain")
+                self._domains.add(domain)
             else:
-                self._addresses.add(normalized)
+                address = addresses.normalize_address(text)
+                if address is None:
+                    raise ValueError(f"list {name!r} has an entry that is not a plain address")
+                self._addresses.add(address)
 
     def contains(self, raw: str) -> bool:
         parsed = _parse_address(raw)
@@ -120,7 +130,9 @@ class PolicyEngine:
         self._version = bundle_version(bundle)
         self._ranks = {label: rank for rank, label in enumerate(bundle.policy.labels)}
         self._internal_domains = frozenset(domain.lower() for domain in customer.domains)
-        self._lists = {name: _AddressList(entries) for name, entries in bundle.policy.lists.items()}
+        self._lists = {
+            name: _AddressList(name, entries) for name, entries in bundle.policy.lists.items()
+        }
 
     @property
     def version(self) -> str:
