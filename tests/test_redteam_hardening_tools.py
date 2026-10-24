@@ -84,10 +84,11 @@ def test_ids_prefixes_and_titles() -> None:
     assert len(set(titles)) == len(titles)
 
 
-def test_ids_do_not_collide_with_the_baseline_or_other_modules() -> None:
+def test_ids_are_in_the_baseline_and_unique_across_modules() -> None:
     baseline = json.loads((ROOT / "redteam" / "baseline.json").read_text(encoding="utf-8"))
     listed = {i for ids in baseline["categories"].values() for i in ids}
-    assert not set(IDS) & listed
+    # Registered in the baseline, so CI fails if any goes missing.
+    assert set(IDS) <= listed
     others = [s.id for s in all_scenarios() if s.module != MODULE]
     assert not set(IDS) & set(others)
 

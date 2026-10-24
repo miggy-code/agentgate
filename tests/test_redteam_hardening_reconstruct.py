@@ -72,7 +72,8 @@ def test_ids_are_registered_new_and_prefixed() -> None:
     assert others.isdisjoint(mine)
     baseline = json.loads((ROOT / "redteam" / "baseline.json").read_text())
     known = {scenario_id for ids in baseline["categories"].values() for scenario_id in ids}
-    assert known.isdisjoint(mine)
+    # Registered in the baseline, so CI fails if any goes missing.
+    assert set(mine) <= known
     for scenario_id, registered in mine.items():
         assert registered.category is Category.AUDIT_INTEGRITY
         assert scenario_id.startswith(CATEGORY_PREFIXES[registered.category] + "-")

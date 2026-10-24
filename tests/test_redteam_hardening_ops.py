@@ -84,7 +84,8 @@ def test_ids_are_registered_new_and_prefixed() -> None:
     assert sorted(registered) == IDS
     baseline = json.loads((ROOT / "redteam" / "baseline.json").read_text())
     known = {scenario_id for ids in baseline["categories"].values() for scenario_id in ids}
-    assert known.isdisjoint(registered)
+    # Registered in the baseline, so CI fails if any goes missing.
+    assert set(registered) <= known
     for scenario_id, registered_scenario in registered.items():
         assert scenario_id.startswith(CATEGORY_PREFIXES[registered_scenario.category] + "-")
 
