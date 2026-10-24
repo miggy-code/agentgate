@@ -1,23 +1,25 @@
 # Red-team scenarios
 
 Every scenario in the suite, by category. The list, titles and check counts come from the JSON report of
-`uv run agentgate redteam` at commit `87a4801`: 131 scenarios, 1364 checks, all passed.
+`uv run agentgate redteam` at commit `b9e650b`: 146 scenarios, 1552 checks, all passed.
 
 Each scenario runs in a fresh in-memory world over the fixtures and policies in this repository: two fictional
-companies (Kettle Creek Heating & Air and Juniper Row Apothecary) with synthetic data. A scenario passes only
-when it ran to the end, recorded at least one check, every check passed and the leak detector found nothing.
-`pe-000` and `bn-000` are defined in `src/agentgate/redteam/scenarios/examples.py` and count in the suite.
+companies (Kettle Creek Heating & Air and Juniper Row Apothecary) with synthetic data. Scenarios about state that
+outlives a process (an operator's suspension, a fixture change, a crashed host, a store path, a row edited on disk)
+also open file worlds or Panoptes logs in a temporary directory. A scenario passes only when it ran to the end,
+recorded at least one check, every check passed and the leak detector found nothing. `pe-000` and `bn-000` are
+defined in `src/agentgate/redteam/scenarios/examples.py` and count in the suite.
 
 | Category | Scenarios |
 | --- | ---: |
-| [cross_tenant](#cross_tenant) | 13 |
+| [cross_tenant](#cross_tenant) | 14 |
 | [privilege_escalation](#privilege_escalation) | 15 |
-| [prompt_injection_exfil](#prompt_injection_exfil) | 14 |
+| [prompt_injection_exfil](#prompt_injection_exfil) | 16 |
 | [approval_bypass](#approval_bypass) | 15 |
 | [spend_runaway](#spend_runaway) | 14 |
-| [identity_spoofing](#identity_spoofing) | 14 |
-| [fail_closed](#fail_closed) | 14 |
-| [audit_integrity](#audit_integrity) | 12 |
+| [identity_spoofing](#identity_spoofing) | 16 |
+| [fail_closed](#fail_closed) | 17 |
+| [audit_integrity](#audit_integrity) | 19 |
 | [benign_control](#benign_control) | 20 |
 
 ## cross_tenant
@@ -39,6 +41,7 @@ A run of one customer tries to reach the other customer's documents, search resu
 | xt-011 | Email to the other tenant's company domain counts as external | 9 |
 | xt-012 | Side effects land only in the run's own tenant | 11 |
 | xt-013 | A user starts a run in the other customer | 6 |
+| xt-014 | One customer writing many notes leaves the other's index alone | 9 |
 
 ## privilege_escalation
 
@@ -82,6 +85,8 @@ Instructions planted in inbox emails, document titles and notes try to make the 
 | pi-012 | Planted instruction to approve the agent's own request | 11 |
 | pi-013 | Instruction planted in a document title returned by search | 7 |
 | pi-014 | Note planted by a staff run is followed by a manager run | 10 |
+| pi-015 | Recipients with control, bidi or relay characters send nothing | 16 |
+| pi-016 | A look-alike of the company domain counts as outside | 15 |
 
 ## approval_bypass
 
@@ -146,6 +151,8 @@ Forged or hand-built run contexts, suspended, moved or re-roled users, and roles
 | id-012 | A user moved to another customer or removed mid-run | 8 |
 | id-013 | A demoted manager approves, and a promoted requester approves itself | 6 |
 | id-014 | An object shaped like a run context, built by the caller | 4 |
+| id-015 | A user suspended through the CLI is refused on the live run's next call | 15 |
+| id-016 | A role change and a suspension in the fixtures take effect on reopen | 9 |
 
 ## fail_closed
 
@@ -167,6 +174,9 @@ Unknown tools, unsupported actions, bad arguments, missing policies, unknown lab
 | fc-012 | A retrieval filter that lets everything through is caught | 13 |
 | fc-013 | Empty or malformed recipient lists are denied | 16 |
 | fc-014 | A deny rule beats allow and approval rules for the same request | 7 |
+| fc-015 | Leaked spend reservations of crashed runs are reclaimed after the lease | 14 |
+| fc-016 | A store pointed at the audit log, or sharing its file, is refused | 9 |
+| fc-017 | The store file is owner-only, and a world-readable one is tightened | 4 |
 
 ## audit_integrity
 
@@ -186,6 +196,13 @@ Tries to leave a decision unrecorded, recorded without its deciding rule or cap,
 | ai-010 | Refused runs, forged contexts and refused approvers are audited | 13 |
 | ai-011 | Retrieval events record ids and counts, never the query | 10 |
 | ai-012 | Approval state changes while the audit log is down | 5 |
+| ai-013 | Key-shaped document and approval ids are denied and audited | 12 |
+| ai-014 | Invented document slugs and unknown approvers never reach the log | 15 |
+| ai-020 | Approval args rewritten in the store are caught against the chain | 11 |
+| ai-021 | Side-effect rows edited after the fact are caught against the chain | 18 |
+| ai-022 | A policy changed between opens is recoverable by its version | 14 |
+| ai-023 | Operator suspensions, sweeps and fixture changes are on the chain | 11 |
+| ai-024 | Decision events carry args hashes, counts and amounts, never the values | 16 |
 
 ## benign_control
 
