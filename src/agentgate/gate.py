@@ -13,6 +13,22 @@ allow, an audit record and then the tool. If the allow cannot be
 recorded the tool does not run. Every outcome becomes at least one audit event carrying ids,
 labels, counts and reason codes, never document bodies, message text or argument values.
 
+So that an incident can be reconstructed from the log alone, a decision on a call whose
+arguments validated also carries values derived from them, never the text: `args_hash`
+(approvals.args_hash of the tool, the action and the validated args, as the tool receives
+them), for a send the number of recipients and how many are inside and outside the
+customer's domains, and for a spend its amount. EXECUTED adds `effect_ref`, the id of the
+row the tool wrote (ToolResult.effect_ref), so a store row can be matched to its event.
+Every event about an approval (APPROVAL_REQUIRED, APPROVED, REJECTED, EXPIRED, the ALLOW and
+EXECUTED of the approved call, and a refused execution) carries the approval row's own
+`approval_args_hash`, so `agentgate audit check-store` can tell an approval row rewritten
+after the fact. A search carries no args hash (its query is free text whose hash could be
+tested against guesses), nor does a call naming a document the store does not hold.
+
+The gate also records what is not a tool call but changes what the log means: the policy a
+world loaded (`record_policy_loaded`) and operator actions (`record_operator_action`,
+`release_stale`): fixture syncs, suspensions, reinstatements and stale spend sweeps.
+
 Approval state changes follow the same rule as run starts: each one is recorded inside the
 transaction that makes it. An approval is created, approved, rejected, expired or claimed
 for execution only if its event (APPROVAL_REQUIRED, APPROVED, REJECTED, EXPIRED, or the
@@ -44,6 +60,7 @@ refuses an event for its content, a reference-only version of it is recorded ins
 refusal never turns into an unrecorded exception; only a sink that is down raises.
 """
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -53,7 +70,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -74,6 +91,7 @@ from agentgate.audit.base import (
     AuditRejected,
     AuditSink,
     EventKind,
+    OperatorAction,
     Reference,
     ReferencedField,
 )
@@ -126,6 +144,11 @@ REFERENCE_HEX = 16
 # carry free text or a canary.
 _TOOL_ID = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 _APPROVAL_ID = re.compile(r"^apr_[A-Za-z0-9_-]{1,64}$")
+# A tool's effect_ref goes into events as written only in this id shape; anything else is
+# recorded as a reference.
+_EFFECT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+# IN lists of the stale sweep's follow-up query are sent in chunks of this many ids.
+_ID_CHUNK = 500
 # Customer id for audit events about a caller that matches no customer at all.
 UNKNOWN_CUSTOMER = "unknown"
 
@@ -159,6 +182,7 @@ class GateReason(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    POLICY_LOADED = "policy_loaded"
 
 
 @dataclass(frozen=True)
@@ -242,6 +266,8 @@ class _Prepared:
     document: DocumentFacts | None
     # The id of a document the call reads, for event subjects.
     document_id: str | None
+    # What the call's decision events record about its args: hash, counts, amount.
+    values: dict[str, JsonValue] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -420,7 +446,12 @@ class Gate:
                     rule_ids=verdict.rule_ids,
                     policy_version=verdict.policy_version,
                     decision=True,
-                    details={"risk_score": risk, "document_id": subject},
+                    details={
+                        "risk_score": risk,
+                        "document_id": subject,
+                        **prepared.values,
+                        "approval_args_hash": created.args_hash,
+                    },
                 )
 
             # A request the audit log cannot record raises here and leaves no approval.
@@ -480,14 +511,18 @@ class Gate:
         # The policy may have changed, or the run may have read confidential data, since
         # the approval was granted; a deny now wins over the earlier approval.
         verdict = self._verdict(run, prepared)
+        stored_hash: dict[str, JsonValue] = {"approval_args_hash": approval.args_hash}
         if verdict.effect is Effect.DENY:
-            return self._deny_verdict(call, prepared, verdict, approval.id)
+            return self._deny_verdict(call, prepared, verdict, approval.id, extra=stored_hash)
         reservation = self._reserve(run, call, prepared.config.cost_usd)
         if isinstance(reservation, CapReached):
             return reservation
 
         def record_allow(claimed: Approval) -> None:
-            details: dict[str, JsonValue] = {"approved_by": claimed.decided_by}
+            details: dict[str, JsonValue] = {
+                "approved_by": claimed.decided_by,
+                "approval_args_hash": claimed.args_hash,
+            }
             self._record_allow(call, prepared, verdict, claimed.id, details)
 
         try:
@@ -513,6 +548,7 @@ class Gate:
                 subject=approval.id,
                 rule_ids=approval.rule_ids,
                 policy_version=verdict.policy_version,
+                details={**prepared.values, **stored_hash},
             )
         return self._execute(
             run,
@@ -522,6 +558,7 @@ class Gate:
             verdict,
             subject=approval.id,
             allow_recorded=True,
+            extra=stored_hash,
         )
 
     def refuse(
@@ -571,6 +608,119 @@ class Gate:
             raise ValueError("reservation belongs to another run")
         self._ledger.settle(reservation, actual_usd)
 
+    # Policies and operator actions
+
+    def record_policy_loaded(
+        self, customer_id: str, *, bundle_sha256: str, details: Mapping[str, JsonValue]
+    ) -> None:
+        """Record that this gate decides for a customer with its current policy: one
+        POLICY_LOADED event carrying the version and the sha256 of the canonical bundle
+        snapshot (store.PolicySnapshot) it was computed over. Raises if not recorded."""
+        engine = self._engines.get(customer_id)
+        if engine is None:
+            raise ValueError(f"no policy for customer {customer_id!r}")
+        call = _Call(time.perf_counter_ns(), customer_id, policy_version=engine.version)
+        self._emit(
+            call,
+            EventKind.POLICY_LOADED,
+            GateReason.POLICY_LOADED,
+            subject=engine.version,
+            details={**details, "bundle_sha256": bundle_sha256},
+        )
+
+    def record_operator_action(
+        self,
+        action: OperatorAction,
+        *,
+        customer_id: str,
+        actor: User | None,
+        target: str | None = None,
+        details: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        """Record one OPERATOR_ACTION event in a customer's log. `actor` is the acting user,
+        named only when they belong to that customer (None for the system, or an operator
+        of another customer, recorded as such); `target` is the id acted on, which must be
+        one the store knows. Raises if not recorded."""
+        engine = self._engines.get(customer_id)
+        own = actor is not None and actor.customer_id == customer_id
+        call = _Call(
+            time.perf_counter_ns(),
+            customer_id,
+            user_id=actor.id if own and actor is not None else None,
+            role=actor.role if own and actor is not None else None,
+            policy_version=None if engine is None else engine.version,
+        )
+        recorded: dict[str, JsonValue] = {
+            **(details or {}),
+            "action": action.value,
+            "actor": "user" if own else ("system" if actor is None else "operator"),
+        }
+        self._emit(
+            call,
+            EventKind.OPERATOR_ACTION,
+            action.value,
+            subject=target,
+            details=recorded,
+        )
+
+    def release_stale(
+        self, older_than: timedelta, *, actor: User | None = None, record: bool = True
+    ) -> int:
+        """Reclaim spend reservations left open longer than older_than
+        (SpendLedger.release_stale) and record what was released: one OPERATOR_ACTION per
+        customer with reservations released, with their count, total and run ids. With an
+        actor (an operator command), the actor's own customer also gets an event when
+        nothing of theirs was released. Returns the number released. With record False
+        the sweep records nothing, as SpendLedger.release_stale alone.
+
+        The sweep commits before its events are recorded; if the sink fails, the error
+        propagates with the reservations already released."""
+        if not record:
+            return self._ledger.release_stale(older_than)
+        conn = self._store.connection
+        with self._store.locked():
+            open_ids = [
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM spend_reservations WHERE status = 'open'"
+                ).fetchall()
+            ]
+        released = self._ledger.release_stale(older_than)
+        # The rows open before the sweep that it reclaimed (a reclaimed row keeps its
+        # reclaimed_at even if a late settle charges it afterwards).
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(open_ids) if released else 0, _ID_CHUNK):
+            chunk = open_ids[start : start + _ID_CHUNK]
+            marks = ", ".join("?" for _ in chunk)
+            with self._store.locked():
+                rows += conn.execute(
+                    "SELECT id, run_id, customer_id, reserved_usd FROM spend_reservations"
+                    f" WHERE reclaimed_at IS NOT NULL AND id IN ({marks})",
+                    chunk,
+                ).fetchall()
+        by_customer: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_customer.setdefault(str(row["customer_id"]), []).append(row)
+        if actor is not None:
+            by_customer.setdefault(actor.customer_id, [])
+        minutes = int(older_than.total_seconds() // 60)
+        for customer_id in sorted(by_customer):
+            group = by_customer[customer_id]
+            total = sum((Decimal(row["reserved_usd"]) for row in group), Decimal(0))
+            run_ids: list[JsonValue] = [*sorted({str(row["run_id"]) for row in group})]
+            self.record_operator_action(
+                OperatorAction.STALE_RESERVATIONS_RELEASED,
+                customer_id=customer_id,
+                actor=actor,
+                details={
+                    "released": len(group),
+                    "released_usd": str(total),
+                    "run_ids": run_ids,
+                    "older_than_minutes": minutes,
+                },
+            )
+        return released
+
     # Approvals
 
     def approve(self, approval_id: str, approver_user_id: str, note: str | None = None) -> Approval:
@@ -601,6 +751,7 @@ class Gate:
             GateReason.EXPIRED,
             subject=approval.id,
             rule_ids=approval.rule_ids,
+            details={"approval_args_hash": approval.args_hash},
         )
 
     def _decide_approval(
@@ -657,6 +808,7 @@ class Gate:
                     "requested_by": decided.requested_by,
                     "risk_score": decided.risk_score,
                     "has_note": note is not None,
+                    "approval_args_hash": decided.args_hash,
                 },
             )
 
@@ -782,6 +934,7 @@ class Gate:
             return self._deny(call, Reason.ACTION_NOT_SUPPORTED)
 
         facts = adapter.facts(validated)
+        values = self._call_values(run, config.id, checked_action, validated, facts)
         document: DocumentFacts | None = None
         if facts.document_id is not None:
             stored = (
@@ -811,6 +964,7 @@ class Gate:
                     subject=facts.document_id,
                     rule_ids=decision.rule_ids,
                     policy_version=decision.policy_version,
+                    details=values,
                 )
         elif facts.write_label is not None:
             document = DocumentFacts(
@@ -824,7 +978,28 @@ class Gate:
             facts=facts,
             document=document,
             document_id=facts.document_id,
+            values=values,
         )
+
+    def _call_values(
+        self, run: _Run, tool: str, action: Action, args: BaseModel, facts: ToolFacts
+    ) -> dict[str, JsonValue]:
+        """What the decision events of a validated call record about its args: never a
+        value a person wrote, only its hash, counts and the amount."""
+        values: dict[str, JsonValue] = {}
+        if tool != SEARCH_TOOL:
+            # An adapter's args the hash cannot represent are recorded without one.
+            with contextlib.suppress(TypeError, ValueError):
+                values["args_hash"] = args_hash(tool, action, args.model_dump(mode="json"))
+        if facts.recipients:
+            domains = frozenset(domain.lower() for domain in run.customer.domains)
+            external = sum(1 for raw in facts.recipients if _is_external(raw, domains))
+            values["recipients"] = len(facts.recipients)
+            values["recipients_internal"] = len(facts.recipients) - external
+            values["recipients_external"] = external
+        if facts.amount_usd is not None:
+            values["amount_usd"] = str(facts.amount_usd)
+        return values
 
     def _reserve(
         self,
@@ -876,7 +1051,13 @@ class Gate:
         return verdict
 
     def _deny_verdict(
-        self, call: _Call, prepared: _Prepared, verdict: _Verdict, subject: str | None
+        self,
+        call: _Call,
+        prepared: _Prepared,
+        verdict: _Verdict,
+        subject: str | None,
+        *,
+        extra: Mapping[str, JsonValue] | None = None,
     ) -> Denied:
         # Any denial of a call that names a document reads as not_found to the model, the
         # same as a missing id, so ids (which reveal titles) cannot be probed even within
@@ -893,6 +1074,7 @@ class Gate:
             subject=subject,
             rule_ids=verdict.rule_ids,
             policy_version=verdict.policy_version,
+            details={**prepared.values, **(extra or {})},
         )
 
     def _escalation(self, run: _Run, prepared: _Prepared) -> GateReason | None:
@@ -937,8 +1119,10 @@ class Gate:
         *,
         subject: str | None,
         allow_recorded: bool = False,
+        extra: Mapping[str, JsonValue] | None = None,
     ) -> Outcome:
-        """Record the allow, unless the caller already has, then run the tool."""
+        """Record the allow, unless the caller already has, then run the tool. `extra` is
+        added to the EXECUTED event's details."""
         if not allow_recorded:
             try:
                 # The allow is on record before anything happens, or nothing happens.
@@ -958,7 +1142,14 @@ class Gate:
             else [prepared.document.label]
         )
         return self._finish(
-            run, call, prepared, reservation, result, [*labels, *result.returned_labels], subject
+            run,
+            call,
+            prepared,
+            reservation,
+            result,
+            [*labels, *result.returned_labels],
+            subject,
+            extra=extra,
         )
 
     def _record_allow(
@@ -969,6 +1160,7 @@ class Gate:
         subject: str | None,
         details: dict[str, JsonValue] | None,
     ) -> None:
+        details = {**prepared.values, **(details or {})}
         self._emit(
             call,
             EventKind.ALLOW,
@@ -1046,12 +1238,13 @@ class Gate:
         reservation: Reservation,
         subject: str | None,
     ) -> ToolResult | Denied:
+        values = prepared.values
         try:
             result = prepared.adapter.run(env, run.ctx, prepared.args)
         except Exception as exc:
-            return self._tool_failed(call, reservation, subject, exc)
+            return self._tool_failed(call, reservation, subject, exc, values=values)
         if not result.cost_usd.is_finite() or result.cost_usd < 0:
-            return self._tool_failed(call, reservation, subject, None)
+            return self._tool_failed(call, reservation, subject, None, values=values)
         return result
 
     def _tool_failed(
@@ -1060,11 +1253,14 @@ class Gate:
         reservation: Reservation,
         subject: str | None,
         exc: Exception | None,
+        *,
+        values: Mapping[str, JsonValue] | None = None,
     ) -> Denied:
         self._ledger.release(reservation)
         # The exception type only: messages can quote arguments or document text.
         error = "invalid_result" if exc is None else type(exc).__name__
-        return self._deny(call, GateReason.TOOL_ERROR, subject=subject, details={"error": error})
+        details: dict[str, JsonValue] = {**(values or {}), "error": error}
+        return self._deny(call, GateReason.TOOL_ERROR, subject=subject, details=details)
 
     def _finish(
         self,
@@ -1075,18 +1271,36 @@ class Gate:
         result: ToolResult,
         labels: Iterable[str],
         subject: str | None,
+        *,
+        extra: Mapping[str, JsonValue] | None = None,
     ) -> Executed:
         cost = prepared.config.cost_usd + result.cost_usd
         self._ledger.settle(reservation, cost)
         max_label = self._raise_label(run, labels)
+        details: dict[str, JsonValue] = {
+            "cost_usd": str(cost),
+            "run_max_label": max_label,
+            **prepared.values,
+            **(extra or {}),
+        }
+        if result.effect_ref is not None:
+            details["effect_ref"] = self._effect_ref(result.effect_ref)
         self._emit(
             call,
             EventKind.EXECUTED,
             GateReason.EXECUTED,
             subject=subject,
-            details={"cost_usd": str(cost), "run_max_label": max_label},
+            details=details,
         )
         return Executed(tool=prepared.config.id, content=result.content, cost_usd=cost)
+
+    def _effect_ref(self, value: object) -> JsonValue:
+        """A tool's effect_ref as an event records it: the id, or a reference to anything
+        that is not one plain id."""
+        if isinstance(value, str) and _EFFECT_REF.fullmatch(value) and storable_identifier(value):
+            return value
+        text = value if isinstance(value, str) else repr(type(value))
+        return self.audit_reference(text)
 
     def _raise_label(self, run: _Run, labels: Iterable[str]) -> str | None:
         with self._store.transaction():

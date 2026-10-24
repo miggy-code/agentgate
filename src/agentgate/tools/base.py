@@ -45,6 +45,10 @@ class ToolResult:
     # Labels of every document whose content is in `content`, so the gate can raise the
     # run's max label from what actually reached the model.
     returned_labels: tuple[str, ...] = ()
+    # The id of the side effect the call made (an outbox row, a parts order, a refund, a
+    # note), for the EXECUTED event, so a store row can be matched to its event. An id the
+    # tool chose, never content; None for a call with no side effect.
+    effect_ref: str | None = None
 
 
 @dataclass(frozen=True)

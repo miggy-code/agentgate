@@ -18,6 +18,14 @@ written to it, so a mistyped path cannot mix store tables into the audit log.
 A user suspended by an operator (`suspend_user`, behind `agentgate users suspend`) carries a
 flag, `suspended_by_operator`. Fixture sync never reactivates a flagged user; only
 `reinstate_user` clears the flag, after which the user's status comes from fixtures again.
+
+`policy_snapshots` keeps the canonical JSON of every policy bundle a world has loaded, keyed
+by its version, so the rules behind any version an audit event names can be read back
+(`agentgate audit policy`). A snapshot is written once and never replaced; its sha256 is
+also on the audit chain, in the `policy_loaded` event, so an edited snapshot shows.
+
+`Store(path, readonly=True)` opens an existing store read-only for commands that must not
+change it (`agentgate audit show`): no file is created or tightened, no schema is written.
 """
 
 import contextlib
@@ -28,6 +36,8 @@ import stat
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -65,6 +75,14 @@ CREATE TABLE IF NOT EXISTS documents (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS documents_customer_id ON documents(customer_id);
+
+CREATE TABLE IF NOT EXISTS policy_snapshots (
+    version TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL REFERENCES customers(id),
+    bundle TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    first_loaded_at TEXT NOT NULL
+) STRICT;
 """
 
 
@@ -80,6 +98,21 @@ class StoreError(ValueError):
     """The path does not hold an agentgate store, or a row does not match the store."""
 
 
+@dataclass(frozen=True)
+class PolicySnapshot:
+    """One loaded policy bundle as canonical JSON, under the version computed over it."""
+
+    version: str
+    # The customer that first loaded it. The version hashes the bundle alone, so customers
+    # with identical rules share one snapshot; their policy_loaded events say who loaded it.
+    customer_id: str
+    # The canonical JSON the version hash is computed over (policy.version.bundle_version).
+    bundle: str
+    # Hex sha256 of `bundle` as UTF-8, as the policy_loaded event records it.
+    sha256: str
+    first_loaded_at: datetime
+
+
 def _sorted_json(values: Iterable[str]) -> str:
     # Sets have no order; sorting keeps rows and any dumps byte-for-byte reproducible.
     return json.dumps(sorted(values))
@@ -88,15 +121,29 @@ def _sorted_json(values: Iterable[str]) -> str:
 class Store:
     """Customers, users and documents in one SQLite database."""
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(self, path: str | Path = ":memory:", *, readonly: bool = False) -> None:
         file_path = None if str(path) in {":memory:", ""} else Path(path)
         # The mode an existing file had before it was tightened to owner-only, or None.
         self.tightened_from: int | None = None
-        if file_path is not None:
-            self.tightened_from = _prepare_file(file_path)
-        # isolation_level=None turns off sqlite3's implicit transactions, so single writes
-        # commit immediately and transaction() alone decides multi-write boundaries.
-        self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self.readonly = readonly
+        if readonly:
+            if file_path is None:
+                raise StoreError("a read-only store needs a file")
+            if not file_path.is_file():
+                raise FileNotFoundError(f"store not found: {file_path}")
+            self._conn = sqlite3.connect(
+                f"{file_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+        else:
+            if file_path is not None:
+                self.tightened_from = _prepare_file(file_path)
+            # isolation_level=None turns off sqlite3's implicit transactions, so single
+            # writes commit immediately and transaction() alone decides multi-write
+            # boundaries.
+            self._conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         try:
             self._conn.row_factory = sqlite3.Row
             self._lock = threading.RLock()
@@ -104,8 +151,12 @@ class Store:
             if file_path is not None:
                 # Before the schema script, which would write store tables into the file.
                 _refuse_audit_database(self._conn, file_path)
-            self._conn.executescript(_SCHEMA)
-            _migrate(self._conn)
+            if readonly:
+                if "customers" not in _tables(self._conn):
+                    raise StoreError(f"{file_path}: is not an agentgate store")
+            else:
+                self._conn.executescript(_SCHEMA)
+                _migrate(self._conn)
         except BaseException:
             self._conn.close()
             raise
@@ -279,6 +330,54 @@ class Store:
             ).fetchone()
             return row is not None and bool(row["suspended_by_operator"])
 
+    def save_policy_snapshot(self, snapshot: PolicySnapshot) -> tuple[PolicySnapshot, bool]:
+        """Store a snapshot unless its version is already stored. Returns the stored one and
+        whether it was written now.
+
+        A stored snapshot is never replaced, so the result can differ from `snapshot` only
+        if the stored row was edited: the caller compares the sha256."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO policy_snapshots"
+                " (version, customer_id, bundle, sha256, first_loaded_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    snapshot.version,
+                    snapshot.customer_id,
+                    snapshot.bundle,
+                    snapshot.sha256,
+                    snapshot.first_loaded_at.isoformat(),
+                ),
+            )
+            stored = self.get_policy_snapshot(snapshot.version)
+            assert stored is not None
+            return stored, cursor.rowcount == 1
+
+    def get_policy_snapshot(self, version: str) -> PolicySnapshot | None:
+        """The snapshot stored for a policy version, or None (also for a store from before
+        snapshots, opened read-only)."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM policy_snapshots WHERE version = ?", (version,)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                if "policy_snapshots" in _tables(self._conn):
+                    raise
+                return None
+            return None if row is None else _snapshot(row)
+
+    def list_policy_snapshots(self, customer_id: str) -> list[PolicySnapshot]:
+        """One customer's snapshots, oldest first."""
+        with self._lock:
+            if "policy_snapshots" not in _tables(self._conn):
+                return []
+            rows = self._conn.execute(
+                "SELECT * FROM policy_snapshots WHERE customer_id = ?"
+                " ORDER BY first_loaded_at, version",
+                (customer_id,),
+            ).fetchall()
+            return [_snapshot(row) for row in rows]
+
     def get_customer(self, customer_id: str) -> Customer | None:
         with self._lock:
             row = self._conn.execute(
@@ -355,6 +454,21 @@ def _document(row: sqlite3.Row) -> Document:
     )
 
 
+def _snapshot(row: sqlite3.Row) -> PolicySnapshot:
+    return PolicySnapshot(
+        version=row["version"],
+        customer_id=row["customer_id"],
+        bundle=row["bundle"],
+        sha256=row["sha256"],
+        first_loaded_at=datetime.fromisoformat(row["first_loaded_at"]),
+    )
+
+
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def make_private_dirs(directory: Path) -> None:
     """Create directory and any missing parents owner-only (0700, less any umask bits).
 
@@ -423,10 +537,7 @@ def _tighten(path: Path) -> int | None:
 
 
 def _refuse_audit_database(conn: sqlite3.Connection, path: Path) -> None:
-    tables = {
-        str(row[0])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-    }
+    tables = _tables(conn)
     # The store never has an events table; Panoptes keeps its hash chain beside one.
     if "events" in tables:
         raise StoreError(f"{path}: is a Panoptes audit database, not an agentgate store")

@@ -5,6 +5,15 @@ and under which policy version. Events carry ids, labels, counts and reason code
 document bodies or message text, so the audit log does not become a second copy of the
 data it protects.
 
+Decision events also carry values that let an incident be reconstructed from the log alone,
+still never text: `args_hash` (the approvals args_hash of the tool, action and validated
+args), recipient counts split internal and external (never addresses), a spend's amount,
+the side-effect row a tool wrote (`effect_ref`), and for approval events the approval's own
+`approval_args_hash`, so the store's approval row can be checked against the chain.
+POLICY_LOADED records each customer's policy version and the sha256 of its canonical bundle
+every time a world opens; OPERATOR_ACTION records fixture syncs, suspensions,
+reinstatements and stale spend sweeps, with `details.action` saying which.
+
 A value a caller chose (a document id, an approval id, a tool name, a claimed run, user or
 customer) is kept on the event as given, so in-process checks can see what was asked. When
 it names nothing the store knows, or a durable log would refuse or rewrite it, the gate also
@@ -35,6 +44,17 @@ class EventKind(StrEnum):
     CAP_HIT = "cap_hit"
     RETRIEVAL = "retrieval"
     INVARIANT_VIOLATION = "invariant_violation"
+    POLICY_LOADED = "policy_loaded"
+    OPERATOR_ACTION = "operator_action"
+
+
+class OperatorAction(StrEnum):
+    """What an OPERATOR_ACTION event records, in `details.action` and as its reason."""
+
+    FIXTURE_SYNC = "fixture_sync"
+    USER_SUSPENDED = "user_suspended"
+    USER_REINSTATED = "user_reinstated"
+    STALE_RESERVATIONS_RELEASED = "stale_reservations_released"
 
 
 # The fields of an event that can hold a caller's value, and so can be referenced.

@@ -13,7 +13,7 @@ from typer.testing import CliRunner, Result
 
 import agentgate
 from agentgate.audit.base import AuditEvent, EventKind
-from agentgate.audit.panoptes import PanoptesSink
+from agentgate.audit.panoptes import PanoptesSink, read_events
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.policy.schema import load_bundle
 from agentgate.policy.version import bundle_version
@@ -418,12 +418,11 @@ def test_gateway_serve_refuses_unknown_and_suspended_users(
     # Nothing reaches stdout, which would be the MCP stream.
     assert result.stdout == ""
     assert result.stderr == f"{DEMO_IDENTITY_NOTE}\n{error}\n"
-    sink = PanoptesSink(tmp_path / "data" / "audit.db", create=False)
-    try:
-        # The gate records the suspended user's refused run; an unknown id never reaches it.
-        assert sink.count() == audited
-    finally:
-        sink.close()
+    # Opening a fresh database records its policies and fixture load first. After that, the
+    # gate records the suspended user's refused run; an unknown id never reaches it.
+    events = read_events(tmp_path / "data" / "audit.db")
+    opening = {"policy_loaded", "operator_action"}
+    assert len([e for e in events if e.kind.value not in opening]) == audited
 
 
 def test_gateway_serve_needs_a_user() -> None:

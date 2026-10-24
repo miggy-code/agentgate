@@ -35,6 +35,8 @@ from agentgate.tools.base import ToolAdapter, ToolEnv, ToolFacts, ToolResult
 # Bodies handed to the model are cut here, so one huge document cannot flood the context.
 MAX_BODY_CHARS = 4000
 MAX_TEXT_CHARS = 20_000
+# The tag every note carries.
+NOTE_TAG = "note"
 
 _SCHEMA = (
     """
@@ -204,7 +206,7 @@ class NotesWrite(_Adapter[NotesWriteArgs]):
             customer_id=ctx.customer_id,
             title=args.title,
             label=args.label,
-            tags=frozenset({"note"}),
+            tags=frozenset({NOTE_TAG}),
             body=args.body,
         )
         env.store.add_document(note)
@@ -212,7 +214,8 @@ class NotesWrite(_Adapter[NotesWriteArgs]):
         # customer's documents for as long as it takes.
         env.index.add(note)
         return ToolResult(
-            content={"document_id": note.id, "title": note.title, "label": note.label}
+            content={"document_id": note.id, "title": note.title, "label": note.label},
+            effect_ref=note.id,
         )
 
 
@@ -249,7 +252,8 @@ class EmailSend(_Adapter[EmailSendArgs]):
         )
         to: list[JsonValue] = [*recipients]
         return ToolResult(
-            content={"status": "queued", "email_id": email_id, "recipients": len(to), "to": to}
+            content={"status": "queued", "email_id": email_id, "recipients": len(to), "to": to},
+            effect_ref=email_id,
         )
 
 
@@ -277,7 +281,7 @@ class PartsOrder(_Adapter[PartsOrderArgs]):
                 env.clock.now().isoformat(),
             ),
         )
-        return ToolResult(content={"status": "ordered", "order_id": order_id})
+        return ToolResult(content={"status": "ordered", "order_id": order_id}, effect_ref=order_id)
 
 
 class RefundIssue(_Adapter[RefundIssueArgs]):
@@ -303,7 +307,9 @@ class RefundIssue(_Adapter[RefundIssueArgs]):
                 env.clock.now().isoformat(),
             ),
         )
-        return ToolResult(content={"status": "issued", "refund_id": refund_id})
+        return ToolResult(
+            content={"status": "issued", "refund_id": refund_id}, effect_ref=refund_id
+        )
 
 
 def default_tools() -> dict[str, ToolAdapter]:
@@ -365,8 +371,8 @@ class RefundRow:
 
 
 def _rows(store: Store, table: str, customer_id: str | None) -> list[dict[str, str | int]]:
-    # table is one of this module's constants, never caller text.
-    ensure_schema(store)
+    # table is one of this module's constants, never caller text. A table no tool has
+    # written yet holds no rows; it is not created here, so a read-only store can be read.
     query = f"SELECT * FROM {table}"
     params: tuple[str, ...] = ()
     if customer_id is not None:
@@ -374,6 +380,11 @@ def _rows(store: Store, table: str, customer_id: str | None) -> list[dict[str, s
         params = (customer_id,)
     query += " ORDER BY created_at, rowid"
     with store.locked():
+        exists = store.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if exists is None:
+            return []
         return [dict(row) for row in store.connection.execute(query, params).fetchall()]
 
 
@@ -421,3 +432,76 @@ def list_refunds(store: Store, customer_id: str | None = None) -> list[RefundRow
         )
         for row in _rows(store, "refunds", customer_id)
     ]
+
+
+@dataclass(frozen=True)
+class StoredEffect:
+    """A side effect a built-in tool wrote, as the validated args that would have written it.
+
+    `args` hashed with approvals.args_hash under the tool and its action is what the gate
+    recorded as `args_hash` on the call's EXECUTED event, whose `effect_ref` is `id`, so
+    `agentgate audit check-store` can tell a row edited after the fact from the one the gate
+    allowed. Notes have no run in the store; their run_id is None.
+    """
+
+    tool: str
+    id: str
+    customer_id: str
+    run_id: str | None
+    args: dict[str, JsonValue]
+
+
+def stored_effects(store: Store, customer_id: str) -> list[StoredEffect]:
+    """Every outbox email, parts order, refund and note of one customer, oldest first."""
+    effects: list[StoredEffect] = []
+    for email in list_outbox(store, customer_id):
+        to: list[JsonValue] = [*email.recipients]
+        effects.append(
+            StoredEffect(
+                EmailSend.tool_id,
+                email.id,
+                email.customer_id,
+                email.run_id,
+                {"to": to, "subject": email.subject, "body": email.body},
+            )
+        )
+    for order in list_parts_orders(store, customer_id):
+        effects.append(
+            StoredEffect(
+                PartsOrder.tool_id,
+                order.id,
+                order.customer_id,
+                order.run_id,
+                {
+                    "part": order.part,
+                    "quantity": order.quantity,
+                    "amount_usd": str(order.amount_usd),
+                },
+            )
+        )
+    for refund in list_refunds(store, customer_id):
+        effects.append(
+            StoredEffect(
+                RefundIssue.tool_id,
+                refund.id,
+                refund.customer_id,
+                refund.run_id,
+                {
+                    "order_id": refund.order_id,
+                    "amount_usd": str(refund.amount_usd),
+                    "reason": refund.reason,
+                },
+            )
+        )
+    for document in store.list_documents(customer_id):
+        if NOTE_TAG in document.tags:
+            effects.append(
+                StoredEffect(
+                    NotesWrite.tool_id,
+                    document.id,
+                    document.customer_id,
+                    None,
+                    {"title": document.title, "body": document.body, "label": document.label},
+                )
+            )
+    return effects

@@ -334,7 +334,8 @@ def test_list_and_show_compute_expiry_without_writing(tmp_path: Path) -> None:
         approval = world.gate.approvals.get(stale.id)
         assert approval is not None and approval.status is ApprovalStatus.PENDING
     assert _cli(tmp_path, "expire", "--as", "kc-owner-dale").stdout == "expired 1 approvals\n"
-    assert _audit_count(tmp_path) == events + 1
+    # The expiry, and the open of a command that changes state: one policy_loaded per customer.
+    assert _audit_count(tmp_path) == events + 1 + 2
     result = _cli(tmp_path, "list", "--as", "kc-owner-dale", "--status", "expired")
     assert result.stdout.splitlines()[0] == _line(stale.approval, "expired")
 

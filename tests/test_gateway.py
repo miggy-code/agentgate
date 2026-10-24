@@ -21,7 +21,7 @@ from mcp.types import CallToolResult, TextContent
 from agentgate.agent.loop import run_agent, tool_specs
 from agentgate.agent.mock import ScriptedModel
 from agentgate.audit.base import AuditEvent, EventKind, MemorySink
-from agentgate.audit.panoptes import PanoptesSink
+from agentgate.audit.panoptes import PanoptesSink, read_events
 from agentgate.cli import DEMO_IDENTITY_NOTE
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
@@ -641,8 +641,15 @@ def test_cli_serves_over_stdio(tmp_path: Path) -> None:
     assert runs[0][0] in stderr[1]
     sink = PanoptesSink(audit_db, create=False)
     try:
-        # run_started, then allow and executed for the read, then the deny.
-        assert sink.count() == 4
+        # The open of a fresh database: policy_loaded and the fixture load for each customer.
+        # Then run_started, allow and executed for the read, then the deny.
+        events = read_events(audit_db)
+        kinds = [e.kind.value for e in events]
+        assert kinds[:4].count("policy_loaded") == 2 and kinds[:4].count("operator_action") == 2
+        assert {e.details.get("action") for e in events if e.kind.value == "operator_action"} == {
+            "fixture_sync"
+        }
+        assert kinds[4:] == ["run_started", "allow", "executed", "deny"], kinds
         assert sink.verify()["valid"]
     finally:
         sink.close()

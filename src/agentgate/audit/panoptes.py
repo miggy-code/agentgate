@@ -16,10 +16,15 @@ value that names nothing real, or a real id Panoptes would refuse) holds its `re
 reference, and context["agentgate"]["references"] says which fields those are and why. The
 gate checks values with `storable_identifier`, Panoptes' own rule, before it emits them. A
 refused event raises AuditRejected, so the gate can tell it from a storage failure.
+
+`read_events` reads a log back, read-only, as the AuditEvents it stores, in the order they
+were written: each referenced field holds its `ref:` reference, as stored. That is what
+`agentgate audit show` prints and what `agentgate audit check-store` compares the store with.
 """
 
+import json
 import sqlite3
-from datetime import UTC
+from datetime import UTC, datetime
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -28,7 +33,7 @@ from typing import Any
 from panoptes.db import AuditDB
 from panoptes.schema import ValidationError, validate_identifier
 
-from agentgate.audit.base import AuditEvent, AuditRejected, EventKind
+from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, Reference
 
 # Panoptes needs a session and run id on every event; this marks events outside any run.
 NO_RUN = "no-run"
@@ -49,6 +54,8 @@ _STATUS: dict[EventKind, str] = {
     EventKind.CAP_HIT: "blocked",
     EventKind.INVARIANT_VIOLATION: "blocked",
     EventKind.APPROVAL_REQUIRED: "pending",
+    EventKind.POLICY_LOADED: "success",
+    EventKind.OPERATOR_ACTION: "success",
 }
 
 
@@ -176,6 +183,72 @@ class PanoptesSink:
     def close(self) -> None:
         self._closed = True
         self._db.close()
+
+
+def read_events(db_path: str | Path) -> list[AuditEvent]:
+    """Every agentgate event in the Panoptes log at db_path, oldest first, as stored.
+
+    Opens the file read-only and writes nothing. Raises FileNotFoundError for a missing file,
+    ValueError for a file that is not a Panoptes log or a row that is not a well-formed
+    agentgate event. Rows Panoptes holds for other agents are skipped. This does not verify
+    the chain; PanoptesSink.verify does.
+    """
+    path = Path(db_path)
+    _check_existing(path)
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT event_id, timestamp, action, context FROM events ORDER BY rowid"
+        ).fetchall()
+    finally:
+        conn.close()
+    events: list[AuditEvent] = []
+    for event_id, timestamp, action, context in rows:
+        event = _stored_event(str(event_id), str(timestamp), action, context)
+        if event is not None:
+            events.append(event)
+    return events
+
+
+def _stored_event(
+    event_id: str, timestamp: str, action_json: object, context_json: object
+) -> AuditEvent | None:
+    try:
+        context = json.loads(str(context_json))
+        fields = context.get("agentgate") if isinstance(context, dict) else None
+        if fields is None:
+            return None
+        action = json.loads(str(action_json))
+        parameters = action.get("parameters") or {}
+        values: dict[str, Any] = {
+            "event_id": event_id,
+            "timestamp": _aware(datetime.fromisoformat(timestamp)),
+            "kind": fields["kind"],
+            "customer_id": fields["customer_id"],
+            "user_id": fields.get("user_id"),
+            "role": fields.get("role"),
+            "run_id": fields.get("run_id"),
+            "tool": fields.get("tool"),
+            "action": parameters.get("action"),
+            "subject": action.get("target"),
+            "reason": fields["reason"],
+            "rule_ids": tuple(fields.get("rule_ids") or ()),
+            "policy_version": fields.get("policy_version"),
+            "latency_us": fields.get("latency_us"),
+            "details": fields.get("details") or {},
+        }
+        # Each referenced field already holds its reference; the context says why.
+        values["references"] = {
+            name: Reference(ref=values[name], why=why)
+            for name, why in (fields.get("references") or {}).items()
+        }
+        return AuditEvent.model_validate(values)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError(f"event {event_id}: not a well-formed agentgate event") from exc
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _check_existing(path: Path) -> None:

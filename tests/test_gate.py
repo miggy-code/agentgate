@@ -18,7 +18,7 @@ import pytest
 from pydantic import BaseModel, JsonValue
 
 import agentgate.gate as gate_module
-from agentgate.approvals import ApprovalError, ApprovalErrorReason, ApprovalStatus
+from agentgate.approvals import ApprovalError, ApprovalErrorReason, ApprovalStatus, args_hash
 from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, MemorySink
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import FixedClock
@@ -1125,7 +1125,16 @@ def test_audit_failure_at_execution_leaves_the_approval_usable(world: World) -> 
     executed(gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args))
     allow = [e for e in sink.events if e.kind is EventKind.ALLOW]
     assert len(allow) == 1
-    assert allow[0].details == {"approved_by": "kc-mgr-terrence"}
+    stored = world.gate.approvals.get(approval_id)
+    assert stored is not None
+    assert allow[0].details == {
+        "approved_by": "kc-mgr-terrence",
+        "approval_args_hash": stored.args_hash,
+        "args_hash": stored.args_hash,
+        "recipients": 1,
+        "recipients_internal": 0,
+        "recipients_external": 1,
+    }
     assert status_of(world, approval_id) == (ApprovalStatus.EXECUTED, "kc-mgr-terrence", True)
 
 
@@ -1181,7 +1190,12 @@ def test_tool_error_is_denied_and_released(world: World) -> None:
     outcome = gate.call_tool(ctx, "parts.order", Action.SPEND, order_args("20.00"))
     assert outcome == Denied("tool_error")
     event = world.last(EventKind.DENY)
-    assert (event.reason, event.details) == ("tool_error", {"error": "RuntimeError"})
+    assert event.reason == "tool_error"
+    assert event.details == {
+        "error": "RuntimeError",
+        "args_hash": args_hash("parts.order", Action.SPEND, order_args("20.00")),
+        "amount_usd": "20.00",
+    }
     assert gate.ledger.run_calls(ctx.run_id) == 0
     assert world.events(EventKind.EXECUTED) == []
 

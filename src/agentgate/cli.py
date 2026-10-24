@@ -26,14 +26,15 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
+from pydantic import JsonValue
 
 import agentgate
 from agentgate.agent.loop import run_agent, tool_specs
 from agentgate.agent.mock import NaiveModel
 from agentgate.agent.model import Model
 from agentgate.approvals import Approval, ApprovalError, ApprovalStatus
-from agentgate.audit.base import MemorySink
-from agentgate.audit.panoptes import PanoptesSink
+from agentgate.audit.base import AuditEvent, EventKind, MemorySink, ReferencedField
+from agentgate.audit.panoptes import PanoptesSink, read_events
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
 from agentgate.fixtures import FixtureError
 from agentgate.gate import IdentityError
@@ -53,6 +54,7 @@ from agentgate.redteam.baseline import (
 )
 from agentgate.redteam.core import Category, SuiteResult, run_suite
 from agentgate.redteam.transport import Transport
+from agentgate.store import Store
 from agentgate.tools.builtin import default_tools
 from agentgate.world import (
     DEFAULT_AUDIT_DB,
@@ -60,8 +62,13 @@ from agentgate.world import (
     DEFAULT_FIXTURES,
     DEFAULT_POLICIES,
     DEFAULT_RESERVATION_LEASE,
+    OpenRecord,
+    OperatorReason,
+    StoreCheck,
     UserAdminError,
     World,
+    bundle_sha256,
+    check_store,
     open_memory_world,
     open_world,
     reinstate_user,
@@ -231,6 +238,256 @@ def _database_error(exc: sqlite3.Error) -> str:
     return f"database error: {exc}"
 
 
+# audit show, policy and check-store
+
+
+def _reading_user(store: Store, user_id: str, *, owners_only: bool) -> User:
+    """The acting user of a read-only audit command: active, an owner (or a manager when
+    owners_only is false)."""
+    user = store.get_user(user_id)
+    if user is None:
+        _fail(f"unknown user {user_id!r}")
+    if user.status is not UserStatus.ACTIVE:
+        _fail(f"user {user_id!r} is not active")
+    allowed = {Role.OWNER} if owners_only else {Role.OWNER, Role.MANAGER}
+    if user.role not in allowed:
+        who = "owners only" if owners_only else "owners and managers only"
+        _fail(f"role {user.role.value!r} may not read the audit log; {who}")
+    return user
+
+
+@contextmanager
+def _audit_reader(
+    db: Path, audit_db: Path, as_user: str, *, owners_only: bool
+) -> Iterator[tuple[Store, User, list[AuditEvent]]]:
+    """The store opened read-only, the acting user and every event in the log."""
+    typer.echo(DEMO_IDENTITY_NOTE, err=True)
+    try:
+        store = Store(db, readonly=True)
+    except sqlite3.Error as exc:
+        _fail(_database_error(exc))
+    except (OSError, ValueError) as exc:
+        _fail(str(exc))
+    try:
+        user = _reading_user(store, as_user, owners_only=owners_only)
+        try:
+            events = read_events(audit_db)
+        except (OSError, ValueError) as exc:
+            _fail(str(exc))
+        yield store, user, events
+    except sqlite3.Error as exc:
+        _fail(_database_error(exc))
+    finally:
+        store.close()
+
+
+def _shown(value: str) -> str:
+    """A stored value as one line of plain ASCII: anything else is shown escaped."""
+    if value.isascii() and value.isprintable() and " " not in value:
+        return value
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _shown_detail(value: JsonValue) -> str:
+    if isinstance(value, str):
+        return _shown(value)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return ",".join(_shown(str(item)) for item in value) or "[]"
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _field(event: AuditEvent, name: ReferencedField) -> str:
+    value = getattr(event, name)
+    if value is None:
+        return "-"
+    reference = event.references.get(name)
+    if reference is not None:
+        return f"{reference.ref} ({reference.why} value)"
+    return _shown(str(value))
+
+
+def _event_line(event: AuditEvent) -> str:
+    stamp = event.timestamp.astimezone(UTC).isoformat(timespec="milliseconds")
+    parts = [
+        stamp.replace("+00:00", "Z"),
+        event.kind.value,
+        _shown(event.reason),
+        f"user={_field(event, 'user_id')}",
+        f"role={'-' if event.role is None else event.role.value}",
+        f"tool={_field(event, 'tool')}",
+        f"subject={_field(event, 'subject')}",
+        f"rules={','.join(_shown(r) for r in event.rule_ids) or '-'}",
+        f"policy={_shown(event.policy_version) if event.policy_version else '-'}",
+    ]
+    if event.run_id is not None:
+        parts.append(f"run={_field(event, 'run_id')}")
+    parts += [f"{key}={_shown_detail(value)}" for key, value in sorted(event.details.items())]
+    return "  ".join(parts)
+
+
+@audit_app.command("show")
+def audit_show(
+    as_user: AsOption,
+    db: Annotated[Path, typer.Option("--db", help="agentgate database, read-only.")] = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    run: Annotated[
+        str | None, typer.Option("--run", metavar="RUN_ID", help="Only this run's events.")
+    ] = None,
+    customer: Annotated[
+        str | None,
+        typer.Option(
+            "--customer", metavar="ID", help="Must be the acting user's own customer, if given."
+        ),
+    ] = None,
+    kind: Annotated[
+        EventKind | None, typer.Option("--kind", help="Only events of this kind.")
+    ] = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", min=1, help="Only the last N matching events.")
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the stored events as JSON instead.")
+    ] = False,
+) -> None:
+    """Print the acting user's customer's audit events, oldest first, one per line.
+
+    Owners and managers only. Read-only: neither file is changed. A value the log holds as a
+    reference prints as its ref: and why ("unknown value": it named nothing the store knew).
+    Run `agentgate audit verify` to check the chain itself."""
+    with _audit_reader(db, audit_db, as_user, owners_only=False) as (_, user, events):
+        # Another customer reads exactly like a missing one.
+        if customer is not None and customer != user.customer_id:
+            _fail(f"customer {customer!r} not found")
+        shown = [
+            event
+            for event in events
+            if event.customer_id == user.customer_id
+            and (run is None or event.run_id == run)
+            and (kind is None or event.kind is kind)
+        ]
+    if limit is not None:
+        shown = shown[-limit:]
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [event.model_dump(mode="json") for event in shown],
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+        )
+        return
+    for event in shown:
+        typer.echo(_event_line(event))
+    typer.echo(f"{user.customer_id}  {len(shown)} events")
+
+
+@audit_app.command("policy")
+def audit_policy(
+    version: Annotated[str, typer.Argument(metavar="VERSION", help="A policy version hash.")],
+    as_user: AsOption,
+    db: Annotated[Path, typer.Option("--db", help="agentgate database, read-only.")] = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+) -> None:
+    """Print the policy bundle stored for a version, and check it against the chain.
+
+    The bundle is the canonical JSON the version is computed over. Its sha256 must match
+    the snapshot row, the version, and every policy_loaded event for it on the chain.
+    Exits 1 on any mismatch. Owners and managers only; read-only."""
+    with _audit_reader(db, audit_db, as_user, owners_only=False) as (store, user, events):
+        snapshot = store.get_policy_snapshot(version) if version.isprintable() else None
+        loaded = [
+            event
+            for event in events
+            if event.kind is EventKind.POLICY_LOADED
+            and event.customer_id == user.customer_id
+            and event.policy_version == version
+        ]
+        # A version is the hash of the bundle alone, so two customers with the same rules
+        # share one snapshot; the customer's own chain shows it loaded that version. Any
+        # other customer's version reads exactly like a missing one.
+        if snapshot is None or (snapshot.customer_id != user.customer_id and not loaded):
+            _fail(f"policy version {version!r} not found")
+    digest = bundle_sha256(snapshot.bundle)
+    try:
+        bundle = json.loads(snapshot.bundle)
+    except ValueError:
+        bundle = None
+    problems: list[str] = []
+    if bundle is None:
+        problems.append("the stored bundle is not JSON")
+    else:
+        typer.echo(json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=True))
+    if digest != snapshot.sha256:
+        problems.append("the stored bundle does not match its stored sha256")
+    if "sha256:" + digest[:16] != version:
+        problems.append("the stored bundle does not hash to its version")
+    recorded = [event.details.get("bundle_sha256") for event in loaded]
+    if any(value != digest for value in recorded):
+        problems.append("the stored bundle does not match a policy_loaded event")
+    for problem in problems:
+        typer.echo(f"MISMATCH {problem}")
+    on_chain = f"{len(loaded)} policy_loaded events"
+    if not loaded:
+        on_chain += " (checked against the version only)"
+    status = "ok" if not problems else "MISMATCH"
+    typer.echo(f"policy {version}  {user.customer_id}  sha256 {digest}  {on_chain}  {status}")
+    if problems:
+        raise typer.Exit(code=1)
+
+
+_CHECKED_KINDS = (
+    ("approval", "approvals"),
+    ("email.send", "outbox emails"),
+    ("parts.order", "parts orders"),
+    ("refund.issue", "refunds"),
+    ("notes.write", "notes"),
+)
+
+
+@audit_app.command("check-store")
+def audit_check_store(
+    as_user: AsOption,
+    db: Annotated[Path, typer.Option("--db", help="agentgate database, read-only.")] = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+) -> None:
+    """Check the acting owner's customer's approval, outbox, parts order, refund and note
+    rows against the audit chain. Exits 1 if any row does not match, or the chain is broken.
+
+    The chain is verified first. Each approval row's args and args_hash must match the
+    approval_args_hash its events carry, and each side-effect row must hash to the args_hash
+    of the executed event that names it. Owners only; read-only."""
+    with _audit_reader(db, audit_db, as_user, owners_only=True) as (store, user, events):
+        try:
+            sink = PanoptesSink(audit_db, create=False)
+        except (OSError, ValueError, RuntimeError) as exc:
+            _fail(str(exc))
+        try:
+            verified = sink.verify()
+        finally:
+            sink.close()
+        if not verified["valid"]:
+            typer.echo(f"{audit_db}  chain BROKEN: {verified['error']}")
+            raise typer.Exit(code=1)
+        result = check_store(store, events, user.customer_id)
+    for line in _check_lines(result):
+        typer.echo(line)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _check_lines(result: StoreCheck) -> list[str]:
+    lines = [f"MISMATCH {m.kind} {m.id}: {m.problem}" for m in result.mismatches]
+    if result.unchecked:
+        lines.append(
+            f"note: {len(result.unchecked)} rows were recorded before the chain carried"
+            " hashes; only their ids were checked"
+        )
+    counts = ", ".join(f"{result.checked.get(kind, 0)} {label}" for kind, label in _CHECKED_KINDS)
+    lines.append(f"{result.customer_id}  {counts} checked  {len(result.mismatches)} mismatches")
+    return lines
+
+
 @contextmanager
 def _world(
     db: Path,
@@ -239,6 +496,7 @@ def _world(
     fixtures: Path,
     *,
     reservation_lease: timedelta | None = DEFAULT_RESERVATION_LEASE,
+    record_open: OpenRecord = OpenRecord.ALL,
 ) -> Iterator[World]:
     # Printed before anything else, so even a failing command says it once.
     typer.echo(DEMO_IDENTITY_NOTE, err=True)
@@ -249,6 +507,7 @@ def _world(
             policies=policies,
             fixtures=fixtures,
             reservation_lease=reservation_lease,
+            record_open=record_open,
         )
     except sqlite3.Error as exc:
         _fail(_database_error(exc))
@@ -335,7 +594,7 @@ def approvals_list(
 
     Read-only: an approval past its expiry is shown as "expired (pending sweep)" and counts
     as expired for --status, but only `approvals expire` marks it."""
-    with _world(db, audit_db, policies, fixtures) as world:
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
         user = _approver(world, as_user)
         now = world.clock.now()
         approvals = [
@@ -364,7 +623,7 @@ def approvals_show(
     """Show every field of one approval, including the exact args that would run.
 
     Read-only, like list: an overdue approval shows as "expired (pending sweep)"."""
-    with _world(db, audit_db, policies, fixtures) as world:
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
         user = _approver(world, as_user)
         now = world.clock.now()
         approval = world.gate.approvals.get(approval_id)
@@ -511,7 +770,7 @@ def users_list(
     fixtures: FixturesOption = DEFAULT_FIXTURES,
 ) -> None:
     """List the acting user's customer's users: id, role and status."""
-    with _world(db, audit_db, policies, fixtures) as world:
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
         user = world.store.get_user(as_user)
         if user is None:
             _fail(f"unknown user {as_user!r}")
@@ -531,12 +790,17 @@ def users_list(
 
 
 UserIdArgument = Annotated[str, typer.Argument(metavar="USER_ID", help="The user to change.")]
+ReasonOption = Annotated[
+    OperatorReason,
+    typer.Option("--reason", help="Why, as a code: it is recorded in the audit log."),
+]
 
 
 @users_app.command("suspend")
 def users_suspend(
     user_id: UserIdArgument,
     as_user: AsOption,
+    reason: ReasonOption = OperatorReason.UNSPECIFIED,
     db: DbOption = DEFAULT_DB,
     audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
     policies: PoliciesOption = DEFAULT_POLICIES,
@@ -546,10 +810,10 @@ def users_suspend(
 
     Live runs are refused on their next call. The suspension is sticky: fixture sync does
     not reactivate the user, whatever the fixtures say, until `users reinstate`. Nothing is
-    written to the fixtures."""
+    written to the fixtures. The audit log records who suspended whom, and the reason code."""
     with _world(db, audit_db, policies, fixtures) as world:
         try:
-            suspended = suspend_user(world, user_id, acting_user_id=as_user)
+            suspended = suspend_user(world, user_id, acting_user_id=as_user, reason=reason)
         except UserAdminError as exc:
             _fail(str(exc))
     typer.echo(f"suspended {suspended.id}")
@@ -559,16 +823,18 @@ def users_suspend(
 def users_reinstate(
     user_id: UserIdArgument,
     as_user: AsOption,
+    reason: ReasonOption = OperatorReason.UNSPECIFIED,
     db: DbOption = DEFAULT_DB,
     audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
     policies: PoliciesOption = DEFAULT_POLICIES,
     fixtures: FixturesOption = DEFAULT_FIXTURES,
 ) -> None:
     """Lift a suspension made with `users suspend`. The user's status is then what the
-    fixtures say, so a user the fixtures suspend stays suspended."""
+    fixtures say, so a user the fixtures suspend stays suspended. Recorded like a
+    suspension."""
     with _world(db, audit_db, policies, fixtures) as world:
         try:
-            reinstated = reinstate_user(world, user_id, acting_user_id=as_user)
+            reinstated = reinstate_user(world, user_id, acting_user_id=as_user, reason=reason)
         except UserAdminError as exc:
             _fail(str(exc))
     typer.echo(f"reinstated {reinstated.id}  status {reinstated.status.value}")
@@ -599,11 +865,13 @@ def spend_release_stale(
     An operator command: the acting user must be an active owner of some customer. Only the
     count is printed, since the reservations may belong to other customers. Every open
     already releases reservations older than 15 minutes; this one takes another age. A host
-    that was only slow and settles later still has its actual cost recorded."""
+    that was only slow and settles later still has its actual cost recorded. The audit log
+    of each customer whose reservations were released records how many, their total and
+    their runs; the acting owner is named only in their own customer's log."""
     # The automatic sweep is off for this open, so the count covers everything released.
     with _world(db, audit_db, policies, fixtures, reservation_lease=None) as world:
-        _owner(world, as_user)
-        released = world.gate.ledger.release_stale(timedelta(minutes=older_than))
+        owner = _owner(world, as_user)
+        released = world.gate.release_stale(timedelta(minutes=older_than), actor=owner)
     typer.echo(f"released {released} stale reservations older than {older_than} minutes")
 
 
@@ -744,7 +1012,9 @@ def gateway_serve(
     # Imported here, so the other commands do not pay for loading the MCP SDK.
     from agentgate.gateway import gateway_tools, serve_stdio
 
-    with _world(db, audit_db, policies, fixtures) as world:
+    # Record what changed on open (a newly stored policy version, a fixture change, reclaimed
+    # spend), so a policy the gateway loads first is on the chain before its run's events.
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
         user = world.store.get_user(as_user)
         if user is None:
             _fail(f"unknown user {as_user!r}")
