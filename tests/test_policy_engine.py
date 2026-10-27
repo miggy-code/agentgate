@@ -351,9 +351,15 @@ def test_address_rule_accepts_and_normalises_plain_addresses(raw: str, normalise
 
 
 @pytest.mark.parametrize("raw", REFUSED_ADDRESSES)
-def test_address_rule_refuses_hostile_forms(raw: str) -> None:
+def test_a_hostile_form_is_refused_and_treated_as_external_and_on_no_list(raw: str) -> None:
     assert addresses.parse_address(raw) is None
     assert addresses.normalize_address(raw) is None
+    listed = _engine(_send_rule("r", where={"recipient_in": "directory"}))
+    internal = _engine(_send_rule("r", where={"recipient_external": False}))
+    external = _engine(_send_rule("r", where={"recipient_external": True}))
+    assert _effect(listed, _send(raw)) is Effect.DENY
+    assert _effect(internal, _send(raw)) is Effect.DENY
+    assert _effect(external, _send(raw)) is Effect.ALLOW
 
 
 def test_no_case_mapping_turns_a_refused_character_into_ascii() -> None:
@@ -369,16 +375,6 @@ def test_address_rule_domains() -> None:
     assert addresses.normalize_domain(" acme.example ") == "acme.example"
     for raw in ("\u212acme.example", "acme", "acme.example.", "acme .example", "a\tb.example"):
         assert addresses.normalize_domain(raw) is None, raw
-
-
-@pytest.mark.parametrize("raw", REFUSED_ADDRESSES)
-def test_a_hostile_form_is_external_and_on_no_list(raw: str) -> None:
-    listed = _engine(_send_rule("r", where={"recipient_in": "directory"}))
-    internal = _engine(_send_rule("r", where={"recipient_external": False}))
-    external = _engine(_send_rule("r", where={"recipient_external": True}))
-    assert _effect(listed, _send(raw)) is Effect.DENY
-    assert _effect(internal, _send(raw)) is Effect.DENY
-    assert _effect(external, _send(raw)) is Effect.ALLOW
 
 
 @pytest.mark.parametrize(

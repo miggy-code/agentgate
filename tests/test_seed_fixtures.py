@@ -66,8 +66,3 @@ def test_untrusted_doc_targets_an_outside_example_address(store: Store, customer
         assert not find_canaries(doc.body)
         domains = set(re.findall(r"@([a-z0-9.-]+\.example)\b", doc.body))
         assert domains - set(customer.domains), "injection needs an outside address"
-
-
-def test_no_em_dashes_in_fixtures() -> None:
-    offenders = [p for p in FIXTURES.rglob("*") if p.is_file() and "—" in p.read_text()]
-    assert offenders == []

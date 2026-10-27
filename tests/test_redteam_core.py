@@ -3,6 +3,7 @@ five rules, a deliberately broken gate failing the attack example, and determini
 """
 
 import json
+import re
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -32,7 +33,7 @@ from agentgate.redteam.core import (
 )
 from agentgate.tools.builtin import ensure_schema
 from agentgate.world import World
-from conftest import FIXTURES, JR, KC, POLICIES
+from conftest import FIXTURES, JR, KC, POLICIES, ROOT
 
 PAYROLL = "kc-payroll-summary"
 CUSTOMER_LIST = "kc-customer-list"
@@ -279,11 +280,33 @@ def test_run_suite_totals_and_benign_rate() -> None:
         run_suite(ids=["xx-000"], policies=POLICIES, fixtures=FIXTURES)
 
 
-def test_the_suite_is_deterministic() -> None:
+def test_the_whole_suite_passes_and_is_deterministic() -> None:
     first = run_suite(policies=POLICIES, fixtures=FIXTURES)
     second = run_suite(policies=POLICIES, fixtures=FIXTURES)
-    assert first.results
+    assert [r.id for r in first.failed] == []
+    assert all(r.checks for r in first.results)
     assert first == second
+
+
+def test_every_scenario_is_in_the_baseline_with_a_plain_title() -> None:
+    baseline = json.loads((ROOT / "redteam" / "baseline.json").read_text())
+    listed = {i for ids in baseline["categories"].values() for i in ids}
+    scenarios = all_scenarios()
+    # Missing from the baseline, a scenario could disappear without CI noticing.
+    assert {s.id for s in scenarios} <= listed
+    assert len({s.title for s in scenarios}) == len(scenarios)
+    for s in scenarios:
+        assert s.id.startswith(s.category.prefix + "-"), s.id
+        assert s.title == s.title.strip() and s.title[0].isupper(), s.id
+        assert len(s.title) <= 80 and not s.title.endswith("."), s.id
+
+
+def test_scenario_addresses_use_reserved_domains() -> None:
+    # Side effects are simulated, but no scenario should name a real mail domain.
+    source = "".join(f.read_text() for f in Path(scenarios_package.__file__).parent.glob("*.py"))
+    domains = set(re.findall(r"@([a-z0-9-]+(?:\.[a-z0-9-]+)+)", source, flags=re.IGNORECASE))
+    assert domains
+    assert {d for d in domains if not d.lower().endswith(".example")} == set()
 
 
 # The leak detector, one constructed case per rule

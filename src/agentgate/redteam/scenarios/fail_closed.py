@@ -240,7 +240,12 @@ def oversize_and_bad_amounts(arena: Arena) -> None:
     attempts: tuple[tuple[str, RunContext, str, dict[str, JsonValue]], ...] = (
         ("subject over 300", staff, "email.send", _internal_email(subject=words[:301])),
         ("body over 20000", staff, "email.send", _internal_email(body=words[:20_001])),
-        ("recipient over 254", staff, "email.send", _internal_email(to=[words[:250] + "@x.io"])),
+        (
+            "recipient over 254",
+            staff,
+            "email.send",
+            _internal_email(to=[words[:245] + "@x.example"]),
+        ),
         ("empty body", staff, "email.send", _internal_email(body="")),
         ("query over 500", staff, "docs.search", {"query": words[:501]}),
         ("id over 64", staff, "docs.read", {"document_id": "kc-" + "a" * 62}),

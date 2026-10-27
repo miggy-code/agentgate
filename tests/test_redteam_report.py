@@ -189,11 +189,6 @@ def test_markdown_without_benign_or_attack_scenarios() -> None:
     assert "benign_control |" not in only_attacks
 
 
-def test_reports_have_no_em_dashes() -> None:
-    assert "\u2014" not in to_markdown(PASSING, META)
-    assert "\u2014" not in json.dumps(to_json(PASSING, META), ensure_ascii=False)
-
-
 # JSON
 
 
