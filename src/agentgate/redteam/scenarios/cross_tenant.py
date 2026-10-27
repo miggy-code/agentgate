@@ -563,3 +563,115 @@ def start_run_in_foreign_customer(arena: Arena) -> None:
     arena.expect("no run started", not started, f"{len(started)} runs")
     reasons = sorted(e.reason for e in arena.events(EventKind.DENY))
     arena.expect("four wrong_customer denials", reasons == ["wrong_customer"] * 4, str(reasons))
+
+
+# Note writes. A note write indexes that note alone, in one short transaction. It used to
+# rebuild every customer's index inside one write transaction, so one customer writing notes held
+# the write lock for seconds and another customer's calls failed on SQLite's busy timeout. The
+# in-memory arena cannot show a lock timeout, so xt-014 checks the cause: temporary SQLite
+# triggers record every index row written or deleted, and only the new notes' rows may appear.
+# The two-process timing is covered by tests/test_tools.py.
+
+
+KC_STAFF = "kc-staff-nadine"
+
+JR_STAFF = "jr-staff-priya"
+
+NOTES = 24
+
+NOTE_BATCH = 6
+
+_INDEX_LOG = "xt014_index_writes"
+
+_INDEX_TABLES = ("retrieval_postings", "retrieval_lengths")
+
+
+def _install_index_log(arena: Arena) -> None:
+    conn = arena.store.connection
+    with arena.store.locked():
+        conn.execute(f"CREATE TEMP TABLE {_INDEX_LOG} (tbl TEXT, op TEXT, doc_id TEXT)")
+        for table in _INDEX_TABLES:
+            for op, row in (("insert", "NEW"), ("delete", "OLD"), ("update", "NEW")):
+                conn.execute(
+                    f"CREATE TEMP TRIGGER xt014_{table}_{op} AFTER {op.upper()} ON {table}"
+                    f" BEGIN INSERT INTO {_INDEX_LOG} VALUES ('{table}', '{op}', {row}.doc_id);"
+                    " END"
+                )
+
+
+def _drop_index_log(arena: Arena) -> list[tuple[str, str, str]]:
+    conn = arena.store.connection
+    with arena.store.locked():
+        rows = [
+            (str(r[0]), str(r[1]), str(r[2]))
+            for r in conn.execute(f"SELECT tbl, op, doc_id FROM {_INDEX_LOG}").fetchall()
+        ]
+        for table in _INDEX_TABLES:
+            for op in ("insert", "delete", "update"):
+                conn.execute(f"DROP TRIGGER temp.xt014_{table}_{op}")
+        conn.execute(f"DROP TABLE temp.{_INDEX_LOG}")
+    return rows
+
+
+@scenario("xt-014", XT, "One customer writing many notes leaves the other's index alone")
+def note_writes_leave_other_tenants_alone(arena: Arena) -> None:
+    kc = arena.start(KC_STAFF)
+    before = arena.call(kc, "docs.search", {"query": "dispatch procedure"})
+    arena.expect_executed(before, "KC search before the notes")
+    kc_ids = {doc.id for doc in arena.store.list_documents(KC)}
+
+    jr = arena.start(JR_STAFF)
+    _install_index_log(arena)
+    note_ids: set[str] = set()
+    written = 0
+    kc_served = 0
+    for number in range(1, NOTES + 1):
+        note: dict[str, JsonValue] = {
+            "title": f"Shelf restock {number}",
+            "body": "Restock the cold-chain shelf and log the count.",
+            "label": "internal",
+        }
+        outcome = arena.call(jr, "notes.write", note)
+        if isinstance(outcome, Executed):
+            written += 1
+            note_id = outcome.content.get("document_id")
+            if isinstance(note_id, str):
+                note_ids.add(note_id)
+        if number % NOTE_BATCH == 0:
+            # The other customer's calls keep being served between the writes.
+            read = arena.call(kc, "docs.read", {"document_id": "kc-service-menu"})
+            search = arena.call(kc, "docs.search", {"query": "dispatch procedure"})
+            if isinstance(read, Executed) and isinstance(search, Executed):
+                kc_served += 1
+    log = _drop_index_log(arena)
+
+    arena.expect("every JR note was written", written == NOTES, f"{written} of {NOTES}")
+    arena.expect(
+        "every KC call between the writes was served",
+        kc_served == NOTES // NOTE_BATCH,
+        f"{kc_served} of {NOTES // NOTE_BATCH} rounds",
+    )
+    touched = {doc_id for _, _, doc_id in log}
+    kc_touched = touched & kc_ids
+    arena.expect(
+        "no KC index row was written or deleted", not kc_touched, f"{len(kc_touched)} docs"
+    )
+    arena.expect(
+        "only the new notes' index rows were written",
+        bool(note_ids) and touched == note_ids,
+        f"{len(touched)} documents touched for {len(note_ids)} notes",
+    )
+    deletes = sum(1 for _, op, _ in log if op != "insert")
+    arena.expect("no index row was deleted or rewritten", deletes == 0, f"{deletes} rows")
+    lengths = sum(1 for table, _, _ in log if table == "retrieval_lengths")
+    arena.expect("one lengths row per note", lengths == NOTES, f"{lengths} rows")
+
+    after = arena.call(kc, "docs.search", {"query": "dispatch procedure"})
+    arena.expect(
+        "KC search ranks as before",
+        returned_ids(after) == returned_ids(before) and bool(returned_ids(before)),
+        f"{len(returned_ids(after))} results",
+    )
+    found = arena.call(jr, "docs.search", {"query": "shelf restock"})
+    hits = [doc_id for doc_id in returned_ids(found) if doc_id in note_ids]
+    arena.expect("the JR notes are searchable at once", bool(hits), f"{len(hits)} notes found")

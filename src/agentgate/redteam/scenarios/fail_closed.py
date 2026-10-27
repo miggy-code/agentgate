@@ -8,17 +8,21 @@ proposes the call directly. Where a scenario breaks something on purpose, it end
 control call showing the same request works once the fault is gone.
 """
 
+import hashlib
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from pathlib import Path
 from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
 from agentgate.agent.mock import ScriptedModel
 from agentgate.audit.base import EventKind
+from agentgate.audit.panoptes import PanoptesSink
 from agentgate.context import RunContext
 from agentgate.gate import Denied, IdentityError, Outcome, PendingApproval
-from agentgate.models import Action
+from agentgate.models import Action, UserStatus
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import Policy, PolicyBundle
 from agentgate.redteam.core import (
@@ -30,8 +34,16 @@ from agentgate.redteam.core import (
     scenario,
     transcript_calls,
 )
+from agentgate.redteam.files import FileWorlds
+from agentgate.spend import Reservation
+from agentgate.store import Store, table_names
 from agentgate.tools.base import ToolAdapter, ToolEnv, ToolFacts, ToolResult
 from agentgate.tools.builtin import default_tools
+from agentgate.world import (
+    DEFAULT_RESERVATION_LEASE,
+    World,
+    open_world,
+)
 
 KC = "kettle-creek-hvac"
 JR = "juniper-row-apothecary"
@@ -611,3 +623,231 @@ def deny_beats_allow_and_approval(arena: Arena) -> None:
     arena.expect_denied(outcome, "matched_deny", name="confidential run: deny beats approval")
     arena.expect_audit(EventKind.DENY, rule_id="no-external-after-confidential", run=manager)
     arena.expect_outbox_empty()
+
+
+# Running agentgate, not attacking it: a host killed between reserving and settling a call,
+# and a store pointed at the audit log or left readable. These open file worlds (FileWorlds)
+# that outlive a process, on the arena's clock.
+
+
+OWNER = "kc-owner-dale"
+
+STAFF = "kc-staff-nadine"
+
+SERVICE_MENU = "kc-service-menu"
+
+# The per-run cap in the shipped policy, and enough crashed runs to fill the 20.00 day cap.
+RUN_CAP = Decimal("0.50")
+
+CRASHES = 40
+
+LEASE = DEFAULT_RESERVATION_LEASE
+
+LEASE_MINUTES = int(LEASE.total_seconds() // 60)
+
+
+def _read(document_id: str) -> dict[str, JsonValue]:
+    return {"document_id": document_id}
+
+
+def _recount(store: Store, customer_id: str) -> Decimal:
+    """The customer's spend summed straight from the reservation rows, every day together."""
+    with store.locked():
+        rows = store.connection.execute(
+            "SELECT status, reserved_usd, actual_usd FROM spend_reservations"
+            " WHERE customer_id = ? AND status != 'released'",
+            (customer_id,),
+        ).fetchall()
+    return sum(
+        (Decimal(r["actual_usd"] if r["status"] == "settled" else r["reserved_usd"]) for r in rows),
+        Decimal(0),
+    )
+
+
+def _day_spent(world: World, customer_id: str = KC) -> Decimal:
+    customer = world.store.get_customer(customer_id)
+    assert customer is not None
+    return world.gate.ledger.customer_day_spent(
+        customer_id, world.gate.ledger.customer_day(customer)
+    )
+
+
+def _crash(gate_charge: Callable[[RunContext, Decimal], object], ctxs: list[RunContext]) -> int:
+    """Each run reserves a model call at the run cap; its host then dies before settling."""
+    reserved = 0
+    for ctx in ctxs:
+        if isinstance(gate_charge(ctx, RUN_CAP), Reservation):
+            reserved += 1
+    return reserved
+
+
+@scenario(
+    "fc-015",
+    FC,
+    "Leaked spend reservations of crashed runs are reclaimed after the lease",
+)
+def leaked_reservations_are_reclaimed(arena: Arena) -> None:
+    # Forty hosts each reserve a model call at the per-run cap and die before settling.
+    runs = [arena.start(STAFF) for _ in range(CRASHES)]
+    reservations = [arena.gate.charge_model(ctx, RUN_CAP) for ctx in runs]
+    leaked = [r for r in reservations if isinstance(r, Reservation)]
+    arena.expect("every crashed run reserved", len(leaked) == CRASHES, f"{len(leaked)} reserved")
+    owner = arena.start(OWNER)
+    arena.expect_cap(
+        arena.call(owner, "docs.read", _read(SERVICE_MENU)),
+        "customer_day_cap",
+        name="leaked reservations fill the customer day",
+    )
+
+    # Inside the lease a reservation may be a slow call still in flight: it is kept.
+    arena.advance(LEASE_MINUTES - 1)
+    early = arena.gate.ledger.release_stale(LEASE)
+    arena.expect("nothing reclaimed inside the lease", early == 0, f"{early} reclaimed")
+    arena.advance(2)
+    reclaimed = arena.gate.ledger.release_stale(LEASE)
+    arena.expect(
+        "the sweep reclaims every leaked reservation", reclaimed == CRASHES, f"{reclaimed}"
+    )
+    spent = _day_spent(arena.world)
+    arena.expect("the customer day is free again", spent == 0, f"day spent {spent}")
+    arena.expect_executed(
+        arena.call(owner, "docs.read", _read(SERVICE_MENU)), name="a fresh run's call executes"
+    )
+    fresh = arena.gate.charge_model(arena.start(OWNER), Decimal("0.10"))
+    arena.expect("a fresh model call is reserved", isinstance(fresh, Reservation), describe(fresh))
+
+    # A host that was only slow settles after the sweep: the money it spent still counts.
+    if leaked:
+        arena.gate.settle_model(runs[0], leaked[0], Decimal("0.40"))
+        arena.gate.ledger.release(leaked[1])
+    spent = _day_spent(arena.world)
+    recount = _recount(arena.store, KC)
+    arena.expect("a late settle is charged", spent >= Decimal("0.40"), f"day spent {spent}")
+    arena.expect("the day total matches a recount", spent == recount, f"{spent} vs {recount}")
+    calls = arena.gate.ledger.run_calls(runs[2].run_id)
+    arena.expect("a reclaimed call still counts toward its run", calls == 1, f"{calls} calls")
+
+    # The same crash on disk: the next host to open the store reclaims the leaks itself.
+    with FileWorlds(arena) as disk:
+        host = disk.open()
+        crashed = _crash(
+            host.gate.charge_model, [host.gate.start_run(KC, STAFF) for _ in range(CRASHES)]
+        )
+        arena.expect("every crashed host reserved", crashed == CRASHES, f"{crashed} reserved")
+        disk.close(host)
+        arena.advance(LEASE_MINUTES + 1)
+        reopened = disk.open()
+        arena.expect(
+            "reopening reclaims the leaks",
+            reopened.stale_released == CRASHES,
+            f"{reopened.stale_released} reclaimed",
+        )
+        spent = _day_spent(reopened)
+        arena.expect("the reopened day is free", spent == 0, f"day spent {spent}")
+        ctx = reopened.gate.start_run(KC, OWNER)
+        arena.expect_executed(
+            disk.call(reopened, ctx, "docs.read", _read(SERVICE_MENU)),
+            name="a run on the reopened store executes",
+        )
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
+
+
+def _refused_open(arena: Arena, name: str, attempt: Callable[[], World]) -> None:
+    try:
+        world = attempt()
+    except ValueError as exc:
+        got = f"refused {type(exc).__name__}"
+    else:
+        world.close()
+        got = "opened"
+    arena.expect(name, got.startswith("refused"), got)
+
+
+@scenario("fc-016", FC, "A store pointed at the audit log, or sharing its file, is refused")
+def store_pointed_at_the_audit_log(arena: Arena) -> None:
+    with FileWorlds(arena) as disk:
+        store_path = disk.path("agentgate.db")
+        audit_path = disk.path("audit.db")
+
+        def world_at(db: Path, audit: Path) -> World:
+            return open_world(
+                db_path=db,
+                audit_path=audit,
+                policies=disk.policies,
+                fixtures=disk.fixtures,
+                clock=arena.clock,
+            )
+
+        honest = world_at(store_path, audit_path)
+        honest.gate.start_run(KC, STAFF)
+        honest.close()
+        audit_before = _digest(audit_path)
+        store_before = _digest(store_path)
+
+        _refused_open(
+            arena, "--db at the audit log", lambda: world_at(audit_path, disk.path("x.db"))
+        )
+        arena.expect("the audit log is untouched", _digest(audit_path) == audit_before, "")
+        tables = table_names(audit_path) or set()
+        arena.expect("no store tables in the audit log", "customers" not in tables, "")
+
+        same = disk.path("same.db")
+        _refused_open(arena, "--db and --audit-db the same file", lambda: world_at(same, same))
+        arena.expect("nothing created for the shared path", not same.exists(), "")
+
+        _refused_open(
+            arena, "--audit-db at the store", lambda: world_at(disk.path("y.db"), store_path)
+        )
+        arena.expect("the store is untouched", _digest(store_path) == store_before, "")
+
+        sink = PanoptesSink(audit_path, create=False)
+        try:
+            valid = bool(sink.verify()["valid"])
+            count = sink.count()
+        finally:
+            sink.close()
+        arena.expect("the audit log still verifies", valid and count == 1, f"{count} events")
+
+        # A world on the same paths still opens, so the refusals were about the paths.
+        reopened = world_at(store_path, audit_path)
+        user = reopened.store.get_user(STAFF)
+        reopened.close()
+        arena.expect(
+            "the honest paths still open",
+            user is not None and user.status is UserStatus.ACTIVE,
+            "",
+        )
+
+
+@dataclass(frozen=True)
+class _Modes:
+    directory: int
+    store: int
+
+
+def _modes(directory: Path, store: Path) -> _Modes:
+    return _Modes(directory.stat().st_mode & 0o777, store.stat().st_mode & 0o777)
+
+
+@scenario("fc-017", FC, "The store file is owner-only, and a world-readable one is tightened")
+def store_file_is_owner_only(arena: Arena) -> None:
+    with FileWorlds(arena) as disk:
+        world = disk.open()
+        disk.close(world)
+        modes = _modes(disk.db.parent, disk.db)
+        arena.expect("the store file is 0600", modes.store & 0o077 == 0, f"{modes.store:04o}")
+        arena.expect(
+            "the directory made for it is 0700",
+            modes.directory & 0o077 == 0,
+            f"{modes.directory:04o}",
+        )
+        disk.db.chmod(0o644)
+        reopened = disk.open()
+        before = reopened.store.tightened_from
+        disk.close(reopened)
+        mode = disk.db.stat().st_mode & 0o777
+        arena.expect("a world-readable store is tightened on open", mode == 0o600, f"{mode:04o}")
+        arena.expect("the old mode is reported", before == 0o644, f"{before}")

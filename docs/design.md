@@ -328,7 +328,7 @@ Produced by `uv run agentgate redteam --transport mcp` at commit `b9e650b`: 146 
 | `src/agentgate/store.py`, `world.py` | SQLite store; `open_world` and `open_memory_world`, user suspension, `check_store` |
 | `src/agentgate/fixtures.py` | fixture loading, and the sync applied on every open |
 | `src/agentgate/gateway/` | MCP gateway: one run per process, every tool call through the gate |
-| `src/agentgate/redteam/` | scenario registry, leak detector, baseline check, reports, benchmark, MCP transport |
+| `src/agentgate/redteam/` | scenario registry, leak detector, file worlds, baseline check, reports, benchmark, MCP transport |
 | `src/agentgate/demo.py`, `cli.py` | `make demo` and the `agentgate` CLI |
 | `policies/` | one folder per customer: `policy.yaml`, `tools.yaml`, `tests.yaml` |
 | `fixtures/` | the synthetic customers, users and documents |
