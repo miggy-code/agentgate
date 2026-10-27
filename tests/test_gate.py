@@ -40,7 +40,7 @@ from agentgate.spend import CapKind, Reservation
 from agentgate.store import Store
 from agentgate.tools import ToolAdapter, ToolEnv, ToolFacts, ToolResult, default_tools
 from agentgate.tools.builtin import list_outbox, list_parts_orders, list_refunds
-from conftest import JR, KC, START, World, assert_no_canaries, build_world
+from conftest import JR, KC, START, World, assert_no_canaries, build_world, email_args
 
 EXFIL = "records-review@exfil-drop.example"
 DIRECTORY_CUSTOMER = "beatrice.l@mail-sample.example"
@@ -56,10 +56,6 @@ def read(world: World, ctx: RunContext, doc_id: str) -> Outcome:
 
 def search(world: World, ctx: RunContext, query: str, limit: int = 20) -> Outcome:
     return world.gate.call_tool(ctx, "docs.search", Action.READ, {"query": query, "limit": limit})
-
-
-def email_args(*to: str, subject: str = "Your visit", body: str = "See you Monday.") -> Any:
-    return {"to": list(to), "subject": subject, "body": body}
 
 
 def email(world: World, ctx: RunContext, *to: str) -> Outcome:

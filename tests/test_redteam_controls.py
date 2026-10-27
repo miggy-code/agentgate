@@ -1,151 +1,59 @@
 """The approval bypass, fail closed, audit integrity and benign red-team scenarios.
 
-Three kinds of test:
+Two kinds of test (that the scenarios pass is tested once, for the whole suite, in
+test_redteam_core.py):
 
-1. The scenarios of these four categories pass on the real gate, except the ones listed in
-   KNOWN_GATE_BUGS, which must fail until the gate is fixed.
-2. Mutation tests: each protection an attack scenario targets is removed, by editing the
+1. Mutation tests: each protection an attack scenario targets is removed, by editing the
    source of the one method that holds it (or replacing the method), and the scenarios that
    target it must then fail. A scenario that still passed with its protection removed would
    be testing nothing.
-3. Tightening tests, the same check the other way round for benign scenarios: the rule a
+2. Tightening tests, the same check the other way round for benign scenarios: the rule a
    legitimate task relies on is removed from a copy of the policy, and the scenario must
    then fail. A benign scenario that still passed would not show the gate letting work
    through.
 """
 
-import inspect
 import shutil
-import textwrap
 from collections import defaultdict
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-import agentgate.approvals as approvals_module
 import agentgate.audit.panoptes as panoptes_module
 import agentgate.gate as gate_module
 import agentgate.policy.engine as engine_module
 import agentgate.retrieval as retrieval_module
+import agentgate.store as store_module
+import agentgate.world as world_module
 from agentgate.approvals import ApprovalQueue
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.gate import CapReached, Denied, Gate
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import Effect
 from agentgate.redteam.core import (
-    CATEGORY_PREFIXES,
     Arena,
     Category,
-    ScenarioResult,
     all_scenarios,
     run_suite,
 )
-from conftest import FIXTURES, JR, KC, POLICIES
-
-MINE = (
-    Category.APPROVAL_BYPASS,
-    Category.FAIL_CLOSED,
-    Category.AUDIT_INTEGRITY,
-    Category.BENIGN,
+from agentgate.redteam.transport import Transport
+from agentgate.spend import SpendLedger
+from agentgate.store import PolicySnapshot, Store
+from conftest import (
+    FIXTURES,
+    JR,
+    KC,
+    POLICIES,
+    Mutation,
+    assert_breaks,
+    assert_every_attack_has_a_mutation,
+    run_mutated,
 )
-MODULES = ("approval_bypass", "fail_closed", "audit_integrity", "benign")
-# Em and en dash, which none of these files may contain.
-DASHES = frozenset({chr(0x2014), chr(0x2013)})
-SCENARIO_DIR = Path(__file__).resolve().parent.parent / "src/agentgate/redteam/scenarios"
 
-# Scenarios that assert correct behaviour the gate does not have yet. Each must fail on the
-# real gate; when one starts passing, the bug is fixed and it comes off this list.
-KNOWN_GATE_BUGS: dict[str, set[str]] = {}
-
-
-def run(ids: list[str], policies: Path = POLICIES) -> list[ScenarioResult]:
-    return list(run_suite(ids=ids, policies=policies, fixtures=FIXTURES).results)
-
-
-# 1. The scenarios pass
-
-
-def test_scenarios_pass_except_known_gate_bugs() -> None:
-    suite = run_suite(categories=MINE, policies=POLICIES, fixtures=FIXTURES)
-    by_id = {result.id: result for result in suite.results}
-    unexpected = [
-        (r.id, r.error, r.leaks, [c.name for c in r.checks if not c.passed])
-        for r in suite.results
-        if not r.passed and r.id not in KNOWN_GATE_BUGS
-    ]
-    assert unexpected == []
-    for scenario_id, failing in KNOWN_GATE_BUGS.items():
-        result = by_id[scenario_id]
-        assert not result.passed, f"{scenario_id} passes now: remove it from KNOWN_GATE_BUGS"
-        assert result.error is None
-        assert result.leaks == ()
-        assert {c.name for c in result.checks if not c.passed} == failing
-    assert all(result.checks for result in suite.results)
-
-
-def test_category_sizes() -> None:
-    counts: dict[Category, int] = defaultdict(int)
-    for s in all_scenarios():
-        counts[s.category] += 1
-    assert counts[Category.APPROVAL_BYPASS] >= 10
-    assert counts[Category.FAIL_CLOSED] >= 10
-    assert counts[Category.AUDIT_INTEGRITY] >= 10
-    assert counts[Category.BENIGN] >= 13
-
-
-def test_ids_titles_and_text() -> None:
-    mine = [s for s in all_scenarios() if s.module.rsplit(".", 1)[-1] in MODULES]
-    assert {s.module.rsplit(".", 1)[-1] for s in mine} == set(MODULES)
-    for s in mine:
-        assert s.id.startswith(CATEGORY_PREFIXES[s.category] + "-"), s.id
-        assert s.category in MINE
-        assert 10 <= len(s.title) <= 72, s.id
-        assert s.title == s.title.strip() and not s.title.endswith("."), s.id
-        assert s.title[0].isupper(), s.id
-    for name in MODULES:
-        text = (SCENARIO_DIR / f"{name}.py").read_text()
-        assert DASHES.isdisjoint(text), name
-    text = Path(__file__).read_text()
-    assert DASHES.isdisjoint(text)
-
-
-# 2. Mutation tests
-
-Edit = tuple[str, str]
-
-
-@dataclass(frozen=True)
-class Mutation:
-    name: str
-    # (owner, attribute, source edits): the attribute's source with each edit applied.
-    edits: tuple[tuple[Any, str, tuple[Edit, ...]], ...] = ()
-    # (owner, attribute, replacement): the attribute replaced outright.
-    replace: tuple[tuple[Any, str, Any], ...] = ()
-    names: dict[str, Any] = field(default_factory=dict)
-    # Every one of these must fail with the mutation in place.
-    breaks: tuple[str, ...] = ()
-
-
-def mutant(owner: Any, attribute: str, edits: tuple[Edit, ...], names: dict[str, Any]) -> Any:
-    """The attribute recompiled from its own source with each edit applied exactly once."""
-    original = inspect.getattr_static(owner, attribute)
-    source = textwrap.dedent(inspect.getsource(original))
-    for old, new in edits:
-        assert source.count(old) == 1, f"{attribute}: edit target found {source.count(old)} times"
-        source = source.replace(old, new)
-    namespace = {**original.__globals__, **names}
-    exec(compile(source, f"<mutant {attribute}>", "exec"), namespace)
-    return namespace[attribute]
-
-
-@pytest.fixture(scope="module")
-def shipped_engines() -> Iterator[dict[str, PolicyEngine]]:
-    with Arena(policies=POLICIES, fixtures=FIXTURES) as arena:
-        yield dict(arena.engines)
+# 1. Mutation tests
 
 
 def execute_ignoring_approval(
@@ -199,7 +107,9 @@ def approve_then_record(
     return decided
 
 
-def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
+def _code_mutations() -> list[Mutation]:
+    with Arena(policies=POLICIES, fixtures=FIXTURES) as arena:
+        fallback = dict(arena.engines)
     tools = {tool_id: t for e in fallback.values() for tool_id, t in e.bundle.tools.items()}
     claim = (ApprovalQueue, "_claim")
     status_off = ("if approval.status is not ApprovalStatus.APPROVED:", "if False:")
@@ -277,6 +187,7 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
             ),
             replace=((ApprovalQueue, "expire_due", lambda self: []),),
             breaks=("ab-011", "ab-012"),
+            crashes=True,
         ),
         Mutation(
             "requester may approve",
@@ -401,6 +312,7 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
                 ),
             ),
             breaks=("fc-004", "fc-005"),
+            crashes=True,
         ),
         Mutation(
             "missing policy falls back to the shipped one",
@@ -464,6 +376,7 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
                 ),
             ),
             breaks=("fc-009",),
+            crashes=True,
         ),
         Mutation(
             "search returns results its retrieval event could not record",
@@ -580,6 +493,7 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
                 (ApprovalQueue, "approve", approve_then_record),
             ),
             breaks=("ai-012",),
+            crashes=True,
         ),
         Mutation(
             "verification always passes",
@@ -626,49 +540,237 @@ def mutations(fallback: dict[str, PolicyEngine]) -> list[Mutation]:
     ]
 
 
-def apply(monkeypatch: pytest.MonkeyPatch, mutation: Mutation) -> None:
-    for owner, attribute, edits in mutation.edits:
-        monkeypatch.setattr(owner, attribute, mutant(owner, attribute, edits, mutation.names))
-    for owner, attribute, replacement in mutation.replace:
-        monkeypatch.setattr(owner, attribute, replacement)
+# Caller-chosen values in the durable log (ai-013, ai-014), checked over both transports.
+REFERENCE_MUTATIONS = [
+    Mutation(
+        "the gate attaches no references",
+        ("ai-013", "ai-014"),
+        edits=(
+            (
+                Gate,
+                "_emit",
+                (
+                    (
+                        "references=self._references(call, subject, unknown_subject),",
+                        "references={},",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    Mutation(
+        "the Panoptes sink stores caller values as given",
+        ("ai-013", "ai-014"),
+        edits=(
+            (
+                panoptes_module,
+                "to_panoptes_event",
+                (("event = event.recorded()", "event = event"),),
+            ),
+        ),
+    ),
+    Mutation(
+        "a missing document id is treated as a known one",
+        ("ai-013", "ai-014"),
+        edits=((Gate, "_prepare", (("unknown_subject=facts.document_id,", ""),)),),
+    ),
+    Mutation(
+        "a missing approval id is treated as a known one",
+        ("ai-013",),
+        edits=((Gate, "execute_approved", (("unknown_subject=_text(approval_id),", ""),)),),
+    ),
+    Mutation(
+        "an unknown approver is treated as a known one",
+        ("ai-014",),
+        edits=(
+            (
+                Gate,
+                "_decide_approval",
+                (('claimed=frozenset({"user_id"})', "claimed=frozenset()"),),
+            ),
+        ),
+    ),
+    Mutation(
+        "an unknown user at run start is treated as a known one",
+        ("ai-014",),
+        edits=(
+            (
+                Gate,
+                "start_run",
+                (('claimed=frozenset({"customer_id", "user_id"}),', "claimed=frozenset(),"),),
+            ),
+        ),
+    ),
+]
 
 
-MUTATION_NAMES = [m.name for m in mutations({})]
+# Reconstructing an incident from the log (ai-020 to ai-024).
+def _nothing(*args: object, **kwargs: object) -> None:
+    return None
 
 
-@pytest.mark.parametrize("name", MUTATION_NAMES)
-def test_removing_a_protection_fails_its_scenarios(
-    name: str, monkeypatch: pytest.MonkeyPatch, shipped_engines: dict[str, PolicyEngine]
+def _unsaved(self: Store, snapshot: PolicySnapshot) -> tuple[PolicySnapshot, bool]:
+    # Says it stored the snapshot, stores nothing.
+    return snapshot, True
+
+
+def _no_problems(*args: object, **kwargs: object) -> list[object]:
+    return []
+
+
+def _no_values(*args: object, **kwargs: object) -> dict[str, object]:
+    return {}
+
+
+RECONSTRUCT_MUTATIONS = [
+    Mutation(
+        "the approval request carries no approval hash",
+        ("ai-020",),
+        edits=((Gate, "call_tool", (('"approval_args_hash": created.args_hash,', ""),)),),
+    ),
+    Mutation(
+        "check-store skips approval rows",
+        ("ai-020",),
+        replace=((world_module, "_approval_problems", _no_problems),),
+    ),
+    Mutation(
+        "executed events name no side-effect row",
+        ("ai-021", "ai-024"),
+        edits=((Gate, "_finish", (("if result.effect_ref is not None:", "if False:"),)),),
+    ),
+    Mutation(
+        "check-store skips side-effect rows",
+        ("ai-021",),
+        replace=((world_module, "_effect_problems", _no_problems),),
+    ),
+    Mutation(
+        "policy snapshots are not stored",
+        ("ai-022",),
+        replace=((Store, "save_policy_snapshot", _unsaved),),
+    ),
+    Mutation(
+        "policy loads are not recorded",
+        ("ai-022",),
+        replace=((Gate, "record_policy_loaded", _nothing),),
+    ),
+    Mutation(
+        "operator actions are not recorded",
+        ("ai-023",),
+        replace=((Gate, "record_operator_action", _nothing),),
+    ),
+    Mutation(
+        "the stale sweep records nothing",
+        ("ai-023",),
+        edits=((Gate, "release_stale", (("if not record:", "if True:"),)),),
+    ),
+    Mutation(
+        "the fixture sync records nothing",
+        ("ai-023",),
+        replace=((world_module, "record_fixture_sync", _nothing),),
+    ),
+    Mutation(
+        "decision events carry no values",
+        ("ai-020", "ai-021", "ai-024"),
+        replace=((Gate, "_call_values", _no_values),),
+    ),
+    Mutation(
+        "allow events drop the call's values",
+        ("ai-024",),
+        edits=(
+            (
+                Gate,
+                "_record_allow",
+                (("details = {**prepared.values, **(details or {})}", "details = details or {}"),),
+            ),
+        ),
+    ),
+]
+
+
+# Running agentgate rather than attacking it (fc-015 to fc-017).
+def _no_sweep(self: SpendLedger, older_than: object) -> int:
+    return 0
+
+
+def _no_late_settle(self: SpendLedger, *args: object) -> None:
+    return None
+
+
+def _no_prepare(path: object) -> None:
+    return None
+
+
+OPERATIONS_MUTATIONS = [
+    Mutation("no stale sweep", ("fc-015",), replace=((SpendLedger, "release_stale", _no_sweep),)),
+    Mutation(
+        "late settle dropped",
+        ("fc-015",),
+        replace=((SpendLedger, "_finish_reclaimed", _no_late_settle),),
+    ),
+    Mutation(
+        "audit log accepted as a store",
+        ("fc-016",),
+        replace=((store_module, "_refuse_audit_database", _nothing),),
+    ),
+    Mutation(
+        "paths not checked",
+        ("fc-016",),
+        replace=((world_module, "check_paths", _nothing),),
+        crashes=True,
+    ),
+    Mutation(
+        "store file left to sqlite",
+        ("fc-017",),
+        replace=((store_module, "_prepare_file", _no_prepare),),
+    ),
+]
+
+MUTATIONS = [
+    *_code_mutations(),
+    *REFERENCE_MUTATIONS,
+    *RECONSTRUCT_MUTATIONS,
+    *OPERATIONS_MUTATIONS,
+]
+
+
+# A loose umask, so fc-017 shows the store file being tightened rather than created private.
+@pytest.mark.usefixtures("loose_umask")
+@pytest.mark.parametrize("mutation", MUTATIONS, ids=lambda m: m.name)
+def test_mutation_fails_its_scenarios(mutation: Mutation, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert_breaks(mutation, monkeypatch)
+
+
+@pytest.mark.parametrize("mutation", REFERENCE_MUTATIONS, ids=lambda m: m.name)
+def test_reference_mutations_fail_over_mcp_too(
+    mutation: Mutation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mutation = next(m for m in mutations(shipped_engines) if m.name == name)
-    apply(monkeypatch, mutation)
-    results = run(list(mutation.breaks))
-    still_passing = [r.id for r in results if r.passed]
-    assert still_passing == [], f"{name}: these scenarios passed without their protection"
+    assert_breaks(mutation, monkeypatch, Transport.MCP)
 
 
-def test_every_attack_scenario_has_an_automated_mutation() -> None:
-    covered = {scenario_id for m in mutations({}) for scenario_id in m.breaks}
-    # Scenarios in other modules (the hardening_* ones) carry their mutations in their own
-    # test files; this file covers its own modules.
-    attacks = {
-        s.id
-        for s in all_scenarios()
-        if s.module.rsplit(".", 1)[-1] in MODULES
-        and s.category is not Category.BENIGN
-        and s.id not in KNOWN_GATE_BUGS
-    }
-    assert attacks - covered == set()
+def test_a_reconstruct_mutation_fails_over_mcp_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    unreferenced = next(
+        m for m in RECONSTRUCT_MUTATIONS if m.name == "executed events name no side-effect row"
+    )
+    [result] = run_mutated(unreferenced, monkeypatch, Transport.MCP, ids=["ai-021"]).results
+    assert not result.passed
+    assert "a raised order is caught" in [c.name for c in result.checks if not c.passed]
 
 
-def test_mutations_leave_the_real_gate_alone() -> None:
-    # The edits only ever patch through monkeypatch, so the shipped code still passes.
-    results = run(["ab-002", "fc-012", "ai-008"])
-    assert all(r.passed for r in results)
-    assert approvals_module.ApprovalQueue._claim.__module__ == "agentgate.approvals"
+def test_every_attack_has_a_mutation() -> None:
+    assert_every_attack_has_a_mutation(
+        MUTATIONS, Category.APPROVAL_BYPASS, Category.FAIL_CLOSED, Category.AUDIT_INTEGRITY
+    )
 
 
-# 3. Policy edits: removing a rule a scenario relies on must fail it
+@pytest.mark.usefixtures("loose_umask")
+@pytest.mark.parametrize("transport", list(Transport))
+def test_file_world_scenarios_pass_under_a_loose_umask(transport: Transport) -> None:
+    ids = ["fc-015", "fc-016", "fc-017", "id-015", "id-016"]
+    suite = run_suite(ids=ids, policies=POLICIES, fixtures=FIXTURES, transport=transport)
+    assert [r.id for r in suite.failed] == []
+
+
+# 2. Policy edits: removing a rule a scenario relies on must fail it
 
 
 def edited_policies(tmp_path: Path, customer: str, edit: Callable[[dict[str, Any]], None]) -> Path:
@@ -757,7 +859,7 @@ def test_policy_edits_fail_the_scenarios_that_rely_on_them(
     edit: Callable[[dict[str, Any]], None],
 ) -> None:
     policies = edited_policies(tmp_path, customer, edit)
-    (result,) = run([scenario_id], policies=policies)
+    (result,) = run_suite(ids=[scenario_id], policies=policies, fixtures=FIXTURES).results
     assert not result.passed, f"{scenario_id} still passes with {change}"
     assert result.error is None
 

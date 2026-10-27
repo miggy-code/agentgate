@@ -59,11 +59,6 @@ def clock() -> FixedClock:
 
 
 @pytest.fixture
-def store() -> Store:
-    return Store()
-
-
-@pytest.fixture
 def queue(store: Store, clock: FixedClock) -> ApprovalQueue:
     return ApprovalQueue(store, clock)
 

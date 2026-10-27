@@ -19,8 +19,7 @@ from agentgate.context import RunContext
 from agentgate.gate import Denied, Executed, PendingApproval
 from agentgate.models import Action
 from agentgate.tools.builtin import list_outbox
-from agentgate.world import World, open_world
-from conftest import FIXTURES, KC, POLICIES, plain_text
+from conftest import FIXTURES, KC, POLICIES, open_file_world, plain_text
 
 runner = CliRunner()
 
@@ -44,19 +43,9 @@ class Queued:
         return self.approval.id
 
 
-def _open(tmp: Path, clock: Clock | None = None) -> World:
-    return open_world(
-        db_path=tmp / "data" / "agentgate.db",
-        audit_path=tmp / "data" / "audit.db",
-        policies=POLICIES,
-        fixtures=FIXTURES,
-        clock=clock,
-    )
-
-
 def _queue(tmp: Path, requester: str = "kc-staff-nadine", clock: Clock | None = None) -> Queued:
     """A world session in which requester's run asks to email a directory customer."""
-    with _open(tmp, clock) as world:
+    with open_file_world(tmp, clock) as world:
         ctx = world.gate.start_run(KC, requester)
         outcome = world.gate.call_tool(ctx, "email.send", Action.SEND, ARGS)
         assert isinstance(outcome, PendingApproval), outcome
@@ -237,7 +226,7 @@ def test_approve_then_execute_in_a_reopened_world(queued: Queued) -> None:
     again = _cli(queued.tmp, "approve", queued.id, "--as", "kc-mgr-terrence")
     assert _error(again).startswith("error: not_pending: ")
 
-    with _open(queued.tmp) as world:
+    with open_file_world(queued.tmp) as world:
         outcome = world.gate.execute_approved(
             queued.ctx, queued.id, "email.send", Action.SEND, ARGS
         )
@@ -264,7 +253,7 @@ def test_reject_means_it_never_runs(queued: Queued) -> None:
     later = _cli(queued.tmp, "approve", queued.id, "--as", "kc-mgr-marisol")
     assert _error(later) == f"error: not_pending: approval {queued.id!r} is already rejected\n"
 
-    with _open(queued.tmp) as world:
+    with open_file_world(queued.tmp) as world:
         outcome = world.gate.execute_approved(
             queued.ctx, queued.id, "email.send", Action.SEND, ARGS
         )
@@ -296,7 +285,7 @@ def test_expire_marks_stale_approvals(tmp_path: Path) -> None:
     late = _cli(tmp_path, "approve", stale.id, "--as", "kc-mgr-marisol")
     assert _error(late) == f"error: expired: approval {stale.id!r} has expired\n"
 
-    with _open(tmp_path) as world:
+    with open_file_world(tmp_path) as world:
         approval = world.gate.approvals.get(stale.id)
         assert approval is not None and approval.status is ApprovalStatus.EXPIRED
 
@@ -330,7 +319,7 @@ def test_list_and_show_compute_expiry_without_writing(tmp_path: Path) -> None:
 
     # Nothing was marked or recorded: the sweep is still the owner's expire command.
     assert _audit_count(tmp_path) == events
-    with _open(tmp_path) as world:
+    with open_file_world(tmp_path) as world:
         approval = world.gate.approvals.get(stale.id)
         assert approval is not None and approval.status is ApprovalStatus.PENDING
     assert _cli(tmp_path, "expire", "--as", "kc-owner-dale").stdout == "expired 1 approvals\n"

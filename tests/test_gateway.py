@@ -29,17 +29,13 @@ from agentgate.gateway import EXECUTE_TOOL, build_gateway, gateway_tools, mcp_na
 from agentgate.spend import CapKind
 from agentgate.tools.builtin import default_tools, list_outbox
 from agentgate.world import World, open_memory_world
-from conftest import FIXTURES, JR, KC, POLICIES, START, assert_no_canaries
+from conftest import FIXTURES, JR, KC, POLICIES, START, assert_no_canaries, email_args
 
 EXFIL = "records-review@exfil-drop.example"
 DIRECTORY_CUSTOMER = "beatrice.l@mail-sample.example"
 OTHER_DIRECTORY_CUSTOMER = "ruben.c@mail-sample.example"
 KC_NAMES = {"docs_search", "docs_read", "notes_write", "email_send", "parts_order", EXECUTE_TOOL}
 JR_NAMES = {"docs_search", "docs_read", "notes_write", "email_send", "refund_issue", EXECUTE_TOOL}
-
-
-def email_args(*to: str, subject: str = "Your visit", body: str = "See you Monday.") -> Any:
-    return {"to": list(to), "subject": subject, "body": body}
 
 
 def _world(sink: MemorySink | None = None) -> World:

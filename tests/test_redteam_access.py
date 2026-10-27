@@ -1,95 +1,36 @@
-"""The access red-team scenarios (cross_tenant, privilege_escalation, identity_spoofing):
-they all pass against the real gate, their ids and titles are well formed, and none is
-vacuous. For every scenario, a mutation removes the one protection it targets and the
-scenario must then fail on its own checks or the leak detector, without raising.
+"""Mutation tests for the access scenarios (cross_tenant, privilege_escalation,
+identity_spoofing): for each one, removing the protection it targets must make it fail.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
 import pytest
 from pydantic import ConfigDict
 
+import agentgate.world as world_module
 from agentgate.approvals import ApprovalQueue
 from agentgate.context import RunContext
+from agentgate.fixtures import FixtureSync
 from agentgate.gate import Gate, _Run
 from agentgate.models import Action, Document, Role, User, UserStatus
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Conditions, Effect, LabelBound, PolicyBundle, Rule
-from agentgate.redteam import core
 from agentgate.redteam.core import (
     REDTEAM_START,
     Category,
-    RegisteredScenario,
-    ScenarioResult,
-    all_scenarios,
-    run_scenario,
-    run_suite,
 )
-from agentgate.redteam.scenarios import cross_tenant, identity_spoofing, privilege_escalation
-from agentgate.retrieval import _Filter, _read_request
+from agentgate.redteam.transport import Transport
+from agentgate.retrieval import DocumentIndex, _Filter, _read_request
+from agentgate.store import Store
 from agentgate.world import World
-from conftest import FIXTURES, KC, POLICIES
+from conftest import KC, Mutation, assert_breaks, assert_every_attack_has_a_mutation
 
-MODULES = {
-    cross_tenant.__name__: Category.CROSS_TENANT,
-    privilege_escalation.__name__: Category.PRIVILEGE_ESCALATION,
-    identity_spoofing.__name__: Category.IDENTITY_SPOOFING,
-}
-CATEGORIES = list(MODULES.values())
-
-Mutation = Callable[[World, pytest.MonkeyPatch], None]
-
-
-def ours() -> list[RegisteredScenario]:
-    return [s for s in all_scenarios() if s.module in MODULES]
-
-
-def run(s: RegisteredScenario) -> ScenarioResult:
-    return run_scenario(s, policies=POLICIES, fixtures=FIXTURES)
-
-
-# The suite
-
-
-def test_access_scenarios_all_pass() -> None:
-    suite = run_suite(categories=CATEGORIES, policies=POLICIES, fixtures=FIXTURES)
-    failed = [
-        (r.id, r.error, r.leaks, [c.name for c in r.checks if not c.passed]) for r in suite.failed
-    ]
-    assert failed == []
-    ids = {r.id for r in suite.results}
-    assert {s.id for s in ours()} <= ids
-    for category in CATEGORIES:
-        passed, total = suite.totals[category]
-        assert passed == total
-    for result in suite.results:
-        assert result.checks and result.leaks == () and result.error is None
-
-
-def test_ids_titles_and_categories() -> None:
-    scenarios = ours()
-    by_module: dict[str, list[RegisteredScenario]] = {}
-    for s in scenarios:
-        by_module.setdefault(s.module, []).append(s)
-    assert set(by_module) == set(MODULES)
-    for module, found in by_module.items():
-        category = MODULES[module]
-        assert 10 <= len(found) <= 15, module
-        for s in found:
-            assert s.category is category
-            assert s.id.startswith(category.prefix + "-")
-            assert s.id != "pe-000"
-            assert s.title.strip() == s.title and s.title
-            assert "\u2014" not in s.title
-            assert "\u2013" not in s.title
-    numbers = sorted(int(s.id[3:]) for s in by_module[cross_tenant.__name__])
-    assert numbers == list(range(1, len(numbers) + 1))
-    numbers = sorted(int(s.id[3:]) for s in by_module[privilege_escalation.__name__])
-    assert numbers == list(range(1, len(numbers) + 1))
-    numbers = sorted(int(s.id[3:]) for s in by_module[identity_spoofing.__name__])
-    assert numbers == list(range(1, len(numbers) + 1))
+CATEGORIES = (Category.CROSS_TENANT, Category.PRIVILEGE_ESCALATION, Category.IDENTITY_SPOOFING)
+# A protection removed from the arena's world as it opens. The leak detector's reference
+# engines are built afterwards from the shipped bundles, so they keep it.
+WorldMutation = Callable[[World, pytest.MonkeyPatch], None]
 
 
 # Mutations: each removes one protection from the arena's gate (never from the leak
@@ -463,7 +404,7 @@ def start_run_customer_blind(world: World, mp: pytest.MonkeyPatch) -> None:
     mp.setattr(gate, "start_run", start_run)
 
 
-MUTATIONS: dict[str, tuple[Mutation, ...]] = {
+PROTECTIONS: dict[str, tuple[WorldMutation, ...]] = {
     "xt-001": (tenant_blind_documents,),
     "xt-002": (tenant_blind_documents,),
     "xt-003": (tenant_blind_documents,),
@@ -506,39 +447,77 @@ MUTATIONS: dict[str, tuple[Mutation, ...]] = {
     "id-013": (any_role_approves,),
     "id-014": (trust_context,),
 }
-CASES = [(sid, m) for sid, mutations in MUTATIONS.items() for m in mutations]
 
 
-@pytest.fixture
-def mutate(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[Mutation], None]]:
-    real_open = core.open_memory_world
-
-    def install(mutation: Mutation) -> None:
-        def mutated_world(**kwargs: Any) -> World:
-            world = real_open(**kwargs)
-            mutation(world, monkeypatch)
-            return world
-
-        monkeypatch.setattr(core, "open_memory_world", mutated_world)
-
-    yield install
+# Changes made outside the run (id-015, id-016) and note writes (xt-014).
 
 
-def test_every_access_scenario_has_a_mutation() -> None:
-    assert sorted(MUTATIONS) == sorted(s.id for s in ours())
+def _flag_only(self: Store, user_id: str) -> User | None:
+    # Records the operator flag but leaves the user active.
+    with self.locked():
+        self.connection.execute(
+            "UPDATE users SET suspended_by_operator = 1 WHERE id = ?", (user_id,)
+        )
+    return self.get_user(user_id)
 
 
-@pytest.mark.parametrize(
-    ("scenario_id", "mutation"), CASES, ids=[f"{sid}-{m.__name__}" for sid, m in CASES]
-)
-def test_scenario_fails_without_its_protection(
-    scenario_id: str, mutation: Mutation, mutate: Callable[[Mutation], None]
-) -> None:
-    target = next(s for s in all_scenarios() if s.id == scenario_id)
-    assert run(target).passed
-    mutate(mutation)
-    result = run(target)
-    assert not result.passed
-    # A real failure: a check or the leak detector caught the attack, nothing crashed.
-    assert result.error is None
-    assert result.leaks or any(not check.passed for check in result.checks)
+def _never_flagged(self: Store, user_id: str) -> bool:
+    return False
+
+
+def _no_sync(store: Store, root: object) -> FixtureSync:
+    return FixtureSync()
+
+
+def _rebuild_per_note(self: DocumentIndex, document: Document) -> None:
+    # notes.write rebuilt the whole index for every note, as it used to.
+    self.rebuild()
+
+
+def _by_protection() -> list[Mutation]:
+    breaks: dict[WorldMutation, list[str]] = {}
+    for scenario_id, protections in PROTECTIONS.items():
+        for protection in protections:
+            breaks.setdefault(protection, []).append(scenario_id)
+    return [Mutation(fn.__name__, tuple(ids), world=fn) for fn, ids in breaks.items()]
+
+
+MUTATIONS = [
+    *_by_protection(),
+    Mutation(
+        "suspension leaves the user active",
+        ("id-015",),
+        replace=((Store, "suspend_user", _flag_only),),
+        must_fail="docs.read after suspension",
+    ),
+    Mutation(
+        "sync ignores the operator flag",
+        ("id-015",),
+        replace=((Store, "operator_suspended", _never_flagged),),
+    ),
+    Mutation(
+        "no fixture sync on reopen",
+        ("id-016",),
+        replace=((world_module, "sync_fixtures", _no_sync),),
+    ),
+    Mutation(
+        "a note write rebuilds the whole index",
+        ("xt-014",),
+        replace=((DocumentIndex, "add", _rebuild_per_note),),
+        must_fail="no KC index row was written or deleted",
+    ),
+]
+
+
+@pytest.mark.parametrize("mutation", MUTATIONS, ids=lambda m: m.name)
+def test_mutation_fails_its_scenarios(mutation: Mutation, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert_breaks(mutation, monkeypatch)
+
+
+def test_a_suspension_mutation_fails_over_mcp_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    suspension = next(m for m in MUTATIONS if m.name == "suspension leaves the user active")
+    assert_breaks(suspension, monkeypatch, Transport.MCP)
+
+
+def test_every_attack_has_a_mutation() -> None:
+    assert_every_attack_has_a_mutation(MUTATIONS, *CATEGORIES)

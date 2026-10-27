@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from agentgate.approvals import ApprovalStatus
-from agentgate.audit.base import AuditSink, EventKind, MemorySink
+from agentgate.audit.base import EventKind, MemorySink
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import Clock, FixedClock, SystemClock
 from agentgate.fixtures import FixtureError, load_fixtures
@@ -31,21 +31,10 @@ from agentgate.world import (
     reinstate_user,
     suspend_user,
 )
-from conftest import FIXTURES, JR, KC, POLICIES, START
+from conftest import FIXTURES, JR, KC, POLICIES, START, open_file_world
 
 DIRECTORY_CUSTOMER = "beatrice.l@mail-sample.example"
 EMAIL = {"to": [DIRECTORY_CUSTOMER], "subject": "Your visit", "body": "See you Monday."}
-
-
-def _open(tmp_path: Path, clock: Clock | None = None, sink: AuditSink | None = None) -> World:
-    return open_world(
-        db_path=tmp_path / "data" / "agentgate.db",
-        audit_path=tmp_path / "data" / "audit.db",
-        policies=POLICIES,
-        fixtures=FIXTURES,
-        clock=clock,
-        sink=sink,
-    )
 
 
 def _count(store: Store, table: str) -> int:
@@ -62,7 +51,7 @@ def _fixture_counts() -> tuple[int, int]:
 
 def test_first_open_loads_fixtures_and_indexes(tmp_path: Path) -> None:
     users, documents = _fixture_counts()
-    with _open(tmp_path) as world:
+    with open_file_world(tmp_path) as world:
         assert [c.id for c in world.store.list_customers()] == [JR, KC]
         assert _count(world.store, "users") == users
         assert _count(world.store, "documents") == documents
@@ -76,12 +65,12 @@ def test_first_open_loads_fixtures_and_indexes(tmp_path: Path) -> None:
 
 def test_reopen_keeps_rows_and_approvals_without_duplicates(tmp_path: Path) -> None:
     users, documents = _fixture_counts()
-    with _open(tmp_path, clock=FixedClock(START)) as world:
+    with open_file_world(tmp_path, clock=FixedClock(START)) as world:
         ctx = world.gate.start_run(KC, "kc-staff-nadine")
         outcome = world.gate.call_tool(ctx, "email.send", Action.SEND, EMAIL)
         assert isinstance(outcome, PendingApproval)
 
-    with _open(tmp_path, clock=FixedClock(START)) as world:
+    with open_file_world(tmp_path, clock=FixedClock(START)) as world:
         assert _count(world.store, "users") == users
         assert _count(world.store, "documents") == documents
         assert _count(world.store, "customers") == 2
@@ -99,17 +88,17 @@ def test_reopen_keeps_rows_and_approvals_without_duplicates(tmp_path: Path) -> N
 
 
 def test_reopen_rebuilds_an_empty_index(tmp_path: Path) -> None:
-    _open(tmp_path).close()
+    open_file_world(tmp_path).close()
     with Store(tmp_path / "data" / "agentgate.db") as store, store.transaction():
         store.connection.execute("DELETE FROM retrieval_lengths")
         store.connection.execute("DELETE FROM retrieval_postings")
-    with _open(tmp_path) as world:
+    with open_file_world(tmp_path) as world:
         assert _count(world.store, "retrieval_lengths") == _count(world.store, "documents")
 
 
 def test_given_sink_is_used_and_left_open(tmp_path: Path) -> None:
     sink = MemorySink()
-    with _open(tmp_path, sink=sink) as world:
+    with open_file_world(tmp_path, sink=sink) as world:
         world.gate.start_run(KC, "kc-staff-nadine")
         assert world.sink is sink
         assert not world.owns_sink
@@ -373,7 +362,7 @@ def test_store_and_audit_log_must_be_different_files(tmp_path: Path) -> None:
         open_world(db_path=same, audit_path=same, policies=POLICIES, fixtures=FIXTURES)
     assert not same.exists() and not same.parent.exists()
     # The same file by another spelling.
-    _open(tmp_path).close()
+    open_file_world(tmp_path).close()
     link = tmp_path / "link.db"
     link.symlink_to(tmp_path / "data" / "agentgate.db")
     with pytest.raises(WorldError, match="must be different files"):
@@ -386,7 +375,7 @@ def test_store_and_audit_log_must_be_different_files(tmp_path: Path) -> None:
 
 
 def test_a_store_path_holding_the_audit_log_is_refused(tmp_path: Path) -> None:
-    _open(tmp_path).close()
+    open_file_world(tmp_path).close()
     audit = tmp_path / "data" / "audit.db"
     before = audit.read_bytes()
     with pytest.raises(StoreError, match="is a Panoptes audit database"):
@@ -398,7 +387,7 @@ def test_a_store_path_holding_the_audit_log_is_refused(tmp_path: Path) -> None:
 
 
 def test_an_audit_path_holding_the_store_is_refused(tmp_path: Path) -> None:
-    _open(tmp_path).close()
+    open_file_world(tmp_path).close()
     store = tmp_path / "data" / "agentgate.db"
     tables = table_names(store)
     with pytest.raises(WorldError, match="is an agentgate store, not a Panoptes audit database"):

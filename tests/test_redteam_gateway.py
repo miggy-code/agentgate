@@ -51,11 +51,6 @@ SERVICE_MENU = "kc-service-menu"
 PAYROLL = "kc-payroll-summary"
 CUSTOMER = "beatrice.l@mail-sample.example"
 
-# Failures under mcp that are real gateway findings, pinned with the checks that fail, so a
-# fix (or a new failure) shows up here. None at present. ab-001 was one until the gateway
-# stopped refusing approvals_execute wrappers on its own, unaudited (an empty approval id
-# was invalid_args with no audit event, where the gate says not_found and records it).
-KNOWN_MCP_FAILURES: dict[str, tuple[str, ...]] = {}
 # Reasons a scenario may make no call over MCP at all although it makes agent-side calls:
 # every one of them is a call MCP cannot express.
 INEXPRESSIBLE = {Direct.FORGED_CONTEXT.value, Direct.ACTION_OVERRIDE.value}
@@ -83,18 +78,24 @@ def arena() -> Iterator[Arena]:
 # The whole suite over MCP
 
 
-def test_the_suite_passes_over_mcp_except_the_pinned_gateway_findings(
-    mcp_suite: SuiteResult,
-) -> None:
+def test_the_suite_passes_over_mcp(mcp_suite: SuiteResult) -> None:
     assert mcp_suite.transport is MCP
     assert mcp_suite.total == len(core.all_scenarios())
-    failing = {
-        r.id: tuple(c.name for c in r.checks if not c.passed)
-        for r in mcp_suite.failed
-        if r.error is None and not r.leaks
-    }
-    assert [r.id for r in mcp_suite.failed] == sorted(failing), "errors or leaks under mcp"
-    assert failing == KNOWN_MCP_FAILURES
+    assert failed(mcp_suite) == []
+
+
+def test_file_world_calls_go_over_mcp() -> None:
+    # Scenarios that open file worlds send their agent-side calls through a gateway built for
+    # each file world, and count them as the arena's own.
+    over_mcp = ["fc-015", "id-015", "id-016"]
+    by_mcp = {r.id: r for r in suite(MCP, ids=over_mcp).results}
+    in_process = {r.id: r for r in suite(GATE, ids=over_mcp).results}
+    for scenario_id in over_mcp:
+        result = by_mcp[scenario_id]
+        assert result.mcp_calls > 0, scenario_id
+        assert result.direct_calls == 0, (scenario_id, result.direct_by_reason)
+        assert in_process[scenario_id].mcp_calls == 0
+        assert in_process[scenario_id].direct_calls == result.mcp_calls
 
 
 def test_made_up_approval_ids_are_audited_over_mcp(mcp_suite: SuiteResult) -> None:

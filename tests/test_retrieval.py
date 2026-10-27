@@ -6,7 +6,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -24,6 +23,7 @@ from agentgate.retrieval import (
     sanitize_query,
 )
 from agentgate.store import Store
+from conftest import index_rows
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "fixtures"
@@ -607,13 +607,6 @@ def _random_documents(seed: int, count: int) -> list[Document]:
     return documents
 
 
-def _index_rows(store: Store) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
-    conn = store.connection
-    postings = conn.execute("SELECT * FROM retrieval_postings ORDER BY term, doc_id").fetchall()
-    lengths = conn.execute("SELECT * FROM retrieval_lengths ORDER BY doc_id").fetchall()
-    return [tuple(r) for r in postings], [tuple(r) for r in lengths]
-
-
 INCREMENTAL_QUERIES = [
     "furnace coil",
     "refill shipping cold order",
@@ -639,7 +632,7 @@ def test_add_ranks_exactly_like_a_full_rebuild() -> None:
         incremental.index.add(document)
         rebuilt.store.add_document(document)
     rebuilt.index.rebuild()
-    assert _index_rows(incremental.store) == _index_rows(rebuilt.store)
+    assert index_rows(incremental.store) == index_rows(rebuilt.store)
     _assert_same_searches(incremental, rebuilt)
     # The added documents are really found, not just equally missing.
     found = incremental.search("kc-owner-dale", "furnace coil").trace.returned_ids
@@ -654,7 +647,7 @@ def test_add_ranks_exactly_like_a_full_rebuild() -> None:
         )
     incremental.index.add(changed)
     rebuilt.index.rebuild()
-    assert _index_rows(incremental.store) == _index_rows(rebuilt.store)
+    assert index_rows(incremental.store) == index_rows(rebuilt.store)
     _assert_same_searches(incremental, rebuilt)
 
     # Removing a document drops its rows.
@@ -663,7 +656,7 @@ def test_add_ranks_exactly_like_a_full_rebuild() -> None:
         world.store.connection.execute("DELETE FROM documents WHERE id = ?", (gone,))
     incremental.index.remove(gone)
     rebuilt.index.rebuild()
-    assert _index_rows(incremental.store) == _index_rows(rebuilt.store)
+    assert index_rows(incremental.store) == index_rows(rebuilt.store)
     _assert_same_searches(incremental, rebuilt)
     for world in (incremental, rebuilt):
         world.store.close()
@@ -672,7 +665,7 @@ def test_add_ranks_exactly_like_a_full_rebuild() -> None:
 def test_add_writes_only_that_documents_rows() -> None:
     world = _build_world()
     conn = world.store.connection
-    before = _index_rows(world.store)
+    before = index_rows(world.store)
     note = Document(
         id="kc-inc-note",
         customer_id=KC,
@@ -686,7 +679,7 @@ def test_add_writes_only_that_documents_rows() -> None:
     # One lengths row and two postings (coil, filter); the long term is counted in the body
     # length but never posted. Nothing else is deleted or written.
     assert conn.total_changes - changes == 1 + 2
-    postings, lengths = _index_rows(world.store)
+    postings, lengths = index_rows(world.store)
     assert [r for r in postings if r[1] != note.id] == before[0]
     assert [r for r in lengths if r[0] != note.id] == before[1]
     assert [r for r in postings if r[1] == note.id] == [
@@ -699,13 +692,13 @@ def test_add_writes_only_that_documents_rows() -> None:
     changes = conn.total_changes
     world.index.add(note)
     assert conn.total_changes - changes == (2 + 1) * 2
-    assert _index_rows(world.store) == (postings, lengths)
+    assert index_rows(world.store) == (postings, lengths)
     world.store.close()
 
 
 def test_remove_of_an_unindexed_document_changes_nothing() -> None:
     world = _build_world()
-    before = _index_rows(world.store)
+    before = index_rows(world.store)
     world.index.remove("kc-not-there")
-    assert _index_rows(world.store) == before
+    assert index_rows(world.store) == before
     world.store.close()

@@ -1,9 +1,7 @@
 import hashlib
 import json
-import os
 import sqlite3
 import stat
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -42,11 +40,6 @@ def _document(doc_id: str, customer_id: str = "acme", **overrides: object) -> Do
         "body": f"Body of {doc_id}.\n",
     }
     return Document.model_validate(data | overrides)
-
-
-@pytest.fixture
-def store() -> Store:
-    return Store()
 
 
 def test_round_trips_every_model(store: Store) -> None:
@@ -206,16 +199,6 @@ def test_transactions_serialize_read_check_write_across_threads() -> None:
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
-
-
-@pytest.fixture
-def loose_umask() -> Iterator[None]:
-    # The usual default, so a file SQLite created itself would come out 0644.
-    previous = os.umask(0o022)
-    try:
-        yield
-    finally:
-        os.umask(previous)
 
 
 def test_a_new_store_file_is_owner_only(tmp_path: Path, loose_umask: None) -> None:

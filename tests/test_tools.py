@@ -34,7 +34,7 @@ from agentgate.tools.builtin import (
     list_parts_orders,
     list_refunds,
 )
-from conftest import FIXTURES, JR, KC, POLICIES, World
+from conftest import FIXTURES, JR, KC, POLICIES, World, index_rows
 
 STARTED = datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
 ARGS_MODELS: list[type[BaseModel]] = [
@@ -391,33 +391,26 @@ def test_email_send_refuses_a_malformed_recipient_among_good_ones(world: World) 
 # notes.write indexes the note alone
 
 
-def _index_rows(store: Store) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
-    conn = store.connection
-    postings = conn.execute("SELECT * FROM retrieval_postings ORDER BY term, doc_id").fetchall()
-    lengths = conn.execute("SELECT * FROM retrieval_lengths ORDER BY doc_id").fetchall()
-    return [tuple(r) for r in postings], [tuple(r) for r in lengths]
-
-
 def test_notes_write_touches_only_the_new_notes_rows(world: World) -> None:
     adapter = default_tools()["notes.write"]
     title, body = "Coil restock", "Restock the coil shelf; coil count is low."
     args = _parse(NotesWriteArgs, {"title": title, "body": body, "label": "internal"})
     terms = {"coil", "restock", "the", "shelf", "count", "is", "low"}
     conn = world.store.connection
-    postings_before, lengths_before = _index_rows(world.store)
+    postings_before, lengths_before = index_rows(world.store)
     changes = conn.total_changes
     result = adapter.run(_env(world), _ctx(), args)
     # One document row, one lengths row and one posting per distinct term, nothing else:
     # no other customer's (or this customer's) rows are deleted or written again.
     assert conn.total_changes - changes == 1 + 1 + len(terms)
     note_id = result.content["document_id"]
-    postings_after, lengths_after = _index_rows(world.store)
+    postings_after, lengths_after = index_rows(world.store)
     assert [r for r in postings_after if r[1] != note_id] == postings_before
     assert [r for r in lengths_after if r[0] != note_id] == lengths_before
     assert {r[0] for r in postings_after if r[1] == note_id} == terms
     # And the index is the one a full rebuild gives.
     world.index.rebuild()
-    assert _index_rows(world.store) == (postings_after, lengths_after)
+    assert index_rows(world.store) == (postings_after, lengths_after)
 
 
 def test_a_note_write_does_not_block_another_connection(tmp_path: Path) -> None:
