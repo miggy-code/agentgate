@@ -624,11 +624,11 @@ def approval_changes_without_audit(arena: Arena) -> None:
 
 EMAIL = "email.send"
 
-KEY_SHAPED_DOC = "sk-aaaaaaaaaaaaaaaaaaaaaaaa"
+KEY_SHAPED_DOC = "sk-fake-aaaaaaaaaaaaaaaaaaaaaaaa"
 
-KEY_SHAPED_APPROVAL = "apr_-sk-aaaaaaaaaaaaaaaaaaaaaaa"
+KEY_SHAPED_APPROVAL = "apr_-sk-fake-aaaaaaaaaaaaaaaaaaaaaaa"
 
-KEY_SHAPED_APPROVER = "sk-bbbbbbbbbbbbbbbbbbbbbbbb"
+KEY_SHAPED_APPROVER = "sk-fake-bbbbbbbbbbbbbbbbbbbbbbbb"
 
 INVENTED_SLUGS = ("beatrice-lindqvist-medical-history", "ruben-castillo-home-address")
 
@@ -756,8 +756,8 @@ def key_shaped_ids_audited(arena: Arena) -> None:
             [(r["user_id"], r["stored_user"], r["target"]) for r in approver]
             == [(ref(KEY_SHAPED_APPROVER), ref(KEY_SHAPED_APPROVER), real)],
         )
-        arena.expect("no key-shaped value in the log", b"sk-aaaa" not in data)
-        arena.expect("no key-shaped approver in the log", b"sk-bbbb" not in data)
+        arena.expect("no key-shaped value in the log", b"sk-fake-aaaa" not in data)
+        arena.expect("no key-shaped approver in the log", b"sk-fake-bbbb" not in data)
 
 
 @scenario("ai-014", AI, "Invented document slugs and unknown approvers never reach the log")

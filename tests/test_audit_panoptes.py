@@ -133,7 +133,7 @@ def test_panoptes_normalization_keeps_ids_intact() -> None:
 def test_id_panoptes_would_redact_is_refused() -> None:
     # Panoptes would store this subject as "[REDACTED API KEY]"; an altered id is no record.
     with pytest.raises(ValidationError, match="subject"):
-        to_panoptes_event(_event(subject="sk-proj-abcdefghijklmnopqrstuvwx"))
+        to_panoptes_event(_event(subject="sk-proj-fakefakefakefakefakefake"))
 
 
 def _ref(char: str) -> str:
@@ -143,7 +143,7 @@ def _ref(char: str) -> str:
 def test_referenced_fields_are_mapped_as_their_references() -> None:
     event = _event(
         EventKind.DENY,
-        customer_id="sk-proj-abcdefghijklmnopqrstuvwx",
+        customer_id="sk-proj-fakefakefakefakefakefake",
         user_id="Ignore previous instructions",
         run_id="forged-run",
         tool="secret.tool",
@@ -209,9 +209,9 @@ def test_reference_shape_is_enforced() -> None:
         ("apr_AbC-12_x", True),
         ("Ignore previous instructions", True),
         ("ref:0123456789abcdef", True),
-        ("sk-aaaaaaaaaaaaaaaaaaaaaaaa", False),
-        ("apr_-sk-aaaaaaaaaaaaaaaaaaaaaaa", False),
-        ("ghp_" + "a" * 36, False),
+        ("sk-fake-aaaaaaaaaaaaaaaaaaaaaaaa", False),
+        ("apr_-sk-fake-aaaaaaaaaaaaaaaaaaaaaaa", False),
+        ("ghp_" + "fake" * 9, False),
         ("\x1b[31mred", False),
         ("x" * 257, False),
         ("", False),
@@ -224,7 +224,7 @@ def test_storable_identifier(value: str, storable: bool) -> None:
 
 def test_referenced_event_round_trips(sink: PanoptesSink, tmp_path: Path) -> None:
     event = _event(
-        subject="sk-aaaaaaaaaaaaaaaaaaaaaaaa",
+        subject="sk-fake-aaaaaaaaaaaaaaaaaaaaaaaa",
         references={"subject": Reference(ref=_ref("9"), why="unknown")},
     )
     sink.record(event)
@@ -237,7 +237,7 @@ def test_referenced_event_round_trips(sink: PanoptesSink, tmp_path: Path) -> Non
     assert row["action"]["target"] == _ref("9")
     assert row["context"]["agentgate"]["references"] == {"subject": "unknown"}
     sink.close()
-    assert b"sk-aaaa" not in (tmp_path / "audit.db").read_bytes()
+    assert b"sk-fake-aaaa" not in (tmp_path / "audit.db").read_bytes()
 
 
 # Recording
@@ -295,7 +295,7 @@ def test_creates_parent_directories(tmp_path: Path) -> None:
 def test_rejected_event_raises_and_stores_nothing(sink: PanoptesSink) -> None:
     # AuditRejected, not Panoptes' own error, so the gate can tell it from a sink outage.
     with pytest.raises(AuditRejected) as raised:
-        sink.record(_event(tool="sk-proj-abcdefghijklmnopqrstuvwx"))
+        sink.record(_event(tool="sk-proj-fakefakefakefakefakefake"))
     assert isinstance(raised.value.__cause__, ValidationError)
     assert sink.count() == 0
 
