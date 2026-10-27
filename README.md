@@ -69,7 +69,7 @@ Kettle Creek Heating & Air (an HVAC contractor) and Juniper Row Apothecary (a ph
 
 ## Why
 
-I deployed company-brain agents for small businesses: an agent in front of a memory layer, with read and write tool connections. They had a spend limit (not per run), approval before customer-facing work, and could only send approved emails. Some tools checked identity before they ran, but there was no general per-user permission layer across documents, tools and spend, and no audit log you could rebuild an incident from. agentgate is that layer.
+I deployed company-brain agents for small businesses: an agent in front of a memory layer, with read and write tool connections. They had a spend limit (not per run), approval before customer-facing work, and could only send approved emails. They had no access control or identity checks, so any staff member could reach anything the agent could, and no audit log you could rebuild an incident from. agentgate is the layer I would add now.
 
 ## How it works
 
