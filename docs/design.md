@@ -200,6 +200,8 @@ Each shipped tool has exactly one action, a base risk for the risk score, an opt
 
 The risk score is the tool's `base_risk`, plus 25 if any recipient is outside the company, plus 5 per full 100 USD of the amount, up to 40.
 
+An allowed call still needs approval when a `customer_facing` tool reaches someone outside the company, when its risk score reaches `risk_threshold`, or (`escalated_recipient_clearance`) when the run has already been shown a document and an internal recipient is not an active user of the customer whose role may read a document at that label. An internal address that names no user counts as not cleared.
+
 ### tests.yaml
 
 Each case names a fixture user (role and customer come from the fixtures, never from the case), a request, the expected effect, and the deciding rule ids. One case from `policies/kettle-creek-hvac/tests.yaml`:

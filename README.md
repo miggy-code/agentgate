@@ -118,7 +118,7 @@ I deployed company-brain agents for small businesses: an agent in front of a mem
 3. **Decide document calls before spend.** A missing document, another customer's document and one the user may not read all look the same to the model: `not_found`. Deciding before spend means a spend cap can't tell them apart either.
 4. **Reserve spend.** Calls and USD per run, then USD per customer local day.
 5. **Decide.** The policy engine decides with the run's highest label so far. That label only rises, so reading a confidential document closes doors for the rest of the run.
-6. **Escalate.** A customer-facing call that reaches outside the company, or one at or above the policy's risk threshold, becomes an approval bound to the arguments hash.
+6. **Escalate.** A customer-facing call that reaches outside the company, mail to an internal recipient who may not read what the run has already seen, or a call at or above the policy's risk threshold, becomes an approval bound to the arguments hash. Each approval request counts toward the run's call cap.
 7. **Record, then run.** The `allow` event is written first. If it can't be written, the tool doesn't run and the model is told `audit_unavailable`.
 
 The model sees the tool's content, a reason code, an approval id or `cap_reached`. It never sees rule ids or audit details. Each subsystem is covered in [docs/design.md](docs/design.md).

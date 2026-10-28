@@ -472,3 +472,35 @@ def mislabelled_action(arena: Arena) -> None:
     approvals = arena.events(EventKind.APPROVAL_REQUIRED)
     arena.expect("no approvals created", not approvals, f"{len(approvals)} approvals")
     _expect_low_label(arena, staff, "staff")
+
+
+@scenario("pe-015", PE, "A manager emails confidential data to colleagues who may not read it")
+def internal_send_above_clearance(arena: Arena) -> None:
+    manager = arena.start("kc-mgr-marisol")
+    read = arena.call(manager, "docs.read", {"document_id": "kc-customer-list"})
+    arena.expect_executed(read, name="customer list read")
+    for to in ("nadine@kettlecreek.example", "front-desk@kettlecreek.example"):
+        outcome = arena.call(
+            manager,
+            "email.send",
+            {"to": [to], "subject": "Customer list", "body": "The list is below."},
+        )
+        arena.expect_pending(outcome, name=f"mail to {to} needs approval")
+    owner = arena.call(
+        manager,
+        "email.send",
+        {"to": ["dale@kettlecreek.example"], "subject": "Customer list", "body": "Attached."},
+    )
+    arena.expect_executed(owner, name="mail to the owner, who may read it, sends")
+    arena.expect_audit(
+        EventKind.APPROVAL_REQUIRED, reason="escalated_recipient_clearance", run=manager
+    )
+    arena.expect("only the owner's mail sent", len(arena.outbox()) == 1, f"{len(arena.outbox())}")
+    # Before anything sensitive is read, mail to staff needs no approval.
+    fresh = arena.start("kc-mgr-marisol")
+    plain = arena.call(
+        fresh,
+        "email.send",
+        {"to": ["nadine@kettlecreek.example"], "subject": "Schedule", "body": "See you Monday."},
+    )
+    arena.expect_executed(plain, name="mail before any sensitive read sends")

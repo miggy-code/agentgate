@@ -38,7 +38,9 @@ back. A claim whose ALLOW cannot be recorded leaves the approval approved and un
 The run's max label is the most sensitive label of anything returned to the model so far.
 It only rises, and rules such as no-external-after-confidential read it, so reading a
 confidential document closes doors for the rest of the run, including for approvals granted
-earlier: execute_approved decides again with the current label and policy.
+earlier: execute_approved decides again with the current label and policy. It also sends
+mail to an internal recipient who may not read that label, or who is no known user, for
+approval.
 
 A call sent for approval gives its spend back but counts as one of the run's calls, so a
 run cannot queue more approvals than its call cap.
@@ -112,6 +114,7 @@ from agentgate.tools.base import ToolAdapter, ToolEnv, ToolFacts, ToolResult
 from agentgate.tools.builtin import default_tools
 
 SEARCH_TOOL = "docs.search"
+READ_TOOL = "docs.read"
 # The tags of a note being written, as the engine sees it when deciding the write.
 NOTE_TAGS = frozenset({"note"})
 
@@ -177,6 +180,8 @@ class GateReason(StrEnum):
     WRITE_DOWN = "write_down"
     ESCALATED_CUSTOMER_FACING = "escalated_customer_facing"
     ESCALATED_RISK = "escalated_risk"
+    # An internal recipient may not read the most sensitive label the run has seen.
+    ESCALATED_RECIPIENT_CLEARANCE = "escalated_recipient_clearance"
     AUDIT_UNAVAILABLE = "audit_unavailable"
     TOOL_ERROR = "tool_error"
     RETRIEVAL_FILTER = "retrieval_filter"
@@ -1086,6 +1091,8 @@ class Gate:
     def _escalation(self, run: _Run, prepared: _Prepared) -> GateReason | None:
         if prepared.config.customer_facing and self._reaches_outside(run, prepared):
             return GateReason.ESCALATED_CUSTOMER_FACING
+        if self._uncleared_recipient(run, prepared.facts.recipients):
+            return GateReason.ESCALATED_RECIPIENT_CLEARANCE
         if self._risk(run, prepared) >= run.policy.approvals.risk_threshold:
             return GateReason.ESCALATED_RISK
         return None
@@ -1101,6 +1108,44 @@ class Gate:
         if not recipients:
             return True
         return self._any_external(run, recipients)
+
+    def _uncleared_recipient(self, run: _Run, recipients: tuple[str, ...]) -> bool:
+        """Whether an internal recipient may not read what the run has already been shown.
+
+        Once a run has seen a document at some label, mail to an internal address goes out
+        without approval only when every internal recipient is an active user of the
+        customer whose role may read a document at that label. The engine is asked about a
+        document with that label alone, no tags and not assigned to anyone, so a grant that
+        needs more than the label does not count. External recipients are left to the
+        policy and to the customer-facing escalation.
+        """
+        if not recipients:
+            return False
+        label = self.run_max_label(run.ctx.run_id)
+        if label is None:
+            return False
+        domains = frozenset(domain.lower() for domain in run.customer.domains)
+        users = {user.email.lower(): user for user in self._store.list_users(run.ctx.customer_id)}
+        for raw in recipients:
+            parsed = parse_address(raw)
+            if parsed is None or parsed[1] not in domains:
+                continue
+            user = users.get(parsed[0])
+            if user is None or user.status is not UserStatus.ACTIVE:
+                return True
+            decision = run.engine.decide(
+                Request(
+                    customer_id=run.ctx.customer_id,
+                    user_id=user.id,
+                    role=user.role,
+                    tool=READ_TOOL,
+                    action=Action.READ,
+                    document=DocumentFacts(customer_id=run.ctx.customer_id, label=label),
+                )
+            )
+            if decision.effect is not Effect.ALLOW:
+                return True
+        return False
 
     def _any_external(self, run: _Run, recipients: tuple[str, ...]) -> bool:
         domains = frozenset(domain.lower() for domain in run.customer.domains)

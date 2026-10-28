@@ -64,6 +64,7 @@ A user inside their own customer tries to read, write, send or spend above what 
 | pe-012 | Confidential search results, then a lower note | 5 |
 | pe-013 | Probing ids cannot tell forbidden documents from missing ones | 54 |
 | pe-014 | A mislabelled action tries to unlock a tool | 12 |
+| pe-015 | A manager emails confidential data to colleagues who may not read it | 7 |
 
 ## prompt_injection_exfil
 

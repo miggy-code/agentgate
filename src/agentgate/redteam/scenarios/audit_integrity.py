@@ -274,6 +274,9 @@ def rule_ids_on_decisions(arena: Arena) -> None:
 @scenario("ai-003", AI, "No event carries document text, email text, notes or queries")
 def no_content_in_events(arena: Arena) -> None:
     owner = arena.start("kc-owner-dale")
+    # Sent first: after the owner's restricted reads, mail to a colleague needs approval.
+    email = _internal_email("Quillmark board prep", "Quillmark: bring the margin sheet Friday.")
+    arena.expect_executed(arena.call(owner, "email.send", email), "internal email sent")
     query = "succession valuation payroll quillmark"
     arena.call(owner, "docs.search", {"query": query})
     documents = arena.store.list_documents(KC)
@@ -288,8 +291,6 @@ def no_content_in_events(arena: Arena) -> None:
         "label": "confidential",
     }
     arena.call(owner, "notes.write", note)
-    email = _internal_email("Quillmark board prep", "Quillmark: bring the margin sheet Friday.")
-    arena.expect_executed(arena.call(owner, "email.send", email), "internal email sent")
     text = _audit_text(arena)
     lines = {
         line.strip()

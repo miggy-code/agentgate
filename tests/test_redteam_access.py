@@ -297,6 +297,11 @@ def any_role_approves(world: World, mp: pytest.MonkeyPatch) -> None:
     _rebuild(world, mp, apply)
 
 
+def no_recipient_clearance(world: World, mp: pytest.MonkeyPatch) -> None:
+    """Every internal recipient counts as cleared for whatever the run has read."""
+    mp.setattr(world.gate, "_uncleared_recipient", lambda run, recipients: False)
+
+
 def no_label_tracking(world: World, mp: pytest.MonkeyPatch) -> None:
     """The run's max label never rises, so write-down has nothing to compare against."""
     mp.setattr(world.gate, "_raise_label", lambda run, labels: None)
@@ -432,6 +437,7 @@ PROTECTIONS: dict[str, tuple[WorldMutation, ...]] = {
     "pe-012": (no_label_tracking,),
     "pe-013": (staff_read_ceiling_restricted,),
     "pe-014": (actions_ignored,),
+    "pe-015": (no_recipient_clearance,),
     "id-001": (ignore_suspension,),
     "id-002": (ignore_suspension,),
     "id-003": (trust_context,),

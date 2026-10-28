@@ -33,7 +33,8 @@
       "pe-011",
       "pe-012",
       "pe-013",
-      "pe-014"
+      "pe-014",
+      "pe-015"
     ],
     "prompt_injection_exfil": [
       "pi-001",
