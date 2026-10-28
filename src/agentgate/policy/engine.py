@@ -200,12 +200,13 @@ class PolicyEngine:
                 return False
             if self._ranks[document.label] > self._ranks[rule.labels.max]:
                 return False
-        return self._conditions_hold(rule.where, request)
+        return self._conditions_hold(rule.where, request, deny=rule.effect is Effect.DENY)
 
-    def _conditions_hold(self, where: Conditions, request: Request) -> bool:
-        if where.recipient_in is not None and not self._all_in_list(
-            where.recipient_in, request.recipients
-        ):
+    def _conditions_hold(self, where: Conditions, request: Request, *, deny: bool) -> bool:
+        # A list on an allow or approval rule must cover every recipient; on a deny rule,
+        # one listed recipient is enough, so adding an unlisted one cannot dodge the deny.
+        in_list = self._any_in_list if deny else self._all_in_list
+        if where.recipient_in is not None and not in_list(where.recipient_in, request.recipients):
             return False
         if where.recipient_external is not None:
             if not request.recipients:
@@ -243,6 +244,12 @@ class PolicyEngine:
         if listed is None or not recipients:
             return False
         return all(listed.contains(raw) for raw in recipients)
+
+    def _any_in_list(self, name: str, recipients: tuple[str, ...]) -> bool:
+        listed = self._lists.get(name)
+        if listed is None:
+            return False
+        return any(listed.contains(raw) for raw in recipients)
 
     def _is_external(self, raw: str) -> bool:
         parsed = _parse_address(raw)

@@ -177,7 +177,7 @@ The full file has 7 directory addresses and 14 rules.
 
 | Condition | Holds when |
 | --- | --- |
-| `recipient_in: <list>` | every recipient is on the named list (send) |
+| `recipient_in: <list>` | every recipient is on the named list; on a `deny` rule, any recipient is (send) |
 | `recipient_external: true` | at least one recipient is outside the customer's domains (send) |
 | `amount_usd_gt: "<usd>"` | the amount is above the value (spend) |
 | `amount_usd_lte: "<usd>"` | the amount is at or below the value (spend) |

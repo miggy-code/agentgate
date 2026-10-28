@@ -244,6 +244,22 @@ def test_recipient_in_with_an_empty_list_never_holds() -> None:
     assert _effect(engine, _send("pat@home.example")) is Effect.DENY
 
 
+def test_recipient_in_on_a_deny_rule_needs_only_one_listed_recipient() -> None:
+    blocked = {
+        "id": "blocked",
+        "effect": "deny",
+        "tools": ["email.send"],
+        "actions": ["send"],
+        "where": {"recipient_in": "directory"},
+    }
+    engine = _engine(_send_rule("anyone", where={"recipient_external": True}), blocked)
+    # An unlisted recipient added beside a listed one does not get past the deny.
+    mixed = _send("pat@home.example", "stranger@else.example")
+    assert engine.decide(mixed).effect is Effect.DENY
+    assert engine.decide(mixed).rule_ids == ("blocked",)
+    assert engine.decide(_send("stranger@else.example")).effect is Effect.ALLOW
+
+
 # recipient_external
 
 
@@ -618,8 +634,9 @@ def test_no_condition_holds_on_a_bare_request(where: Conditions) -> None:
     # required, so the missing-document case is checked directly as defence in depth.
     engine = _engine(_rule("r"))
     bare = _send()
-    assert engine._conditions_hold(where, bare) is False
-    assert engine._conditions_hold(Conditions(), bare) is True
+    for deny in (False, True):
+        assert engine._conditions_hold(where, bare, deny=deny) is False
+        assert engine._conditions_hold(Conditions(), bare, deny=deny) is True
 
 
 def test_label_bound_without_a_document_does_not_match() -> None:
