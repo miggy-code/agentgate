@@ -646,7 +646,9 @@ def test_directory_email_needs_approval(world: World) -> None:
     assert (event.reason, event.subject) == ("matched_approval", outcome.approval_id)
     assert event.rule_ids == ("email-customers",)
     assert event.details["risk_score"] == 65
-    assert world.gate.ledger.run_calls(ctx.run_id) == 0
+    # The request is one of the run's calls, at no cost.
+    assert world.gate.ledger.run_calls(ctx.run_id) == 1
+    assert world.gate.ledger.run_spent(ctx.run_id) == 0
     assert list_outbox(world.store) == []
 
 
@@ -720,7 +722,8 @@ def test_changed_recipient_after_approval(world: World) -> None:
     assert outcome == Denied("args_mismatch")
     assert world.last(EventKind.DENY).reason == "args_mismatch"
     assert list_outbox(world.store) == []
-    assert world.gate.ledger.run_calls(ctx.run_id) == 0
+    # Only the request counts; the refused execution gave its reservation back.
+    assert world.gate.ledger.run_calls(ctx.run_id) == 1
     # The exact approved call still runs.
     executed(
         world.gate.execute_approved(ctx, approval.approval_id, "email.send", Action.SEND, args)
@@ -1021,12 +1024,24 @@ def test_customer_day_cap(world: World) -> None:
     executed(read(world, ctx, "kc-service-menu"))
 
 
-def test_denied_and_pending_calls_release_their_reservation(world: World) -> None:
+def test_denied_calls_release_their_reservation_and_pending_ones_cost_nothing(
+    world: World,
+) -> None:
     ctx = world.run("kc-mgr-marisol")
     email(world, ctx, EXFIL)
-    pending(email(world, ctx, DIRECTORY_CUSTOMER))
     assert world.gate.ledger.run_calls(ctx.run_id) == 0
+    pending(email(world, ctx, DIRECTORY_CUSTOMER))
+    assert world.gate.ledger.run_calls(ctx.run_id) == 1
     assert world.gate.ledger.run_spent(ctx.run_id) == 0
+
+
+def test_approval_requests_count_toward_max_calls(world: World) -> None:
+    ctx = world.run("kc-mgr-marisol")
+    limit = world.engines[KC].bundle.policy.spend.max_calls_per_run
+    for _ in range(limit):
+        pending(email(world, ctx, DIRECTORY_CUSTOMER))
+    assert email(world, ctx, DIRECTORY_CUSTOMER) == CapReached(CapKind.CALLS)
+    assert len(world.gate.approvals.list(KC)) == limit
 
 
 # Audit failure and tool failure
@@ -1116,7 +1131,7 @@ def test_audit_failure_at_execution_leaves_the_approval_usable(world: World) -> 
     assert outcome == Denied("audit_unavailable")
     assert status_of(world, approval_id) == (ApprovalStatus.APPROVED, "kc-mgr-terrence", False)
     assert list_outbox(world.store) == []
-    assert gate.ledger.run_calls(ctx.run_id) == 0
+    assert gate.ledger.run_calls(ctx.run_id) == 1
     sink.kinds = frozenset()
     executed(gate.execute_approved(ctx, approval_id, "email.send", Action.SEND, args))
     allow = [e for e in sink.events if e.kind is EventKind.ALLOW]

@@ -19,7 +19,7 @@ A denied read looks like a missing document. Whether the id does not exist, belo
 
 ## Spend caps
 
-Each policy sets three caps: USD per run, USD per customer per day, and tool plus model calls per run. The day is the customer's local day, from the customer's timezone. The gate reserves before every tool call, and the reference agent loop reserves before every model call. Reservations are settled at the actual cost. Calls that are denied or sent for approval give their reservation back and do not count toward the call cap; every model call counts, including one that failed.
+Each policy sets three caps: USD per run, USD per customer per day, and tool plus model calls per run. The day is the customer's local day, from the customer's timezone. The gate reserves before every tool call, and the reference agent loop reserves before every model call. Reservations are settled at the actual cost. Calls that are denied give their reservation back and do not count toward the call cap. A call sent for approval gives its money back but counts as one call, so a run cannot queue more approvals than its call cap; running the approved call later is another call. Every model call counts, including one that failed.
 
 A reservation is a lease. One still open 15 minutes after it was made, such as one left by a host that died between reserve and settle, is released on the next `open_world` of that database (the approvals, users and gateway commands each do one), or by `agentgate spend release-stale`. A released lease no longer counts toward the run or the customer day, but still counts toward the run's call cap. If the host was only slow and settles later, the actual cost is recorded.
 

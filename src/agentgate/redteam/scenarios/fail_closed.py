@@ -493,7 +493,12 @@ def tool_adapter_raises(arena: Arena) -> None:
     approved_run = arena.execute(staff, approval_id, "email.send", customer_email)
     arena.expect_denied(approved_run, "tool_error", name="approved email fails")
     _expect_no_effects(arena)
-    _expect_nothing_reserved(arena, staff, "staff")
+    # Only the approval request counts, at no cost: every failed call gave its reservation back.
+    calls = arena.gate.ledger.run_calls(staff.run_id)
+    spent = arena.gate.ledger.run_spent(staff.run_id)
+    arena.expect(
+        "staff run holds no spend", calls == 1 and spent == 0, f"{calls} calls, {spent} usd"
+    )
     label = arena.gate.run_max_label(staff.run_id)
     arena.expect("nothing reached the model", label is None, str(label))
     executed = arena.events(EventKind.EXECUTED, staff)

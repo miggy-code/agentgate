@@ -40,6 +40,9 @@ It only rises, and rules such as no-external-after-confidential read it, so read
 confidential document closes doors for the rest of the run, including for approvals granted
 earlier: execute_approved decides again with the current label and policy.
 
+A call sent for approval gives its spend back but counts as one of the run's calls, so a
+run cannot queue more approvals than its call cap.
+
 Model-facing reasons are the engine's reason codes, with one exception: every denial of a
 call that names a document (a missing id, another customer's document, or one of the run's
 own customer that the run may not read) reads as `not_found`, so document ids, which
@@ -431,7 +434,6 @@ class Gate:
             return self._deny_verdict(call, prepared, verdict, subject)
 
         if verdict.effect is Effect.REQUIRE_APPROVAL:
-            self._ledger.release(reservation)
             risk = self._risk(run, prepared)
 
             def record_request(created: Approval) -> None:
@@ -452,19 +454,26 @@ class Gate:
                 )
 
             # A request the audit log cannot record raises here and leaves no approval.
-            approval = self._approvals.create(
-                customer_id=run.ctx.customer_id,
-                run_id=run.ctx.run_id,
-                requested_by=run.ctx.user_id,
-                tool=prepared.config.id,
-                action=prepared.action,
-                args=dict(args),
-                risk_score=risk,
-                rule_ids=verdict.rule_ids,
-                policy_version=verdict.policy_version,
-                ttl=timedelta(minutes=run.policy.approvals.ttl_minutes),
-                record=record_request,
-            )
+            try:
+                approval = self._approvals.create(
+                    customer_id=run.ctx.customer_id,
+                    run_id=run.ctx.run_id,
+                    requested_by=run.ctx.user_id,
+                    tool=prepared.config.id,
+                    action=prepared.action,
+                    args=dict(args),
+                    risk_score=risk,
+                    rule_ids=verdict.rule_ids,
+                    policy_version=verdict.policy_version,
+                    ttl=timedelta(minutes=run.policy.approvals.ttl_minutes),
+                    record=record_request,
+                )
+            except BaseException:
+                self._ledger.release(reservation)
+                raise
+            # The request is one of the run's calls, at no cost, so a run cannot queue more
+            # approvals than max_calls_per_run allows; the spend goes back to the caps.
+            self._ledger.settle(reservation, Decimal(0))
             return PendingApproval(approval_id=approval.id, expires_at=approval.expires_at)
 
         return self._execute(run, call, prepared, reservation, verdict, subject=subject)

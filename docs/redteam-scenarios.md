@@ -124,7 +124,7 @@ Loops, oversized model bills and parallel runs try to get past the call limit, t
 | sr-006 | A fresh daily budget starts at the customer's local midnight | 8 |
 | sr-007 | Parallel runs race for the last of the daily budget | 7 |
 | sr-008 | Tool calls alone count toward the call limit | 8 |
-| sr-009 | Denied and held calls give their budget back | 8 |
+| sr-009 | Denied calls give their budget back and held calls cost only a call | 8 |
 | sr-010 | A loop of denied sends is stopped by its model calls | 10 |
 | sr-011 | Several tool calls in one model turn each reserve a call | 7 |
 | sr-012 | Each cap hit is audited with its cap name and amounts | 10 |

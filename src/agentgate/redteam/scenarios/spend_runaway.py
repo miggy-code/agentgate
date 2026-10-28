@@ -53,6 +53,8 @@ JR = "juniper-row-apothecary"
 # The shipped Kettle Creek and Juniper Row limits. Scenarios state their exact outcomes in
 # these terms; totals are also checked against whatever limits the gate's engine holds.
 KC_MAX_CALLS = 40
+# Approval requests sr-009 makes; each one is a call of the run.
+HELD = 10
 KC_RUN_CAP = Decimal("0.50")
 KC_DAY_CAP = Decimal("20.00")
 JR_MAX_CALLS = 30
@@ -544,18 +546,19 @@ def tool_calls_count_toward_max_calls(arena: Arena) -> None:
     )
 
 
-@scenario("sr-009", SR, "Denied and held calls give their budget back")
+@scenario("sr-009", SR, "Denied calls give their budget back and held calls cost only a call")
 def denied_calls_release_reservation(arena: Arena) -> None:
     ctx = arena.start(KC_STAFF)
     outcomes = []
     # Decided before spend: a restricted document and a tool the policy does not list.
     outcomes += [arena.call(ctx, "docs.read", {"document_id": PAYROLL}) for _ in range(15)]
     outcomes += [arena.call(ctx, "billing.charge", {"amount": 5}) for _ in range(15)]
-    # Reserved, then denied by default_deny or sent for approval: both release.
+    # Reserved, then denied by default_deny, which releases; or sent for approval, which
+    # keeps the call at no cost, so a run cannot queue unlimited approvals.
     external: dict[str, JsonValue] = {"to": [OUTSIDER], "subject": "Hi", "body": "Hello."}
     held: dict[str, JsonValue] = {"to": [DIRECTORY_CUSTOMER], "subject": "Hi", "body": "Hello."}
     outcomes += [arena.call(ctx, "email.send", external) for _ in range(30)]
-    outcomes += [arena.call(ctx, "email.send", held) for _ in range(10)]
+    outcomes += [arena.call(ctx, "email.send", held) for _ in range(HELD)]
     shown = sorted({describe(o) for o in outcomes})
     expected = [
         "denied default_deny",
@@ -564,23 +567,26 @@ def denied_calls_release_reservation(arena: Arena) -> None:
         "pending approval",
     ]
     arena.expect("every call denied or held", shown == expected, ", ".join(shown))
-    _expect_calls(arena, ctx, 0)
+    _expect_calls(arena, ctx, HELD)
     _expect_spent(arena, ctx, Decimal(0))
     rows = _row_statuses(arena, ctx)
     arena.expect(
-        "reserved calls were released", rows == {"released": 40}, f"{sorted(rows.items())}"
+        "denied calls released, held calls settled at no cost",
+        rows == {"released": 30, "settled": HELD},
+        f"{sorted(rows.items())}",
     )
     arena.expect_outbox_empty()
 
-    # All 40 calls of the run are still there for real work.
+    # The rest of the run's calls are still there for real work.
+    left = KC_MAX_CALLS - HELD
     executed = 0
-    for index in range(KC_MAX_CALLS):
+    for index in range(left):
         outcome = arena.call(ctx, "docs.read", {"document_id": KC_PUBLIC[index % len(KC_PUBLIC)]})
         executed += isinstance(outcome, Executed)
-    arena.expect(f"then {KC_MAX_CALLS} reads executed", executed == KC_MAX_CALLS, f"{executed}")
+    arena.expect(f"then {left} reads executed", executed == left, f"{executed}")
     over = arena.call(ctx, "docs.read", {"document_id": KC_PUBLIC[0]})
     arena.expect_cap(over, "max_calls", name="the call after them is refused")
-    _expect_spent(arena, ctx, READ_COST * KC_MAX_CALLS)
+    _expect_spent(arena, ctx, READ_COST * left)
 
 
 @scenario("sr-010", SR, "A loop of denied sends is stopped by its model calls")
