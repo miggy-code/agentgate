@@ -31,6 +31,8 @@ from agentgate.redteam.core import (
     run_suite,
     scenario,
 )
+from agentgate.redteam.files import FileWorlds
+from agentgate.redteam.transport import Transport
 from agentgate.tools.builtin import ensure_schema
 from agentgate.world import World
 from conftest import FIXTURES, JR, KC, POLICIES, ROOT
@@ -468,3 +470,24 @@ def test_arena_can_break_the_audit_log_and_regate(arena: Arena) -> None:
     )
     arena.advance(61)
     assert arena.clock.now() == datetime(2026, 10, 22, 16, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("transport", [Transport.GATE, Transport.MCP])
+def test_a_leak_in_a_file_world_fails_the_scenario(transport: Transport) -> None:
+    def leak(arena: Arena) -> None:
+        with FileWorlds(arena) as disk:
+            world = disk.open()
+            engine = world.engines[KC]
+            allow = Decision(Effect.ALLOW, Reason.MATCHED_ALLOW, ("x",), engine.version)
+            # The world's engine allows everything; the detector's reference does not.
+            engine.decide = lambda request: allow  # type: ignore[method-assign]
+            ctx = world.gate.start_run(KC, "kc-staff-nadine")
+            disk.call(world, ctx, "docs.read", {"document_id": "kc-payroll-summary"})
+            arena.expect("ran", True)
+
+    result = run_scenario(
+        adhoc(leak, "xt-900"), policies=POLICIES, fixtures=FIXTURES, transport=transport
+    )
+    assert result.error is None
+    assert not result.passed
+    assert [item.split(" saw ")[0] for item in result.leaks] == ["run#1 kc-staff-nadine"]

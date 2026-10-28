@@ -99,9 +99,15 @@ def create_then_record(self: ApprovalQueue, *, record: Any = None, **kwargs: Any
 
 
 def approve_then_record(
-    self: ApprovalQueue, *args: Any, record: Any = None, expired: Any = None
+    self: ApprovalQueue,
+    approval_id: str,
+    approver: Any,
+    settings: Any,
+    note: str | None = None,
+    record: Any = None,
+    expired: Any = None,
 ) -> Any:
-    decided = REAL_APPROVE(self, *args, expired=expired)
+    decided = REAL_APPROVE(self, approval_id, approver, settings, note, expired=expired)
     if record is not None:
         record(decided)
     return decided
@@ -185,9 +191,8 @@ def _code_mutations() -> list[Mutation]:
                     (("if live and self._now() >= approval.expires_at:", "if False:"),),
                 ),
             ),
-            replace=((ApprovalQueue, "expire_due", lambda self: []),),
+            replace=((ApprovalQueue, "expire_due", lambda self, record=None: []),),
             breaks=("ab-011", "ab-012"),
-            crashes=True,
         ),
         Mutation(
             "requester may approve",
@@ -312,7 +317,8 @@ def _code_mutations() -> list[Mutation]:
                 ),
             ),
             breaks=("fc-004", "fc-005"),
-            crashes=True,
+            # The unvalidated args fail inside the tool; over MCP the gateway reports it.
+            crashes=("AttributeError", "GatewayCallError"),
         ),
         Mutation(
             "missing policy falls back to the shipped one",
@@ -376,7 +382,7 @@ def _code_mutations() -> list[Mutation]:
                 ),
             ),
             breaks=("fc-009",),
-            crashes=True,
+            crashes=("AuditDown",),
         ),
         Mutation(
             "search returns results its retrieval event could not record",
@@ -493,7 +499,6 @@ def _code_mutations() -> list[Mutation]:
                 (ApprovalQueue, "approve", approve_then_record),
             ),
             breaks=("ai-012",),
-            crashes=True,
         ),
         Mutation(
             "verification always passes",
@@ -716,7 +721,7 @@ OPERATIONS_MUTATIONS = [
         "paths not checked",
         ("fc-016",),
         replace=((world_module, "check_paths", _nothing),),
-        crashes=True,
+        crashes=("StoreError",),
     ),
     Mutation(
         "store file left to sqlite",

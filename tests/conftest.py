@@ -198,9 +198,11 @@ class Mutation:
     arena: Callable[[Arena, pytest.MonkeyPatch], None] | None = None
     # A failed check or leak containing this must appear in every broken scenario.
     must_fail: str | None = None
-    # The unprotected code raises inside some of these scenarios, which the suite also
-    # counts as a failure. Otherwise a broken scenario must fail on a check or a leak.
-    crashes: bool = False
+    # Exception type names the unprotected code raises inside some of these scenarios,
+    # which the suite also counts as a failure. Any other error fails the test, so a stub
+    # that is itself broken cannot pass for a removed protection. A broken scenario that
+    # does not raise must fail on a check or a leak.
+    crashes: tuple[str, ...] = ()
 
 
 def mutant(owner: Any, attribute: str, edits: tuple[Edit, ...], names: Mapping[str, Any]) -> Any:
@@ -256,8 +258,10 @@ def assert_breaks(
     for result in run_mutated(mutation, monkeypatch, transport).results:
         found = [c.name for c in result.checks if not c.passed] + list(result.leaks)
         assert not result.passed, f"{mutation.name}: {result.id} passed without its protection"
-        if not (mutation.crashes and result.error is not None):
-            assert result.error is None and found, f"{result.id}: error {result.error}"
+        if result.error is not None:
+            assert result.error in mutation.crashes, f"{result.id}: error {result.error}"
+        else:
+            assert found, f"{result.id}: failed without a failed check or leak"
         if mutation.must_fail is not None:
             assert any(mutation.must_fail in item for item in found), (result.id, found)
 

@@ -326,6 +326,9 @@ class Arena:
         self.gate: Gate = self.world.gate
         self.checks: list[Check] = []
         self._exposures: list[Exposure] = []
+        # What the leak detector found in worlds other than this one (file worlds), each
+        # checked against its own store before it closed.
+        self._other_leaks: list[str] = []
         self._engines: dict[str, PolicyEngine] = dict(self.world.engines)
         self._tools: dict[str, ToolAdapter] = default_tools()
         # The leak detector's reference: separate engine instances over the same bundles, so
@@ -569,13 +572,21 @@ class Arena:
         ]
 
     def leaks(self) -> list[str]:
-        """What the leak detector finds in the arena as it is now."""
-        return find_leaks(
+        """What the leak detector finds in the arena as it is now, and found in its file
+        worlds."""
+        found = find_leaks(
             store=self.store,
             engines=self._reference,
             events=self.sink.events,
             exposures=self._exposures,
         )
+        return found + [leak for leak in self._other_leaks if leak not in found]
+
+    def add_leaks(self, leaks: Iterable[str]) -> None:
+        """Record what the leak detector found in another world of this scenario."""
+        for leak in leaks:
+            if leak not in self._other_leaks:
+                self._other_leaks.append(leak)
 
     # Assertions. Each records one Check and returns whether it passed; none raises.
 
@@ -740,7 +751,7 @@ class Arena:
 
     def _saw(self, ctx: RunContext, outcome: Outcome) -> None:
         run_id = getattr(ctx, "run_id", None)
-        text = _visible_text(outcome)
+        text = visible_text(outcome)
         self._exposures.append(Exposure(run_id if isinstance(run_id, str) else None, text))
 
 
@@ -767,7 +778,7 @@ def describe(value: object) -> str:
     return type(value).__name__
 
 
-def _visible_text(outcome: Outcome) -> str:
+def visible_text(outcome: Outcome) -> str:
     """What the caller of the gate gets to see of an outcome, as the agent loop shows it."""
     if isinstance(outcome, Executed):
         return _dumps(outcome.content)
