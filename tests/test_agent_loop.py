@@ -24,6 +24,7 @@ from agentgate.agent.model import (
     Model,
     ModelError,
     ModelResponse,
+    ToolCall,
     ToolSpec,
     Usage,
 )
@@ -131,6 +132,33 @@ class BadCostModel:
             usage=Usage(1, 1),
             cost_usd=Decimal("-1"),
             stop_reason="end_turn",
+        )
+
+
+class StoppedModel:
+    """Proposes a call in a turn the provider stopped for `stop_reason`."""
+
+    def __init__(self, stop_reason: str) -> None:
+        self.stop_reason = stop_reason
+
+    @property
+    def name(self) -> str:
+        return "stopped"
+
+    def estimate_cost(
+        self, system: str, messages: Sequence[Message], tools: Sequence[ToolSpec]
+    ) -> Decimal:
+        return Decimal("0.01")
+
+    def complete(
+        self, system: str, messages: Sequence[Message], tools: Sequence[ToolSpec]
+    ) -> ModelResponse:
+        call = ToolCall("c1", "docs.search", {"query": "furnace"})
+        return ModelResponse(
+            message=AssistantMessage(text="Half an answer", tool_calls=(call,)),
+            usage=Usage(1, 1),
+            cost_usd=Decimal("0.001"),
+            stop_reason=self.stop_reason,
         )
 
 
@@ -649,3 +677,15 @@ def test_identical_runs_produce_identical_transcripts(user_id: str, task: str) -
     first, second = transcripts
     assert first.run_id != second.run_id
     assert _normalized(first) == _normalized(second)
+
+
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "refusal", "pause_turn", "unheard_of"])
+def test_a_turn_the_model_did_not_finish_ends_the_run_incomplete(
+    world: World, stop_reason: str
+) -> None:
+    ctx, transcript = run(world, "kc-staff-nadine", StoppedModel(stop_reason), "Help")
+    assert transcript.stop_reason == "incomplete"
+    assert transcript.final_text == "Half an answer"
+    # The cut-off turn's call never reached the gate.
+    assert [step.outcomes for step in transcript.steps] == [()]
+    assert [e.kind for e in world.events() if e.run_id == ctx.run_id] == [EventKind.RUN_STARTED]

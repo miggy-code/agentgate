@@ -331,7 +331,8 @@ def format_transcript(
     model_calls = len(transcript.steps)
     lines.append(f"  stop: {transcript.stop_reason} after {model_calls} model calls")
     if transcript.final_text is not None:
-        lines += wrap(f"final answer: {transcript.final_text}", 2, 4)
+        label = "final answer" if transcript.stop_reason == "final" else "last text"
+        lines += wrap(f"{label}: {transcript.final_text}", 2, 4)
     return lines
 
 

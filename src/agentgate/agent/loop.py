@@ -47,7 +47,12 @@ DEFAULT_SYSTEM = (
 )
 COMPANY_PLACEHOLDER = "{company}"
 
-StopReason = Literal["final", "max_steps", "cap_reached", "model_error"]
+StopReason = Literal["final", "incomplete", "max_steps", "cap_reached", "model_error"]
+
+# Provider stop reasons of a turn the model finished. Any other ("max_tokens", "refusal",
+# "pause_turn", or one this code does not know) ends the run as incomplete, and the turn's
+# tool calls, which may be cut off, are not run.
+_FINISHED_TURN = frozenset({"end_turn", "stop_sequence", "tool_use"})
 
 
 @dataclass(frozen=True)
@@ -119,7 +124,7 @@ def run_agent(
     company: str | None = None,
     max_steps: int = 12,
 ) -> AgentTranscript:
-    """Run one task to a final answer, a cap, a model error or max_steps.
+    """Run one task to a final answer, a cap, a model error, an incomplete turn or max_steps.
 
     `specs` is required: the gate keeps its engines and adapters private, so the caller,
     which built the gate, passes tool_specs(engine, tools) for the run's customer. A spec
@@ -180,6 +185,9 @@ def run_agent(
         message = response.message
         messages.append(message)
 
+        if response.stop_reason not in _FINISHED_TURN:
+            steps.append(AgentStep(response=response, outcomes=()))
+            return finish("incomplete", message.text)
         if not message.tool_calls:
             steps.append(AgentStep(response=response, outcomes=()))
             return finish("final", message.text)

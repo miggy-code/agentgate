@@ -48,6 +48,7 @@ What agentgate does not do, and where its guarantees stop. The README lists the 
 ## Testing
 
 - Most attack scenarios assume a fully compromised model proposing calls directly. The leak detector looks for exact canary tokens; a model that paraphrased, re-encoded or split a canary would not be caught by it, and public and internal documents carry no canary.
+- The Anthropic adapter defaults to `max_tokens` 2048, which thinking shares with the answer. A turn cut off there ends the run as `incomplete` and its tool calls are not run. A higher default would make each call's spend reservation (the full `max_tokens`, twice with fallbacks) exceed the shipped per-run caps.
 - No test, CI job or report in this repository calls the live Claude API. The Anthropic adapter is tested only with a fake client, and no result here comes from a real model.
 - Spend figures in the demo and the red-team suite come from a made-up mock price list (1 USD and 5 USD per million input and output tokens, 4 characters per token) and invented per-tool costs. They show the caps working, not what a real model would cost.
 - The red-team suite's MCP run uses the MCP SDK's in-memory transport. The stdio launch is covered by one test in `tests/test_gateway.py`, not by the suite.
