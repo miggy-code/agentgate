@@ -33,12 +33,13 @@ from agentgate.agent.loop import run_agent, tool_specs
 from agentgate.agent.mock import NaiveModel
 from agentgate.agent.model import Model
 from agentgate.approvals import Approval, ApprovalError, ApprovalStatus
-from agentgate.audit.base import AuditEvent, EventKind, MemorySink, ReferencedField
+from agentgate.audit.base import AuditEvent, EventKind, MemorySink, Reference, ReferencedField
 from agentgate.audit.panoptes import read_events, verify_log
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
 from agentgate.fixtures import FixtureError
-from agentgate.gate import IdentityError
+from agentgate.gate import GateReason, IdentityError, store_audit_reference
 from agentgate.models import Role, User, UserStatus
+from agentgate.policy.engine import Reason
 from agentgate.policy.schema import PolicyError
 from agentgate.policy.testing import load_policy_bundles, run_policy_tests
 from agentgate.policy.version import bundle_version, git_revision
@@ -321,6 +322,31 @@ def _event_line(event: AuditEvent) -> str:
     return "  ".join(parts)
 
 
+def _tenant_view(store: Store, event: AuditEvent) -> AuditEvent:
+    """The event as its own customer's readers see it.
+
+    A denial naming another customer's document is shown as a missing document is recorded:
+    its reason, id and args hash would otherwise tell a tenant which ids exist elsewhere.
+    """
+    if event.kind is not EventKind.DENY or event.reason != Reason.DOCUMENT_CUSTOMER_MISMATCH:
+        return event
+    if event.subject is None:
+        return event
+    # Every reference is the same keyed hash of its value, so an id the log already holds
+    # as a reference keeps it.
+    held = event.references.get("subject")
+    ref = held.ref if held is not None else store_audit_reference(store, event.subject)
+    return event.model_copy(
+        update={
+            "reason": GateReason.DOCUMENT_NOT_FOUND.value,
+            "subject": ref,
+            "rule_ids": (),
+            "details": {},
+            "references": {**event.references, "subject": Reference(ref=ref, why="unknown")},
+        }
+    )
+
+
 @audit_app.command("show")
 def audit_show(
     as_user: AsOption,
@@ -349,13 +375,15 @@ def audit_show(
 
     Owners and managers only. Read-only: neither file is changed. A value the log holds as a
     reference prints as its ref: and why ("unknown value": it named nothing the store knew).
+    A denial naming another customer's document prints as a missing document, as the model
+    was told; the log itself keeps the real reason for the operator.
     Run `agentgate audit verify` to check the chain itself."""
-    with _audit_reader(db, audit_db, as_user, owners_only=False) as (_, user, events):
+    with _audit_reader(db, audit_db, as_user, owners_only=False) as (store, user, events):
         # Another customer reads exactly like a missing one.
         if customer is not None and customer != user.customer_id:
             _fail(f"customer {customer!r} not found")
         shown = [
-            event
+            _tenant_view(store, event)
             for event in events
             if event.customer_id == user.customer_id
             and (run is None or event.run_id == run)

@@ -324,10 +324,7 @@ class Gate:
 
         Stable per store database, so an operator can ask whether a value was ever probed.
         """
-        digest = hmac.new(
-            self._audit_key, value.encode("utf-8", "surrogatepass"), hashlib.sha256
-        ).hexdigest()
-        return REFERENCE_PREFIX + digest[:REFERENCE_HEX]
+        return _reference(self._audit_key, value)
 
     @property
     def ledger(self) -> SpendLedger:
@@ -1492,6 +1489,16 @@ class Gate:
 
     def _get_approval(self, approval_id: object) -> Approval | None:
         return self._approvals.get(approval_id) if _lookupable(approval_id) else None
+
+
+def store_audit_reference(store: Store, value: str) -> str:
+    """The reference a gate on this store records for value, for readers without a gate."""
+    return _reference(_load_audit_key(store), value)
+
+
+def _reference(key: bytes, value: str) -> str:
+    digest = hmac.new(key, value.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+    return REFERENCE_PREFIX + digest[:REFERENCE_HEX]
 
 
 def _load_audit_key(store: Store) -> bytes:

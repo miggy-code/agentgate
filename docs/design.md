@@ -6,7 +6,7 @@ The README covers what agentgate is and how a call flows through it. This page h
 
 Search filters before it ranks. Each search asks the policy engine about every one of the customer's documents, from metadata only, never the body. Only documents the engine allows outright are searchable. BM25F then ranks the permitted set, with term statistics computed from that set alone, so forbidden documents do not shift scores. Each ranked result is checked again before it is returned; a disagreement is an invariant violation and the search returns nothing.
 
-A denied read looks like a missing document. Whether the id does not exist, belongs to another customer, or names a document the user may not read, the model is told `not_found`. The audit log keeps the real reason.
+A denied read looks like a missing document. Whether the id does not exist, belongs to another customer, or names a document the user may not read, the model is told `not_found`. The audit log keeps the real reason. `audit show`, which the customer's own owners and managers read, prints a denial naming another customer's document exactly as it prints a missing one (`document_not_found`, the id as an unknown reference, no args hash), so it cannot be used to find which ids exist elsewhere.
 
 ## Approvals
 

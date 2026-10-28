@@ -496,6 +496,29 @@ def test_audit_show_prints_the_customers_events(place: Place) -> None:
     assert events[1]["references"]["subject"]["why"] == "unknown"
 
 
+def test_audit_show_prints_a_foreign_document_like_a_missing_one(place: Place) -> None:
+    with place.open() as world:
+        ctx = world.gate.start_run(KC, "kc-staff-nadine")
+        for doc_id in ("jr-payroll-summary-2026", "jr-payroll-summary-2027"):
+            world.gate.call_tool(ctx, "docs.read", Action.READ, {"document_id": doc_id})
+        foreign_ref = world.gate.audit_reference("jr-payroll-summary-2026")
+    # The log keeps the real reason for the operator.
+    reasons = [e.reason for e in place.events() if e.kind is EventKind.DENY]
+    assert reasons == ["document_customer_mismatch", "document_not_found"]
+    result = place.cli("show", "--as", "kc-owner-dale", "--run", ctx.run_id, "--kind", "deny")
+    assert result.exit_code == 0, result.output
+    foreign, missing = result.stdout.splitlines()[:2]
+    assert "jr-payroll" not in result.stdout and "args_hash" not in result.stdout
+    assert f"subject={foreign_ref} (unknown value)" in foreign
+
+    def shape(line: str) -> list[str]:
+        return [part for part in line.split("  ")[1:] if not part.startswith("subject=")]
+
+    assert shape(foreign) == shape(missing)
+    shown = json.loads(place.cli("show", "--as", "kc-owner-dale", "--json").stdout)
+    assert "document_customer_mismatch" not in json.dumps(shown)
+
+
 def test_audit_show_refusals(place: Place) -> None:
     _flow(place)
     staff = place.cli("show", "--as", "kc-staff-nadine")
