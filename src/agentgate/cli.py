@@ -34,7 +34,7 @@ from agentgate.agent.mock import NaiveModel
 from agentgate.agent.model import Model
 from agentgate.approvals import Approval, ApprovalError, ApprovalStatus
 from agentgate.audit.base import AuditEvent, EventKind, MemorySink, ReferencedField
-from agentgate.audit.panoptes import PanoptesSink, read_events
+from agentgate.audit.panoptes import read_events, verify_log
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
 from agentgate.fixtures import FixtureError
 from agentgate.gate import IdentityError
@@ -190,19 +190,15 @@ def verify(
         "data/audit.db"
     ),
 ) -> None:
-    """Check the audit log's hash chain. Exits 1 if any stored event was changed."""
+    """Check the audit log's hash chain. Exits 1 if any stored event was changed, or any
+    event is outside the chain. Read-only: a snapshot of the file is verified."""
     try:
-        # create=False: a mistyped path must fail, not verify a new empty log.
-        sink = PanoptesSink(db, create=False)
-    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-        _fail(str(exc))
-    try:
-        result = sink.verify()
-        count = sink.count()
+        # A mistyped path fails here; nothing is created or changed.
+        result, count = verify_log(db)
     except sqlite3.Error as exc:
         _fail(_database_error(exc))
-    finally:
-        sink.close()
+    except (OSError, ValueError, RuntimeError) as exc:
+        _fail(str(exc))
     if result["valid"]:
         typer.echo(f"{db}  {count} events  chain intact")
         return
@@ -459,13 +455,9 @@ def audit_check_store(
     of the executed event that names it. Owners only; read-only."""
     with _audit_reader(db, audit_db, as_user, owners_only=True) as (store, user, events):
         try:
-            sink = PanoptesSink(audit_db, create=False)
+            verified, _ = verify_log(audit_db)
         except (OSError, ValueError, RuntimeError) as exc:
             _fail(str(exc))
-        try:
-            verified = sink.verify()
-        finally:
-            sink.close()
         if not verified["valid"]:
             typer.echo(f"{audit_db}  chain BROKEN: {verified['error']}")
             raise typer.Exit(code=1)

@@ -20,23 +20,36 @@ refused event raises AuditRejected, so the gate can tell it from a storage failu
 `read_events` reads a log back, read-only, as the AuditEvents it stores, in the order they
 were written: each referenced field holds its `ref:` reference, as stored. That is what
 `agentgate audit show` prints and what `agentgate audit check-store` compares the store with.
+Only rows Panoptes stored as agentgate decision events are read; another writer's row is
+skipped whatever its context holds.
+
+An agentgate log is chained from its first event, so verification also fails for events
+outside the chain: a log whose hashes were nulled and whose chain metadata was deleted would
+otherwise verify as a log that never had a chain. `verify_log` checks a private snapshot of
+the file, because Panoptes opens a log read-write (it migrates, re-anchors a chain whose
+metadata is missing, and sets file modes), and verification must not change what it checks.
 """
 
 import json
 import sqlite3
+import tempfile
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from panoptes.db import AuditDB
+from panoptes.db import AuditDB, ChainIntegrityError
 from panoptes.schema import ValidationError, validate_identifier
 
 from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, Reference
 
 # Panoptes needs a session and run id on every event; this marks events outside any run.
 NO_RUN = "no-run"
+
+# The Panoptes agent type and event type every agentgate event is stored under.
+AGENT_TYPE = "agentgate"
+EVENT_TYPE = "decision_point"
 
 # Panoptes event schema version these events are written against. Version 4 is the first
 # that accepts agent type "agentgate" and outcome status "pending".
@@ -83,8 +96,8 @@ def to_panoptes_event(event: AuditEvent) -> dict[str, Any]:
     mapped: dict[str, Any] = {
         "event_id": event.event_id,
         "timestamp": event.timestamp.astimezone(UTC).isoformat(),
-        "event_type": "decision_point",
-        "agent": {"type": "agentgate", "session_id": run_id, "run_id": run_id},
+        "event_type": EVENT_TYPE,
+        "agent": {"type": AGENT_TYPE, "session_id": run_id, "run_id": run_id},
         "action": {
             "tool_name": event.tool or event.kind.value,
             "parameters": {"action": _value(event.action), "subject": event.subject},
@@ -171,8 +184,19 @@ class PanoptesSink:
             raise AuditRejected("Panoptes refused the event") from exc
 
     def verify(self) -> dict[str, Any]:
-        """Panoptes' chain verification result; result["valid"] is True when intact."""
-        result: dict[str, Any] = self._db.verify_chain()
+        """Panoptes' chain verification result; result["valid"] is True when intact.
+
+        Stricter than Panoptes alone: every stored event must be on the chain, since
+        agentgate starts its logs empty. Events outside it mean the chain was stripped.
+        """
+        result: dict[str, Any] = dict(self._db.verify_chain())
+        if not result["valid"]:
+            return result
+        if not result.get("initialized"):
+            return _broken(result, "events exist but the hash chain is not initialized")
+        outside = result.get("legacy_event_count") or 0
+        if outside:
+            return _broken(result, f"{outside} events are outside the hash chain")
         return result
 
     def count(self) -> int:
@@ -185,39 +209,90 @@ class PanoptesSink:
         self._db.close()
 
 
+def _broken(result: dict[str, Any], error: str) -> dict[str, Any]:
+    return {**result, "valid": False, "error": error, "broken_event_id": None}
+
+
+def verify_log(db_path: str | Path) -> tuple[dict[str, Any], int]:
+    """Verify the log at db_path without writing to it, and count its events.
+
+    Raises FileNotFoundError for a missing file and ValueError for a file that is not a
+    Panoptes log. A log Panoptes refuses to open for its chain is reported as broken.
+    """
+    path = Path(db_path)
+    _check_existing(path)
+    with tempfile.TemporaryDirectory(prefix="agentgate-verify-") as tmp:
+        copy = Path(tmp) / "audit.db"
+        source = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            target = sqlite3.connect(copy)
+            try:
+                # The backup API reads through SQLite, so the snapshot includes the WAL.
+                source.backup(target)
+                total, unchained = _chain_presence(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+        if total and unchained:
+            # Checked before Panoptes opens the copy, which would start a new chain here.
+            error = "events exist but the hash chain is not initialized"
+            return {"valid": False, "error": error, "broken_event_id": None}, total
+        try:
+            sink = PanoptesSink(copy, create=False)
+        except ChainIntegrityError as exc:
+            return {"valid": False, "error": str(exc), "broken_event_id": None}, total
+        try:
+            return sink.verify(), sink.count()
+        finally:
+            sink.close()
+
+
+def _chain_presence(conn: sqlite3.Connection) -> tuple[int, bool]:
+    """How many events the log holds, and whether its chain metadata is missing."""
+    (total,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+    has_meta = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chain_meta'"
+    ).fetchone()
+    if has_meta is None:
+        return int(total), True
+    (meta,) = conn.execute("SELECT COUNT(*) FROM chain_meta").fetchone()
+    return int(total), meta == 0
+
+
 def read_events(db_path: str | Path) -> list[AuditEvent]:
     """Every agentgate event in the Panoptes log at db_path, oldest first, as stored.
 
     Opens the file read-only and writes nothing. Raises FileNotFoundError for a missing file,
     ValueError for a file that is not a Panoptes log or a row that is not a well-formed
-    agentgate event. Rows Panoptes holds for other agents are skipped. This does not verify
-    the chain; PanoptesSink.verify does.
+    agentgate event. Rows Panoptes holds for other agents, or that are not decision events,
+    are skipped. This does not verify the chain; verify_log does.
     """
     path = Path(db_path)
     _check_existing(path)
     conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     try:
+        # Filtered on Panoptes' own columns: any writer can put an "agentgate" key in its
+        # context, but only agentgate's events carry its agent type.
         rows = conn.execute(
-            "SELECT event_id, timestamp, action, context FROM events ORDER BY rowid"
+            "SELECT event_id, timestamp, action, context FROM events"
+            " WHERE agent_type = ? AND event_type = ? ORDER BY rowid",
+            (AGENT_TYPE, EVENT_TYPE),
         ).fetchall()
     finally:
         conn.close()
     events: list[AuditEvent] = []
     for event_id, timestamp, action, context in rows:
-        event = _stored_event(str(event_id), str(timestamp), action, context)
-        if event is not None:
-            events.append(event)
+        events.append(_stored_event(str(event_id), str(timestamp), action, context))
     return events
 
 
 def _stored_event(
     event_id: str, timestamp: str, action_json: object, context_json: object
-) -> AuditEvent | None:
+) -> AuditEvent:
     try:
         context = json.loads(str(context_json))
-        fields = context.get("agentgate") if isinstance(context, dict) else None
-        if fields is None:
-            return None
+        fields = context["agentgate"]
         action = json.loads(str(action_json))
         parameters = action.get("parameters") or {}
         values: dict[str, Any] = {

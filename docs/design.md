@@ -275,7 +275,7 @@ uv run agentgate audit verify [--db data/audit.db]
 
 No approvals command queues an approval. A pending approval comes from an agent run against an on-disk world: the host calls `call_tool` as in the integration sample and a call that needs approval returns `PendingApproval`, or an MCP client calls a tool through `agentgate gateway serve`, which uses the same files by default. `agentgate agent run` uses a fresh in-memory world that is discarded when it exits, so an approval it creates cannot be decided afterwards. After approval, the requester's run executes the call through `gate.execute_approved`, or over MCP through `approvals_execute` on the same gateway connection.
 
-`agentgate audit verify` checks the Panoptes hash chain and prints `<path>  N events  chain intact`, or `chain BROKEN: ...` and exits 1. It has no checkpoint option; see [Limits](limits.md).
+`agentgate audit verify` checks the Panoptes hash chain and prints `<path>  N events  chain intact`, or `chain BROKEN: ...` and exits 1. An agentgate log is chained from its first event, so events outside the chain (a log whose hashes were nulled and chain metadata deleted) also fail. It verifies a private snapshot of the file and never writes to it. It has no checkpoint option; see [Limits](limits.md).
 
 ## Optional real model
 

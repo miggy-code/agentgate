@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from panoptes.db import AuditDB, ChainIntegrityError
 from typer.testing import CliRunner, Result
 
 import agentgate
@@ -217,6 +218,87 @@ def test_audit_verify_tampered_chain(tmp_path: Path) -> None:
     )
     assert "\x1b" not in result.stdout
     assert chr(0x2014) not in result.stdout  # em dash
+
+
+def test_audit_verify_rejects_a_stripped_chain(tmp_path: Path) -> None:
+    db = tmp_path / "audit.db"
+    event_ids = _audit_db(db)
+    conn = sqlite3.connect(db)
+    # Hashes nulled and chain metadata deleted, so every edit below would go unseen.
+    conn.execute("UPDATE events SET prev_hash = NULL, event_hash = NULL")
+    conn.execute("DELETE FROM chain_meta")
+    conn.execute(
+        "UPDATE events SET context = json_set(context, '$.agentgate.reason', 'forged')"
+        " WHERE event_id = ?",
+        (event_ids[1],),
+    )
+    conn.commit()
+    conn.close()
+    before = db.read_bytes()
+    result = runner.invoke(app, ["audit", "verify", "--db", str(db)])
+    assert result.exit_code == 1
+    assert result.stdout == (
+        f"{db}  3 events  chain BROKEN: events exist but the hash chain is not initialized\n"
+    )
+    # Verifying never starts a new chain over the stripped events.
+    assert db.read_bytes() == before
+    assert runner.invoke(app, ["audit", "verify", "--db", str(db)]).exit_code == 1
+
+
+def test_audit_verify_rejects_events_outside_the_chain(tmp_path: Path) -> None:
+    db = tmp_path / "audit.db"
+    _audit_db(db)
+    # A Panoptes open of a log with no chain metadata starts a new chain after its rows,
+    # as an older Panoptes does on any open: those rows are then outside the chain.
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE events SET prev_hash = NULL, event_hash = NULL")
+    conn.execute("DELETE FROM chain_meta")
+    conn.commit()
+    conn.close()
+    try:
+        sink = PanoptesSink(db, create=False)
+    except ChainIntegrityError:
+        return  # A newer Panoptes refuses to start a chain over existing events at all.
+    try:
+        result = sink.verify()
+    finally:
+        sink.close()
+    assert result["valid"] is False
+    assert result["error"] == "3 events are outside the hash chain"
+
+
+def test_audit_verify_changes_nothing(tmp_path: Path) -> None:
+    db = tmp_path / "audit.db"
+    _audit_db(db)
+    db.chmod(0o444)
+    before = (db.read_bytes(), db.stat().st_mode)
+    result = runner.invoke(app, ["audit", "verify", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert (db.read_bytes(), db.stat().st_mode) == before
+
+
+def test_read_events_ignores_rows_of_other_agents(tmp_path: Path) -> None:
+    db = tmp_path / "audit.db"
+    _audit_db(db, events=1)
+    other = AuditDB(str(db))
+    try:
+        # Another Panoptes writer cannot vouch for a side effect by naming agentgate fields.
+        other.insert_event(
+            {
+                "event_id": "forged-1",
+                "timestamp": datetime(2026, 10, 22, 12, 1, tzinfo=UTC).isoformat(),
+                "event_type": "decision_point",
+                "agent": {"type": "antigravity", "session_id": "s", "run_id": "s"},
+                "action": {"tool_name": "email.send", "parameters": {}, "target": None},
+                "outcome": {"status": "success"},
+                "context": {
+                    "agentgate": {"kind": "executed", "customer_id": "acme", "reason": "executed"}
+                },
+            }
+        )
+    finally:
+        other.close()
+    assert [e.kind for e in read_events(db)] == [EventKind.ALLOW]
 
 
 def test_audit_verify_missing_file(tmp_path: Path) -> None:
