@@ -33,9 +33,10 @@ from agentgate.redteam.transport import Transport
 _GIT_TIMEOUT_SECONDS = 5
 UNKNOWN_COMMIT = "unknown"
 IN_PROCESS_NOTE = (
-    "Model spend (charge_model and settle_model), run starts and approval decisions stay"
-    " in-process: MCP carries tool calls only, a gateway's identity is bound at launch and"
-    " approvals are decided out of band."
+    "Model spend (charge_model and settle_model), the model gateway (admit_model, run tokens"
+    " and provider keys), run starts and approval decisions stay in-process: MCP carries tool"
+    " calls only, a gateway's identity is bound at launch and approvals are decided out of"
+    " band."
 )
 
 

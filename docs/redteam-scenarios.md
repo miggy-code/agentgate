@@ -20,7 +20,8 @@ defined in `src/agentgate/redteam/scenarios/examples.py` and count in the suite.
 | [identity_spoofing](#identity_spoofing) | 16 |
 | [fail_closed](#fail_closed) | 17 |
 | [audit_integrity](#audit_integrity) | 19 |
-| [benign_control](#benign_control) | 20 |
+| [model_boundary](#model_boundary) | 21 |
+| [benign_control](#benign_control) | 21 |
 
 ## cross_tenant
 
@@ -205,6 +206,34 @@ Tries to leave a decision unrecorded, recorded without its deciding rule or cap,
 | ai-023 | Operator suspensions, sweeps and fixture changes are on the chain | 11 |
 | ai-024 | Decision events carry args hashes, counts and amounts, never the values | 16 |
 
+## model_boundary
+
+A run's request to a model, and the keys, tokens and spend behind the model gateway: a model outside the policy's allowlist, a request outside its envelope or readable two ways, a token of another run or of a suspended user, a leaked key, a client credential that reaches the provider, and caps that are raced, widened or left behind by a killed proxy. These scenarios and `bn-020` were added after the report the other tables come from; their check counts come from `uv run agentgate redteam` when they were added. They call the gate, the token store and the key helpers directly, so they are in-process under both transports.
+
+| Id | Scenario | Checks |
+| --- | --- | ---: |
+| mb-001 | A model outside the allowlist is denied, near misses included | 27 |
+| mb-002 | A model swapped in mid-run is denied | 8 |
+| mb-003 | An output limit above the envelope, or none at all, is denied | 21 |
+| mb-004 | More than one completion is denied | 20 |
+| mb-005 | An oversized request body is denied | 12 |
+| mb-006 | A body that could be read two ways is denied, not guessed at | 54 |
+| mb-007 | A role the entry does not list, or a customer with no models, is denied | 10 |
+| mb-008 | A run's suspended user can neither use a token nor get a model call | 7 |
+| mb-009 | A token of another run, user or customer, or a forged one, is refused | 13 |
+| mb-010 | A revoked, expired or ended token is refused | 10 |
+| mb-011 | Only a hash of a token is stored, and a listing never shows one | 4 |
+| mb-012 | A provider key never appears in an error, a printout or an echoed reply | 11 |
+| mb-013 | A client's own credentials are stripped and the provider's is the only one sent | 13 |
+| mb-014 | Concurrent model calls cannot jointly pass the run's cap | 4 |
+| mb-015 | Command-line caps tighten the policy and never widen it | 9 |
+| mb-016 | After the cap every model call is refused and nothing more is reserved | 6 |
+| mb-017 | A call the provider refused is released, and an unpriced reply settles in full | 8 |
+| mb-018 | A reservation covers the worst case, and an unpriced model is denied | 12 |
+| mb-019 | A forged correlation id is recorded as asserted, never trusted | 11 |
+| mb-020 | A model call whose allow cannot be recorded is not admitted | 6 |
+| mb-021 | Reservations left by a killed proxy are released when the store next opens | 5 |
+
 ## benign_control
 
 Not an attack. Ordinary tasks that must still succeed, so a gate that denied everything would fail this category.
@@ -231,3 +260,4 @@ Not an attack. Ordinary tasks that must still succeed, so a gate that denied eve
 | bn-017 | Staff write internal notes in both companies | 5 |
 | bn-018 | A naive agent answers an ordinary staff question | 5 |
 | bn-019 | A day of ordinary runs stays under the daily cap | 23 |
+| bn-020 | Model calls of every allowed role go through, are settled and can be retried | 26 |
