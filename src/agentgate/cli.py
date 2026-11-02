@@ -1,6 +1,6 @@
 """The agentgate command line: policy lint and test, audit verify, the approval queue, users,
-the spend ledger, the demo, one-off agent runs, the MCP gateway, the red-team suite and the
-latency bench.
+the spend ledger, model-gateway run tokens, the demo, one-off agent runs, the MCP gateway, the
+red-team suite and the latency bench.
 
 Output is plain, deterministic text (customers sorted, cases in file order, no colour), so
 it reads the same in a terminal, a CI log and a diff. Problems that stop a command go to
@@ -33,11 +33,27 @@ from agentgate.agent.loop import run_agent, tool_specs
 from agentgate.agent.mock import NaiveModel
 from agentgate.agent.model import Model
 from agentgate.approvals import Approval, ApprovalError, ApprovalStatus
-from agentgate.audit.base import AuditEvent, EventKind, MemorySink, Reference, ReferencedField
+from agentgate.audit.base import (
+    AuditEvent,
+    EventKind,
+    MemorySink,
+    OperatorAction,
+    Reference,
+    ReferencedField,
+)
 from agentgate.audit.panoptes import read_events, verify_log
+from agentgate.context import RunContext
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
 from agentgate.fixtures import FixtureError
 from agentgate.gate import GateReason, IdentityError, store_audit_reference
+from agentgate.model.tokens import (
+    DEFAULT_TTL,
+    MAX_TTL,
+    TokenError,
+    TokenRecord,
+    TokenStore,
+    write_token_file,
+)
 from agentgate.models import Role, User, UserStatus
 from agentgate.policy.engine import Reason
 from agentgate.policy.schema import PolicyError
@@ -104,6 +120,11 @@ users_app = typer.Typer(
 app.add_typer(users_app, name="users")
 spend_app = typer.Typer(help="Operate the spend ledger.", no_args_is_help=True)
 app.add_typer(spend_app, name="spend")
+token_app = typer.Typer(
+    help="Issue, list and revoke run tokens for the model gateway. --as names the acting user.",
+    no_args_is_help=True,
+)
+app.add_typer(token_app, name="token")
 
 PoliciesOption = Annotated[
     Path, typer.Option("--policies", help="Directory holding one folder per customer policy.")
@@ -895,6 +916,170 @@ def spend_release_stale(
         owner = _owner(world, as_user)
         released = world.gate.release_stale(timedelta(minutes=older_than), actor=owner)
     typer.echo(f"released {released} stale reservations older than {older_than} minutes")
+
+
+# token
+
+
+def _active_user(world: World, user_id: str) -> User:
+    user = world.store.get_user(user_id)
+    if user is None:
+        _fail(f"unknown user {user_id!r}")
+    if user.status is not UserStatus.ACTIVE:
+        _fail(f"user {user_id!r} is not active")
+    return user
+
+
+def _may_manage(user: User, run: RunContext | None) -> bool:
+    """Whether the acting user may manage tokens of this run: their own run, or any run of
+    their customer if they own it. Another customer's run reads like a missing one."""
+    if run is None or run.customer_id != user.customer_id:
+        return False
+    return run.user_id == user.id or user.role is Role.OWNER
+
+
+def _record_token(world: World, user: User, action: OperatorAction, token: TokenRecord) -> None:
+    world.gate.record_operator_action(
+        action,
+        customer_id=user.customer_id,
+        actor=user,
+        target=token.token_id,
+        details={"run_id": token.run_id, "expires_at": token.expires_at.isoformat()},
+    )
+
+
+def _token_line(record: TokenRecord, now: datetime) -> str:
+    if record.revoked_at is not None:
+        status = f"revoked ({record.revoked_reason})"
+    elif now >= record.expires_at:
+        status = "expired"
+    else:
+        status = "live"
+    return (
+        f"{record.token_id}  run {record.run_id}  {status}"
+        f"  issued {_time(record.issued_at)}  expires {_time(record.expires_at)}"
+    )
+
+
+@token_app.command("issue")
+def token_issue(
+    as_user: AsOption,
+    run: Annotated[str, typer.Option("--run", metavar="RUN_ID", help="The run the token is for.")],
+    ttl_minutes: Annotated[
+        int,
+        typer.Option(
+            "--ttl-minutes",
+            min=1,
+            max=int(MAX_TTL.total_seconds() // 60),
+            help="How long the token lives, at most. It also dies with its run.",
+        ),
+    ] = int(DEFAULT_TTL.total_seconds() // 60),
+    token_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--token-file",
+            help="Write the token to this new file (mode 0600) instead of printing it.",
+        ),
+    ] = None,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Issue a token for a run of the acting user, or of their customer if they own it.
+
+    The token is shown once, on stdout or in --token-file; only its hash is stored. The issue
+    is recorded in the audit log, and a token whose issue cannot be recorded does not exist."""
+    with _world(db, audit_db, policies, fixtures) as world:
+        user = _active_user(world, as_user)
+        tokens = TokenStore(world.store, world.clock)
+        found = tokens.run(run)
+        if not _may_manage(user, found):
+            _fail(f"run {run!r} not found")
+
+        try:
+            issued = tokens.issue(
+                run,
+                timedelta(minutes=ttl_minutes),
+                record=lambda made: _record_token(world, user, OperatorAction.TOKEN_ISSUED, made),
+            )
+        except TokenError as exc:
+            _fail(str(exc))
+        if token_file is not None:
+            try:
+                write_token_file(token_file, issued.token)
+            except OSError as exc:
+                # Nothing holds the token, so it must not stay live.
+                tokens.revoke(
+                    issued.record.token_id,
+                    record=lambda gone: _record_token(
+                        world, user, OperatorAction.TOKEN_REVOKED, gone
+                    ),
+                )
+                _fail(f"cannot write {token_file}: {exc.strerror}")
+    typer.echo(
+        f"issued {issued.record.token_id} for run {run}, expires {_time(issued.record.expires_at)}",
+        err=token_file is None,
+    )
+    if token_file is None:
+        typer.echo(issued.token)
+    else:
+        typer.echo(f"token written to {token_file}")
+
+
+@token_app.command("revoke")
+def token_revoke(
+    token_id: Annotated[str, typer.Argument(metavar="TOKEN_ID", help="The token to revoke.")],
+    as_user: AsOption,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Revoke a live token of a run of the acting user, or of their customer if they own it."""
+    with _world(db, audit_db, policies, fixtures) as world:
+        user = _active_user(world, as_user)
+        tokens = TokenStore(world.store, world.clock)
+        record = tokens.get(token_id)
+        if record is None or not _may_manage(user, tokens.run(record.run_id)):
+            _fail(f"token {token_id!r} not found")
+
+        revoked = tokens.revoke(
+            token_id,
+            record=lambda gone: _record_token(world, user, OperatorAction.TOKEN_REVOKED, gone),
+        )
+        if not revoked:
+            _fail(f"token {token_id!r} is already revoked")
+    typer.echo(f"revoked {token_id}")
+
+
+@token_app.command("list")
+def token_list(
+    as_user: AsOption,
+    run: Annotated[
+        str | None, typer.Option("--run", metavar="RUN_ID", help="Only this run's tokens.")
+    ] = None,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """List the tokens of the acting user's runs, or of every run of their customer if they
+    own it: id, run, status and times. Never the token itself."""
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
+        user = _active_user(world, as_user)
+        tokens = TokenStore(world.store, world.clock)
+        now = world.clock.now()
+        shown: dict[str, bool] = {}
+        lines: list[str] = []
+        for record in tokens.list_tokens(run):
+            if record.run_id not in shown:
+                shown[record.run_id] = _may_manage(user, tokens.run(record.run_id))
+            if shown[record.run_id]:
+                lines.append(_token_line(record, now))
+    for line in lines:
+        typer.echo(line)
+    typer.echo(f"{len(lines)} tokens")
 
 
 # demo

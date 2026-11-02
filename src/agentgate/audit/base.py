@@ -55,6 +55,8 @@ class OperatorAction(StrEnum):
     USER_SUSPENDED = "user_suspended"
     USER_REINSTATED = "user_reinstated"
     STALE_RESERVATIONS_RELEASED = "stale_reservations_released"
+    TOKEN_ISSUED = "token_issued"
+    TOKEN_REVOKED = "token_revoked"
 
 
 # The fields of an event that can hold a caller's value, and so can be referenced.
