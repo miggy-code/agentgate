@@ -103,10 +103,12 @@ from agentgate.audit.base import (
 from agentgate.audit.panoptes import storable_identifier
 from agentgate.clock import Clock
 from agentgate.context import RunContext
+from agentgate.model.admission import Caps, ModelCall
+from agentgate.model.pricing import RateTable
 from agentgate.models import Action, Customer, Role, Tool, User, UserStatus
 from agentgate.policy.addresses import parse_address
-from agentgate.policy.engine import DocumentFacts, PolicyEngine, Reason, Request
-from agentgate.policy.schema import Effect, Policy
+from agentgate.policy.engine import DocumentFacts, ModelRequest, PolicyEngine, Reason, Request
+from agentgate.policy.schema import Effect, Policy, SpendLimits
 from agentgate.retrieval import DocumentIndex, RetrievalInvariantError, RetrievalResult
 from agentgate.spend import CapHit, CapKind, Reservation, SpendLedger
 from agentgate.store import Store
@@ -153,6 +155,8 @@ _APPROVAL_ID = re.compile(r"^apr_[A-Za-z0-9_-]{1,64}$")
 # A tool's effect_ref goes into events as written only in this id shape; anything else is
 # recorded as a reference.
 _EFFECT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+# A correlation id a client sent goes into events as written only in this shape.
+_CORRELATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # IN lists of the stale sweep's follow-up query are sent in chunks of this many ids.
 _ID_CHUNK = 500
 # Customer id for audit events about a caller that matches no customer at all.
@@ -183,6 +187,10 @@ class GateReason(StrEnum):
     # An internal recipient may not read the most sensitive label the run has seen.
     ESCALATED_RECIPIENT_CLEARANCE = "escalated_recipient_clearance"
     AUDIT_UNAVAILABLE = "audit_unavailable"
+    # A model request whose body could not be read strictly (see model.admission).
+    MODEL_REQUEST_INVALID = "model_request_invalid"
+    # The policy reserves a computed worst case and the rate table cannot give one.
+    MODEL_UNPRICED = "model_unpriced"
     TOOL_ERROR = "tool_error"
     RETRIEVAL_FILTER = "retrieval_filter"
     RETRIEVAL_INVARIANT = "retrieval_invariant"
@@ -619,6 +627,119 @@ class Gate:
             raise ValueError("reservation belongs to another run")
         self._ledger.settle(reservation, actual_usd)
 
+    def release_model(self, ctx: RunContext, reservation: Reservation) -> None:
+        """Give back the reservation of a model call that was not billed: the provider
+        answered with an error, or the client went away before it did. The money and the
+        call both return to the run, as for any release (SpendLedger.release)."""
+        if reservation.run_id != ctx.run_id:
+            raise ValueError("reservation belongs to another run")
+        self._ledger.release(reservation)
+
+    def admit_model(
+        self,
+        ctx: RunContext,
+        call: ModelCall,
+        *,
+        rates: RateTable | None = None,
+        caps: Caps | None = None,
+    ) -> Reservation | Denied | CapReached:
+        """Decide a model request for the run and, if allowed, reserve its worst-case cost.
+
+        In order: the run and its user are checked as for a tool call; a body that could not
+        be read strictly is denied; the policy's models section decides (deny by default,
+        exact model, role, output limit, one completion, body size); the reservation is
+        priced from the rate table, or is the policy's fixed `reserve`; the run's caps, as
+        tightened by `caps`, and the customer's day cap are checked; and the allow is
+        recorded before the reservation is handed back. A model the table does not price is
+        denied unless the policy sets a fixed reserve. If the allow cannot be recorded the
+        reservation is released and the call is denied.
+
+        The caller settles the reservation (`settle_model`) or releases it (`release_model`)
+        once the provider has answered.
+        """
+        base = self._begin(ctx, None, None)
+        run = self._check_run(ctx, base)
+        if isinstance(run, Denied):
+            return run
+        asked = _bind(base, run)
+        values = _model_values(self, call)
+        if not call.valid:
+            return self._deny(asked, GateReason.MODEL_REQUEST_INVALID, details=values)
+
+        decision = run.engine.decide_model(
+            ModelRequest(
+                customer_id=run.ctx.customer_id,
+                role=run.ctx.role,
+                provider=call.provider,
+                model=call.model,
+                max_tokens=call.max_tokens,
+                n=call.n,
+                request_bytes=call.request_bytes,
+            )
+        )
+        listed = run.engine.model_entry(call.provider, call.model) is not None
+        # A model name is the caller's value: it is shown as written only if the policy lists it.
+        subject = call.model or None
+        unknown = None if listed else subject
+        if decision.effect is not Effect.ALLOW:
+            return self._deny(
+                asked,
+                decision.reason.value,
+                subject=subject,
+                unknown_subject=unknown,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                details=values,
+            )
+
+        models = run.policy.models
+        assert models is not None and call.max_tokens is not None  # an allow implies both
+        if isinstance(models.reserve, Decimal):
+            amount: Decimal | None = models.reserve
+        else:
+            amount = (
+                None
+                if rates is None
+                else rates.worst_case_usd(call.model, call.max_tokens, call.request_bytes)
+            )
+            if rates is not None:
+                values["rate_table_version"] = rates.version
+        if amount is None:
+            return self._deny(
+                asked,
+                GateReason.MODEL_UNPRICED,
+                subject=subject,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                details=values,
+            )
+
+        limits = run.policy.spend if caps is None else caps.tighten(run.policy.spend)
+        reserved = self._reserve(run, asked, amount, details=values, limits=limits)
+        if isinstance(reserved, CapReached):
+            return reserved
+        try:
+            # The allow is on record before the request is forwarded, or it is not forwarded.
+            self._emit(
+                asked,
+                EventKind.ALLOW,
+                decision.reason.value,
+                subject=subject,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                decision=True,
+                details={
+                    **values,
+                    "reserved_usd": str(amount),
+                    "reserve": "fixed" if isinstance(models.reserve, Decimal) else "computed",
+                    "reservation_id": reserved.id,
+                },
+            )
+        except Exception:
+            self._ledger.release(reserved)
+            return Denied(GateReason.AUDIT_UNAVAILABLE.value)
+        return reserved
+
     # Policies and operator actions
 
     def record_policy_loaded(
@@ -1018,12 +1139,13 @@ class Gate:
         call: _Call,
         amount: Decimal,
         details: dict[str, JsonValue] | None = None,
+        limits: SpendLimits | None = None,
     ) -> Reservation | CapReached:
         reserved = self._ledger.reserve(
             customer=run.customer,
             run_id=run.ctx.run_id,
             amount_usd=amount,
-            limits=run.policy.spend,
+            limits=run.policy.spend if limits is None else limits,
         )
         if isinstance(reserved, Reservation):
             return reserved
@@ -1674,6 +1796,27 @@ def _refusal_details(details: Mapping[str, JsonValue] | None) -> dict[str, JsonV
             raise ValueError(f"refusal detail {key} must be a list of strings")
         checked[key] = [*sorted(str(item) for item in value)]
     return checked
+
+
+def _model_values(gate: Gate, call: ModelCall) -> dict[str, JsonValue]:
+    """What the events of a model call record about it: counts and ids, never the request's
+    text. The correlation id is the client's claim, so it is recorded as asserted and only
+    in a plain shape; any other is recorded as a reference."""
+    values: dict[str, JsonValue] = {
+        "source": "model",
+        "provider": call.provider.value,
+        "request_bytes": call.request_bytes,
+    }
+    if call.valid:
+        values["max_tokens"] = call.max_tokens
+        values["n"] = call.n
+    asserted = call.correlation_id
+    if asserted is not None:
+        if _CORRELATION_ID.fullmatch(asserted) and storable_identifier(asserted):
+            values["asserted_correlation_id"] = asserted
+        else:
+            values["asserted_correlation_ref"] = gate.audit_reference(asserted)
+    return values
 
 
 def _model_reason(reason: str) -> str:
