@@ -267,6 +267,17 @@ total  126/126 passed
 
 Both outputs are from commit `87a4801`.
 
+## Model gateway
+
+agentgate also decides what a run may ask of a model. Most of it is built; the HTTP proxy that puts it in front of a provider is not (see [Limits](limits.md#model-gateway)). The pieces are in `src/agentgate/model/` and `Gate.admit_model`:
+
+- **Keys** (`model/keys.py`). Provider keys are loaded once from an owner-only JSON file (`{"openai_compatible": "..."}`) or from `AGENTGATE_<PROVIDER>_API_KEY` variables, and held only in the agentgate process. An error names the provider and the path, never a value, and a parser error is never chained to it. The key object prints without its values, cannot be pickled, and `redact` removes a key from text that is on its way out. Every client credential (`Authorization`, `x-api-key`, `x-goog-api-key`, `api-key`, `Cookie`, `Proxy-Authorization`, and a `key`, `api_key`, `apikey` or `access_token` query parameter, whatever its case or encoding) is stripped before the provider's own is added.
+- **Tokens** (`model/tokens.py`). An agent holds a token, never a key. A token is bound to one agentgate run, stored only as a hash, and refused when it is unknown, revoked or expired, when it belongs to another run than the one served, and when its run's user is unknown, of another customer or suspended. It dies with its run (`end_run` revokes every token of a run) or at its lifetime, 8 hours by default and 30 days at most. A run holds at most 16 live tokens. Two different credentials in one request are ambiguous and refused.
+- **The decision** (`Gate.admit_model`). In order: the run and its user are checked as for a tool call; the body is read strictly (`model/admission.py`: one JSON object, no repeated key, whole-number limits, the largest declared output limit counts) and one that cannot be is denied `model_request_invalid`; the policy's `models:` entry decides; the reservation is priced; the caps are checked; and the allow is recorded before the reservation is returned. If the allow cannot be recorded the reservation is released and the call is denied `audit_unavailable`. A model name the policy does not list is recorded only as a keyed reference. A correlation id the client sent is recorded as `asserted_correlation_id` only in a plain identifier shape, otherwise as a reference, and never decides who the run is.
+- **The reservation** (`model/pricing.py`). The worst case of a call is its declared `max_tokens` at the output rate plus the prompt, estimated at one token per 4 bytes of body, at the dearer of the input and cached-input rates, rounded up to a micro-dollar. Rates come from a versioned JSON table in the format Panoptes uses to price observed responses (`{"version", "source", "currency": "USD", "models": {name: {input_per_million, cached_input_per_million, output_per_million}}}`). A model the table does not name has no price, and the call is denied `model_unpriced` unless the policy sets a fixed `reserve`, which is then reserved instead. The reservation goes through the same ledger as every tool call, so tool and model spend share the run and customer-day caps, and a call counts toward `max_calls_per_run`.
+- **Caps** (`Caps`). A process serving one run may lower the run's USD cap and call cap and never raise them: the policy's value is the ceiling.
+- **After the call.** The caller settles the reservation with the cost (`settle_model`), at the full reservation if the reply cannot be priced, or releases it (`release_model`) if the provider refused the call or the client went away. A reservation a killed process left open is released by the stale sweep the next time a world opens.
+
 ## Latency
 
 From `uv run agentgate bench` at commit `05456e9` (2000 timed iterations after 200 warmup, times in microseconds). Machine: Apple M4 Pro, 12 CPUs, macOS 15.7.3, Python 3.12.12, with desktop apps running (load average about 4). The store is in-memory SQLite.
@@ -294,6 +305,9 @@ uv run agentgate users list --as kc-owner-dale
 uv run agentgate users suspend kc-staff-nadine --as kc-owner-dale --reason investigation
 uv run agentgate users reinstate kc-staff-nadine --as kc-owner-dale --reason resolved
 uv run agentgate spend release-stale --as kc-owner-dale [--older-than 15]
+uv run agentgate token issue --as kc-staff-nadine --run <RUN_ID> [--ttl-minutes 480] [--token-file run.token]
+uv run agentgate token list --as kc-staff-nadine [--run <RUN_ID>]
+uv run agentgate token revoke <TOKEN_ID> --as kc-staff-nadine
 uv run agentgate audit show --as kc-mgr-terrence [--run <RUN_ID>] [--kind deny] [--limit 20] [--json]
 uv run agentgate audit policy sha256:66ca6bb217693239 --as kc-mgr-terrence
 uv run agentgate audit check-store --as kc-owner-dale
@@ -305,6 +319,8 @@ uv run agentgate audit verify [--db data/audit.db]
 `approvals list` and `show` only show the acting approver's customer, and `show` prints the exact arguments that would run. Neither changes an approval: one past its expiry shows as `expired (pending sweep)`, and counts as expired for `--status`, until `approvals expire` marks it. A staff user who tries to approve gets `approver_not_allowed: role 'staff' may not decide approvals`. `expire` expires every overdue approval for all customers and prints only the count; the acting user must be an active owner.
 
 `users list` prints the acting user's customer's users with role and status; a user suspended with `users suspend` shows as `suspended (by operator)`. `users suspend` and `users reinstate` are for owners, and an owner cannot suspend themselves. A suspension takes effect on the user's next gate call in any process that uses the same database, a live run or gateway included. It is sticky: a fixture sync does not reactivate the user until `users reinstate`, after which the fixtures decide the user's status again. Both record the acting owner, the user and the `--reason` code. `spend release-stale` releases reservations open longer than `--older-than` minutes (default 15) for all customers and prints only the count; the acting user must be an active owner.
+
+`token issue` makes a model-gateway token for a run of the acting user, or for any run of their customer if they own it, and prints it once on stdout (or writes it to `--token-file`, a new file with mode 0600, which it never overwrites). Only the token's sha256 is stored. `token list` shows ids, runs, status and times, never a token, and `token revoke` revokes one by id. Another customer's run or token reads like a missing one. Both `issue` and `revoke` are recorded in the audit log as operator actions, in the transaction that makes them, so a token whose issue cannot be recorded does not exist.
 
 `audit show` prints the acting user's customer's events, oldest first, one per line, for owners and managers. A value the log holds as a reference prints as its `ref:` and why (`unknown value`: it named nothing the store knew). `audit policy` prints the policy bundle stored for a version and checks its sha256 against the snapshot, the version and every `policy_loaded` event for it, for owners and managers. `audit check-store`, for owners, verifies the chain, then checks each of the customer's approval, outbox, parts order, refund and note rows against the hashes its events carry. Both checks exit 1 on any mismatch. The three `audit` commands open the store read-only and change neither file.
 
@@ -357,6 +373,7 @@ Produced by `uv run agentgate redteam --transport mcp` at commit `b9e650b`: 146 
 | `src/agentgate/retrieval.py` | permission-aware search: filter, BM25F over the permitted set, re-check |
 | `src/agentgate/approvals.py` | approval queue bound to tool, action and args hash |
 | `src/agentgate/spend.py` | spend ledger: per-run calls and USD, per-customer-day USD |
+| `src/agentgate/model/` | model gateway pieces: provider keys, run tokens, strict request reading and caps, rate tables and the worst-case reservation |
 | `src/agentgate/audit/` | audit event type and keyed references, memory sink, Panoptes sink |
 | `src/agentgate/tools/` | tool adapter interface and the built-in tools |
 | `src/agentgate/agent/` | model protocol, reference agent loop, mock models, optional Anthropic adapter |
