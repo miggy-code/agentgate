@@ -137,7 +137,8 @@ class ModelEntry(_Model):
     # Unlike a rule, an entry always names its roles, so a missing line cannot widen access.
     roles: frozenset[Role] = Field(min_length=1)
     max_output_tokens: int = Field(ge=1, le=10_000_000)
-    max_request_bytes: int = Field(ge=1, le=100_000_000)
+    # Bodies above 16 MiB are refused before they are read (model.admission.MAX_BODY_BYTES).
+    max_request_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
 
 
 class ModelPolicy(_Model):

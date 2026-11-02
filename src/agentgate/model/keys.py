@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote_plus
 
+from agentgate._json import no_duplicate_keys
 from agentgate.policy.schema import ModelProvider
 
 # Every agentgate token starts with this, so a key that does too is a token pasted by mistake.
@@ -171,7 +172,7 @@ def _parse_keys(content: bytes, path: Path) -> dict[ModelProvider, str]:
     data: object = None
     unreadable = False
     try:
-        data = json.loads(content, object_pairs_hook=_no_duplicates)
+        data = json.loads(content, object_pairs_hook=no_duplicate_keys)
     except (ValueError, RecursionError):
         # Parser errors quote the text they could not read, which is the secret.
         unreadable = True
@@ -187,16 +188,6 @@ def _parse_keys(content: bytes, path: Path) -> dict[ModelProvider, str]:
         if provider.value in data:
             keys[provider] = validate_key(provider, data[provider.value])
     return keys
-
-
-def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    # Two entries for one provider would leave it unclear which key is used.
-    result: dict[str, object] = {}
-    for name, value in pairs:
-        if name in result:
-            raise ValueError("duplicate key")
-        result[name] = value
-    return result
 
 
 # Client credentials
