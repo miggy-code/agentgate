@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  # Panoptes main moves without a push here, so the job below also runs weekly.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,5 +52,58 @@ jobs:
         with:
           name: reports-python-${{ matrix.python-version }}
           # reports/redteam.{json,md} (gate), reports/redteam-mcp.{json,md} (mcp), and the rest.
+          path: reports/
+          if-no-files-found: warn
+
+  # The same suite against Panoptes main from git, next to the pinned PyPI version above, so a
+  # Panoptes change that breaks agentgate shows up before Panoptes is released.
+  panoptes-main:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      # The git checkout reports the same version as the pinned release, so uv would keep the
+      # release unless told to replace it.
+      - name: Install Panoptes main
+        run: >
+          uv pip install --reinstall-package panoptes-observe
+          "panoptes-observe @ git+https://github.com/miggy-code/Panoptes@main"
+
+      - name: Show the Panoptes commit
+        run: >
+          uv run --no-sync python -c "import importlib.metadata as m;
+          print(m.distribution('panoptes-observe').read_text('direct_url.json'))"
+
+      # No lint or type check: those say nothing about Panoptes. `uv run` must not sync, or
+      # it would put the pinned release back.
+      - name: Test
+        run: make test
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Policy tests
+        run: make policy
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Red-team suite
+        run: make redteam
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-panoptes-main
           path: reports/
           if-no-files-found: warn
