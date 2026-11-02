@@ -1,10 +1,11 @@
 """Policy tests: run the expected decisions in policies/<customer-id>/tests.yaml.
 
-Each test case names a fixture user, a tool and action, and the facts of one request, plus
-the decision the policy must reach. Role and customer always come from the fixtures, never
-from the case, so a test cannot pass by claiming a role the user does not have. A setup
-problem in one case (an unknown user or document) fails that case and the run continues,
-while a problem with a whole file stops the run, since its results could not be trusted.
+Each test case names a fixture user and either a tool and action or, for a model call, the
+provider, model and envelope facts of one request, plus the decision the policy must reach.
+Role and customer always come from the fixtures, never from the case, so a test cannot pass
+by claiming a role the user does not have. A setup problem in one case (an unknown user or
+document) fails that case and the run continues, while a problem with a whole file stops the
+run, since its results could not be trusted.
 """
 
 from collections.abc import Sequence
@@ -12,16 +13,42 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agentgate._yaml import parse_yaml
 from agentgate.fixtures import FixtureError, load_fixtures
 from agentgate.models import Action
-from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Request
-from agentgate.policy.schema import Effect, PolicyBundle, PolicyError, load_bundles
+from agentgate.policy.engine import (
+    Decision,
+    DocumentFacts,
+    ModelRequest,
+    PolicyEngine,
+    Request,
+)
+from agentgate.policy.schema import (
+    Effect,
+    ModelName,
+    ModelProvider,
+    PolicyBundle,
+    PolicyError,
+    load_bundles,
+)
 from agentgate.store import Store
 
 TESTS_FILE = "tests.yaml"
+
+
+class ModelCall(BaseModel):
+    """The facts of one model request in a test case."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: ModelProvider
+    name: ModelName
+    # Left out, the request declares no max_tokens (or no n).
+    max_tokens: int | None = None
+    n: int | None = None
+    request_bytes: int = Field(ge=0)
 
 
 class PolicyTestCase(BaseModel):
@@ -31,8 +58,10 @@ class PolicyTestCase(BaseModel):
 
     name: str = Field(min_length=1, max_length=200)
     user: str
-    tool: str
-    action: Action
+    # A case is either a tool call (tool and action) or a model call (model).
+    tool: str | None = None
+    action: Action | None = None
+    model: ModelCall | None = None
     document: str | None = None
     recipients: tuple[str, ...] = ()
     amount_usd: Decimal | None = None
@@ -41,6 +70,18 @@ class PolicyTestCase(BaseModel):
     # Deciding rule ids in policy file order. None leaves them unchecked; an empty list
     # asserts that no rule decided (a default or built-in deny).
     rules: tuple[str, ...] | None = None
+    # The decision's reason code. None leaves it unchecked.
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _one_kind(self) -> "PolicyTestCase":
+        is_tool = self.tool is not None or self.action is not None
+        if self.model is not None:
+            if is_tool or self.document is not None or self.recipients or self.amount_usd:
+                raise ValueError("a model case takes only user, model and the expectation")
+        elif self.tool is None or self.action is None:
+            raise ValueError("a case needs tool and action, or model")
+        return self
 
 
 @dataclass(frozen=True)
@@ -132,6 +173,23 @@ def _run_case(store: Store, engine: PolicyEngine, case: PolicyTestCase) -> CaseR
         # policy's own, or the case would only ever exercise the customer mismatch check.
         return setup_error(f"user {user.id!r} belongs to customer {user.customer_id!r}")
 
+    if case.model is not None:
+        call = case.model
+        decision = engine.decide_model(
+            ModelRequest(
+                customer_id=user.customer_id,
+                role=user.role,
+                provider=call.provider,
+                model=call.name,
+                max_tokens=call.max_tokens,
+                n=call.n,
+                request_bytes=call.request_bytes,
+            )
+        )
+        return _result(customer_id, case, decision)
+
+    # The case validator guarantees a tool case has both.
+    assert case.tool is not None and case.action is not None
     facts: DocumentFacts | None = None
     if case.document is not None:
         # Not tenant-scoped on purpose: a case may name another customer's document to
@@ -154,6 +212,10 @@ def _run_case(store: Store, engine: PolicyEngine, case: PolicyTestCase) -> CaseR
             run_max_label=case.run_max_label,
         )
     )
+    return _result(customer_id, case, decision)
+
+
+def _result(customer_id: str, case: PolicyTestCase, decision: Decision) -> CaseResult:
     problem = _mismatch(case, decision)
     return CaseResult(customer_id, case, decision, passed=problem is None, problem=problem)
 
@@ -166,6 +228,8 @@ def _mismatch(case: PolicyTestCase, decision: Decision) -> str | None:
         return f"expected {case.expect}, got {decision.effect} ({detail})"
     if case.rules is not None and case.rules != decision.rule_ids:
         return f"expected rules {_format_rules(case.rules)}, got {_format_rules(decision.rule_ids)}"
+    if case.reason is not None and case.reason != decision.reason.value:
+        return f"expected reason {case.reason}, got {decision.reason.value}"
     return None
 
 

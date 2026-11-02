@@ -514,3 +514,74 @@
   tool: notes.write
   action: write
   expect: deny
+
+# Models
+- name: staff calls the allowed model within its envelope
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 4000, request_bytes: 20000}
+  expect: allow
+  rules: [deepseek-flash]
+  reason: model_allowed
+
+- name: a request at the envelope limits is allowed
+  user: kc-owner-dale
+  model:
+    {provider: openai_compatible, name: deepseek-flash, max_tokens: 8000, n: 1, request_bytes: 120000}
+  expect: allow
+  rules: [deepseek-flash]
+
+- name: a model not in the allowlist is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-pro, max_tokens: 100, request_bytes: 1000}
+  expect: deny
+  rules: []
+  reason: model_not_allowed
+
+- name: the right model on another provider's protocol is denied
+  user: kc-staff-gavin
+  model: {provider: openai, name: deepseek-flash, max_tokens: 100, request_bytes: 1000}
+  expect: deny
+  reason: model_not_allowed
+
+- name: a model name that only starts like an allowed one is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash-2, max_tokens: 100, request_bytes: 1000}
+  expect: deny
+  reason: model_not_allowed
+
+- name: a contractor may not call the model
+  user: kc-contractor-hollis
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 100, request_bytes: 1000}
+  expect: deny
+  rules: [deepseek-flash]
+  reason: model_role_denied
+
+- name: max_tokens above the envelope is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 8001, request_bytes: 1000}
+  expect: deny
+  reason: model_max_tokens_exceeded
+
+- name: a request that declares no max_tokens is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash, request_bytes: 1000}
+  expect: deny
+  reason: model_max_tokens_required
+
+- name: more than one completion is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 100, n: 2, request_bytes: 1000}
+  expect: deny
+  reason: model_n_not_one
+
+- name: zero completions is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 100, n: 0, request_bytes: 1000}
+  expect: deny
+  reason: model_n_not_one
+
+- name: an oversized body is denied
+  user: kc-staff-gavin
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 100, request_bytes: 120001}
+  expect: deny
+  reason: model_request_too_large

@@ -149,6 +149,8 @@ def lint(policies: PoliciesOption = Path("policies")) -> None:
             f"{customer_id}  {bundle_version(bundle)}"
             f"  {len(bundle.policy.rules)} rules  {len(bundle.tools)} tools"
         )
+        if bundle.policy.models is not None:
+            line += f"  {len(bundle.policy.models.allow)} models"
         revision = git_revision(policies / customer_id)
         if revision is not None:
             line += f"  git {revision}"

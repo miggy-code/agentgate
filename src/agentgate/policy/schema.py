@@ -31,6 +31,9 @@ ListEntry = Annotated[
     str, Field(pattern=r"^([^@\s]+@|@)[a-z0-9-]+(\.[a-z0-9-]+)+$", max_length=254)
 ]
 Usd = Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=6)]
+PositiveUsd = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=6)]
+# A model name as a provider's API takes it ("deepseek-flash", "models/gemini-2.5-pro").
+ModelName = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")]
 
 
 class PolicyError(ValueError):
@@ -111,6 +114,59 @@ class SpendLimits(_Model):
     max_calls_per_run: int = Field(ge=1, le=10_000)
 
 
+class ModelProvider(StrEnum):
+    """The wire protocol a model request must use."""
+
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
+    GEMINI = "gemini"
+    OPENAI_COMPATIBLE = "openai_compatible"
+
+
+class ModelEntry(_Model):
+    """One model a run may call, with the envelope its request must fit.
+
+    Every field is required: a model with no output cap or body limit would let a request
+    ask for anything, so the policy has to say how much.
+    """
+
+    id: RuleId
+    provider: ModelProvider
+    # Compared exactly with the request body's model field, never as a prefix or pattern.
+    model: ModelName
+    # Unlike a rule, an entry always names its roles, so a missing line cannot widen access.
+    roles: frozenset[Role] = Field(min_length=1)
+    max_output_tokens: int = Field(ge=1, le=10_000_000)
+    max_request_bytes: int = Field(ge=1, le=100_000_000)
+
+
+class ModelPolicy(_Model):
+    """Which models runs may call. Deny by default: a model not listed here is denied."""
+
+    allow: tuple[ModelEntry, ...] = Field(min_length=1)
+    # What one model call reserves before it is sent: "computed" prices the worst case from
+    # the request and the rate table; a fixed USD amount is reserved instead, so a model the
+    # table does not price, or a request that does not declare max_tokens, can still run.
+    reserve: Literal["computed"] | PositiveUsd = "computed"
+
+    @model_validator(mode="after")
+    def _unique_entries(self) -> "ModelPolicy":
+        ids: set[str] = set()
+        targets: set[tuple[ModelProvider, str]] = set()
+        for entry in self.allow:
+            if entry.id in ids:
+                raise ValueError(f"duplicate model entry id {entry.id!r}")
+            ids.add(entry.id)
+            # Two entries for one model would make the envelope depend on listing order.
+            target = (entry.provider, entry.model)
+            if target in targets:
+                raise ValueError(
+                    f"model entry {entry.id!r}: {entry.provider}/{entry.model} is already listed"
+                )
+            targets.add(target)
+        return self
+
+
 class ApprovalSettings(_Model):
     approver_roles: frozenset[Role] = Field(min_length=1)
     ttl_minutes: int = Field(ge=1, le=7 * 24 * 60)
@@ -127,6 +183,8 @@ class Policy(_Model):
     approvals: ApprovalSettings
     lists: dict[ListName, frozenset[ListEntry]] = {}
     rules: tuple[Rule, ...] = Field(min_length=1)
+    # Absent means every model request is denied.
+    models: ModelPolicy | None = None
 
     @field_validator("labels")
     @classmethod

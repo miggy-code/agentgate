@@ -454,3 +454,11 @@
   tool: docs.search
   action: read
   expect: deny
+
+# Models: this policy has no models section, so every model request is denied.
+- name: a policy without a models section denies every model request
+  user: jr-owner-marisol
+  model: {provider: openai_compatible, name: deepseek-flash, max_tokens: 100, request_bytes: 1000}
+  expect: deny
+  rules: []
+  reason: model_not_allowed

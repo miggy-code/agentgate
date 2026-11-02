@@ -185,6 +185,39 @@ The full file has 7 directory addresses and 14 rules.
 | `doc_tags_any: [<tag>]` | the document has any of the tags (read, write) |
 | `doc_assigned_to_user: true` | the document is assigned to the acting user (read, write) |
 
+### Models
+
+`policy.yaml` may also list the models a run may call through the model gateway. It is deny by default, like the rules: a model not listed is denied (`model_not_allowed`), and so is every model request under a policy with no `models:` section. From `policies/kettle-creek-hvac/policy.yaml`:
+
+```yaml
+models:
+  allow:
+    - id: deepseek-flash
+      provider: openai_compatible
+      model: deepseek-flash
+      roles: [owner, manager, staff]
+      max_output_tokens: 8000
+      max_request_bytes: 120000
+  reserve: computed
+```
+
+- `provider` is the wire protocol the request must use: `anthropic`, `openai`, `gemini` or `openai_compatible`. `model` is compared exactly with the request body's `model` field, never as a prefix or a pattern. Two entries cannot name the same provider and model.
+- Every field of an entry is required. `roles` is never optional, so a missing line cannot widen access.
+- A request is allowed only if it fits its entry, and each way it can miss has its own reason code, which is all the caller sees:
+
+| Reason | The request |
+| --- | --- |
+| `model_not_allowed` | names a model or provider no entry lists |
+| `model_role_denied` | comes from a role the entry does not list |
+| `model_max_tokens_required` | declares no output limit (or one below 1) |
+| `model_max_tokens_exceeded` | declares a limit above `max_output_tokens` |
+| `model_n_not_one` | asks for any number of completions but one |
+| `model_request_too_large` | has a body above `max_request_bytes` |
+
+- A request that declares no `max_tokens` is denied even when `reserve` is a fixed amount: the output limit is part of the envelope, and without it the entry's cap is not checked.
+- `reserve` is what one model call holds against the spend caps before it is sent. `computed` prices the worst case from the request and the rate table; a fixed USD string such as `"0.02"` reserves that amount instead, which is the only way to call a model the rate table does not price.
+- A `tests.yaml` case for a model call gives `model: {provider, name, max_tokens, n, request_bytes}` in place of `tool` and `action`, and may state the decision's `reason` as well as `rules` (the entry id).
+
 ### tools.yaml
 
 Each shipped tool has exactly one action, a base risk for the risk score, an optional `customer_facing` flag, and a per-call platform cost counted against the spend caps. From `policies/kettle-creek-hvac/tools.yaml`:
