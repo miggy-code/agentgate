@@ -256,16 +256,16 @@ A policy's version is a content hash of the validated bundle (policy and tools),
 
 ```console
 $ uv run agentgate policy lint
-juniper-row-apothecary  sha256:091571d97a0826e8  15 rules  5 tools  git 87a4801
-kettle-creek-hvac  sha256:66ca6bb217693239  14 rules  5 tools  git 87a4801
+juniper-row-apothecary  sha256:091571d97a0826e8  15 rules  5 tools  git f5b8eba
+kettle-creek-hvac  sha256:62b5288d503e04ae  14 rules  5 tools  1 models  git f5b8eba
 
 $ uv run agentgate policy test
-juniper-row-apothecary  sha256:091571d97a0826e8  59/59 passed
-kettle-creek-hvac  sha256:66ca6bb217693239  67/67 passed
-total  126/126 passed
+juniper-row-apothecary  sha256:091571d97a0826e8  60/60 passed
+kettle-creek-hvac  sha256:62b5288d503e04ae  78/78 passed
+total  138/138 passed
 ```
 
-Both outputs are from commit `87a4801`.
+Both outputs are from commit `d248714`. The version covers the `models:` section too, and a policy without one keeps the version it had before the section existed.
 
 ## Model gateway
 
