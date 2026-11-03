@@ -96,9 +96,6 @@ class ProviderKeys:
                 data = data.replace(key, REDACTED)
         return data
 
-    def appears_in(self, data: str | bytes) -> bool:
-        return self.redact(data) != data
-
     def __repr__(self) -> str:
         names = ", ".join(sorted(provider.value for provider in self._keys))
         return f"ProviderKeys(providers=[{names}])"

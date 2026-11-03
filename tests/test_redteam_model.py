@@ -317,7 +317,8 @@ MUTATIONS = [
                 "parse_model_call",
                 (
                     (
-                        "unknown_fields=sum(1 for name in data if name not in _FIELDS[provider])",
+                        "unknown_fields=sum("
+                        "1 for name in data if name not in _FORMATS[provider].fields)",
                         "unknown_fields=0",
                     ),
                 ),
@@ -616,7 +617,7 @@ MUTATIONS = [
     Mutation(
         "any correlation id is recorded as written",
         ids(19),
-        replace=((gate_module, "_CORRELATION_ID", re.compile(r"(?s).*")),),
+        replace=((gate_module, "_EFFECT_REF", re.compile(r"(?s).*")),),
     ),
     Mutation(
         "a key-shaped correlation id is recorded as written",

@@ -20,7 +20,7 @@ be UTF-8; the JSON parser would otherwise accept UTF-16 and UTF-32 too.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from agentgate._json import no_duplicate_keys
@@ -29,108 +29,115 @@ from agentgate.policy.schema import ModelProvider, SpendLimits
 # A body larger than this is not read at all. The policy's max_request_bytes cannot exceed it.
 MAX_BODY_BYTES = 16 * 1024 * 1024
 
-# The body fields that declare an output limit, per provider. Gemini's sit under
-# generationConfig, which the REST API reads in either spelling.
-_LIMIT_FIELDS: dict[ModelProvider, tuple[str, ...]] = {
-    ModelProvider.ANTHROPIC: ("max_tokens",),
-    ModelProvider.OPENAI: ("max_tokens", "max_completion_tokens", "max_output_tokens"),
-    ModelProvider.OPENAI_COMPATIBLE: ("max_tokens", "max_completion_tokens", "max_output_tokens"),
-    ModelProvider.GEMINI: ("maxOutputTokens", "max_output_tokens"),
-}
-_COUNT_FIELDS: dict[ModelProvider, tuple[str, ...]] = {
-    ModelProvider.ANTHROPIC: (),
-    ModelProvider.OPENAI: ("n",),
-    ModelProvider.OPENAI_COMPATIBLE: ("n",),
-    ModelProvider.GEMINI: ("candidateCount", "candidate_count"),
-}
+
+@dataclass(frozen=True)
+class _WireFormat:
+    """What one provider's request body looks like, as far as the gate reads it."""
+
+    # Every top-level field its API takes. Any other is denied.
+    fields: frozenset[str]
+    # The fields that declare an output limit. Gemini's sit under generationConfig, which the
+    # REST API reads in either spelling.
+    limit_fields: tuple[str, ...]
+    # The fields that ask for more than one completion.
+    count_fields: tuple[str, ...]
+    # Top-level fields that start work or keep state on the provider's side.
+    server_state_fields: frozenset[str]
 
 
-_OPENAI_FIELDS = frozenset(
-    {
-        "model",
-        "messages",
-        "max_tokens",
-        "max_completion_tokens",
-        "max_output_tokens",
-        "n",
-        "stream",
-        "stream_options",
-        "temperature",
-        "top_p",
-        "stop",
-        "presence_penalty",
-        "frequency_penalty",
-        "logit_bias",
-        "logprobs",
-        "top_logprobs",
-        "seed",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "response_format",
-        "user",
-        "reasoning_effort",
-        "functions",
-        "function_call",
-        "input",
-        "instructions",
-        "text",
-        "reasoning",
-        "truncation",
-        "include",
-        "metadata",
-        "previous_response_id",
-        "conversation",
-        "background",
-    }
-)
-_FIELDS: dict[ModelProvider, frozenset[str]] = {
-    ModelProvider.OPENAI: _OPENAI_FIELDS,
-    ModelProvider.OPENAI_COMPATIBLE: _OPENAI_FIELDS | {"top_k", "min_p"},
-    ModelProvider.ANTHROPIC: frozenset(
+_OPENAI = _WireFormat(
+    fields=frozenset(
         {
             "model",
             "messages",
             "max_tokens",
-            "system",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "n",
+            "stream",
+            "stream_options",
             "temperature",
             "top_p",
-            "top_k",
-            "stop_sequences",
-            "stream",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "logprobs",
+            "top_logprobs",
+            "seed",
             "tools",
             "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "user",
+            "reasoning_effort",
+            "functions",
+            "function_call",
+            "input",
+            "instructions",
+            "text",
+            "reasoning",
+            "truncation",
+            "include",
             "metadata",
-            "thinking",
-            "mcp_servers",
-            "container",
+            "previous_response_id",
+            "conversation",
+            "background",
         }
     ),
-    ModelProvider.GEMINI: frozenset(
-        {
-            "contents",
-            "generationConfig",
-            "generation_config",
-            "systemInstruction",
-            "system_instruction",
-            "safetySettings",
-            "safety_settings",
-            "tools",
-            "toolConfig",
-            "tool_config",
-            "cachedContent",
-            "cached_content",
-        }
+    limit_fields=("max_tokens", "max_completion_tokens", "max_output_tokens"),
+    count_fields=("n",),
+    server_state_fields=frozenset({"previous_response_id", "conversation", "background"}),
+)
+_FORMATS: dict[ModelProvider, _WireFormat] = {
+    ModelProvider.OPENAI: _OPENAI,
+    # The same wire protocol under another URL, with the sampling fields some servers add.
+    ModelProvider.OPENAI_COMPATIBLE: replace(_OPENAI, fields=_OPENAI.fields | {"top_k", "min_p"}),
+    ModelProvider.ANTHROPIC: _WireFormat(
+        fields=frozenset(
+            {
+                "model",
+                "messages",
+                "max_tokens",
+                "system",
+                "temperature",
+                "top_p",
+                "top_k",
+                "stop_sequences",
+                "stream",
+                "tools",
+                "tool_choice",
+                "metadata",
+                "thinking",
+                "mcp_servers",
+                "container",
+            }
+        ),
+        limit_fields=("max_tokens",),
+        count_fields=(),
+        server_state_fields=frozenset({"mcp_servers", "container"}),
     ),
-}
-# Top-level fields that start work or keep state on the provider's side.
-_SERVER_STATE_FIELDS: dict[ModelProvider, frozenset[str]] = {
-    ModelProvider.OPENAI: frozenset({"previous_response_id", "conversation", "background"}),
-    ModelProvider.OPENAI_COMPATIBLE: frozenset(
-        {"previous_response_id", "conversation", "background"}
+    ModelProvider.GEMINI: _WireFormat(
+        fields=frozenset(
+            {
+                "contents",
+                "generationConfig",
+                "generation_config",
+                "systemInstruction",
+                "system_instruction",
+                "safetySettings",
+                "safety_settings",
+                "tools",
+                "toolConfig",
+                "tool_config",
+                "cachedContent",
+                "cached_content",
+            }
+        ),
+        limit_fields=("maxOutputTokens", "max_output_tokens"),
+        count_fields=("candidateCount", "candidate_count"),
+        server_state_fields=frozenset({"cachedContent", "cached_content"}),
     ),
-    ModelProvider.ANTHROPIC: frozenset({"mcp_servers", "container"}),
-    ModelProvider.GEMINI: frozenset({"cachedContent", "cached_content"}),
 }
 SERVER_STATE = "server_state"
 SERVER_TOOL = "server_tool"
@@ -200,8 +207,8 @@ def parse_model_call(
     if not isinstance(model, str):
         return invalid
 
-    limits = _integers(sources, _LIMIT_FIELDS[provider])
-    counts = _integers(sources, _COUNT_FIELDS[provider])
+    limits = _integers(sources, _FORMATS[provider].limit_fields)
+    counts = _integers(sources, _FORMATS[provider].count_fields)
     if limits is None or counts is None or len(set(counts)) > 1:
         return invalid
     return ModelCall(
@@ -211,7 +218,7 @@ def parse_model_call(
         n=counts[0] if counts else None,
         request_bytes=len(body),
         correlation_id=correlation_id,
-        unknown_fields=sum(1 for name in data if name not in _FIELDS[provider]),
+        unknown_fields=sum(1 for name in data if name not in _FORMATS[provider].fields),
         server_features=_server_features(provider, data),
     )
 
@@ -219,7 +226,7 @@ def parse_model_call(
 def _server_features(provider: ModelProvider, data: dict[str, object]) -> tuple[str, ...]:
     """The kinds of server-side work the body asks for. A field it cannot read is counted."""
     found: set[str] = set()
-    if any(name in data for name in _SERVER_STATE_FIELDS[provider]):
+    if any(name in data for name in _FORMATS[provider].server_state_fields):
         found.add(SERVER_STATE)
     tools = data.get("tools")
     if tools is not None and not isinstance(tools, list):

@@ -219,7 +219,6 @@ def test_redact_removes_every_key_from_text_and_bytes() -> None:
     assert REDACTED in cleaned and "Bearer " + REDACTED in cleaned
     raw = keys.redact(text.encode())
     assert isinstance(raw, bytes) and all(key.encode() not in raw for key in ALL.values())
-    assert keys.appears_in(text) and not keys.appears_in("nothing here")
 
 
 def test_redact_handles_a_key_that_contains_another() -> None:

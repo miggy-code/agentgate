@@ -153,11 +153,9 @@ REFERENCE_HEX = 16
 # carry free text or a canary.
 _TOOL_ID = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 _APPROVAL_ID = re.compile(r"^apr_[A-Za-z0-9_-]{1,64}$")
-# A tool's effect_ref goes into events as written only in this id shape; anything else is
-# recorded as a reference.
+# A tool's effect_ref, and a correlation id a client sent, go into events as written only in
+# this id shape; anything else is recorded as a reference.
 _EFFECT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-# A correlation id a client sent goes into events as written only in this shape.
-_CORRELATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # IN lists of the stale sweep's follow-up query are sent in chunks of this many ids.
 _ID_CHUNK = 500
 # Customer id for audit events about a caller that matches no customer at all.
@@ -1897,7 +1895,7 @@ def _model_values(gate: Gate, call: ModelCall) -> dict[str, JsonValue]:
             values["server_features"] = list(call.server_features)
     asserted = call.correlation_id
     if asserted is not None:
-        if _CORRELATION_ID.fullmatch(asserted) and storable_identifier(asserted):
+        if _EFFECT_REF.fullmatch(asserted) and storable_identifier(asserted):
             values["asserted_correlation_id"] = asserted
         else:
             values["asserted_correlation_ref"] = gate.audit_reference(asserted)
