@@ -120,6 +120,8 @@ An example MCP client configuration, in the `mcpServers` format many clients use
 
 The process starts the run and issues its one token at startup (printed once, or written 0600 to `--token-file`), sweeps reservations older than the lease every minute, and on shutdown stops accepting, lets in-flight exchanges finish and settle, then ends the run and revokes its token. At startup it refuses to serve unless the policy lists a model for each upstream, each upstream has a provider key, and the reservation's rate table (`RateTable`) and the settlement's (Panoptes' `PricingTable`) read one file to the same version, source and rates for every policy model. `agentgate doctor model-proxy` runs those checks without serving.
 
+`agentgate gateway serve --model-proxy --upstream ... --rate-table ... --token-file ...` starts the same proxy inside the MCP gateway's run: one run id, so a model call and a tool call reserve against the same per-run USD cap, per-day cap and call count. The token goes to `--token-file` only, since stdout is the MCP stream. `--max-usd` and `--max-calls` tighten the run's caps for model calls and can never raise the policy's.
+
 ## Policy format
 
 Each customer has a folder under `policies/` with three files: `policy.yaml` (rules, caps, approvals, lists), `tools.yaml` (the tools the customer has) and `tests.yaml` (expected decisions). A trimmed excerpt of `policies/kettle-creek-hvac/policy.yaml`:

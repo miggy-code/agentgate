@@ -7,7 +7,8 @@ agentgate is a permissions, approval and audit layer between an AI agent and a c
 - **Approvals.** Risky or customer-facing calls wait for a manager. An approval is bound to a hash of the exact arguments, used once, and expires.
 - **Spend caps.** Calls and USD per run, USD per customer per day, reserved before every call.
 - **Audit.** Every decision goes to [Panoptes](https://github.com/miggy-code/Panoptes), a tamper-evident SQLite log. If the decision cannot be recorded, the tool does not run.
-- **Two ways to run.** As in-process middleware, or as an MCP gateway that holds the tools and the database in its own process.
+- **Model gateway.** The same gate decides model requests: a policy `models:` section (deny by default), a run token in place of the provider key, a worst-case reservation against the same caps, and the provider's key added by the proxy, never held by the agent.
+- **Three ways to run.** As in-process middleware, as an MCP gateway that holds the tools and the database in its own process, or with a model proxy that holds the provider keys.
 
 ## Red-team results
 
@@ -25,7 +26,7 @@ agentgate is a permissions, approval and audit layer between an AI agent and a c
 | **attacks total** | **152** | **152/152** | **152/152** |
 | benign_control | 21 | 21/21 | 21/21 |
 
-From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `ec526fb`.
+From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `6b09d32`.
 
 The threat model is a fully compromised model: most attack scenarios propose the harmful call directly, and some prompt injection scenarios run a mock model that obeys any instruction it reads. Benign controls are legitimate tasks the gate must still allow, so a gate that denied everything would fail them.
 
@@ -156,6 +157,16 @@ uv run agentgate gateway serve --as kc-staff-nadine
 
 The gateway serves MCP over stdio for one run. The tools, the database and their side effects live in the gateway process, so an agent that holds only the MCP connection has no path to a tool except through the gate. See [docs/design.md](docs/design.md#the-mcp-gateway).
 
+### And a model proxy
+
+```bash
+uv run agentgate model-proxy serve --as kc-staff-nadine \
+  --upstream openai_compatible=https://api.deepseek.com \
+  --rate-table rates.json --keys-file keys.json --token-file run.token
+```
+
+The proxy is [Panoptes](https://github.com/miggy-code/Panoptes)' reverse proxy with agentgate deciding in its hooks. The agent points its SDK at the proxy and sends the run's token where it would send a provider key. Each request must be a POST to a generation endpoint, carry a live token and fit the policy's `models:` entry; its worst case is reserved against the run's caps, the provider's key replaces whatever credential the client sent, and the reservation is settled from what the provider reports. `gateway serve --model-proxy` does this inside the MCP gateway's run, so tool and model calls share one set of caps. `agentgate doctor model-proxy` checks the setup without serving. See [docs/design.md](docs/design.md#the-model-proxy).
+
 ## Limits
 
 The main ones (the full list is in [docs/limits.md](docs/limits.md)):
@@ -165,6 +176,8 @@ The main ones (the full list is in [docs/limits.md](docs/limits.md)):
 - **The audit log is tamper-evident, not tamper-proof.** Editing or deleting a stored event fails verification. But someone with write access can delete the newest events and rewrite the chain metadata, and catching that needs a checkpoint stored somewhere else.
 - **The audit log and the state database are separate SQLite files with no two-phase commit.** A tool that ran can be missing its `executed` event if the log fails right after.
 - **Search asks the policy engine about every document of the customer.** That works at fixture scale (20 documents per customer) and is the first thing to change at scale.
+- **Model spend is metered only through the proxy.** A run whose model calls do not go through `model-proxy serve` (or `gateway serve --model-proxy`) is not metered for them. Behind the proxy the agent cannot spend past the run's caps, but it is priced from a rate table as written, a reply with no usage is charged in full, and a streamed reply is not inspected.
+- **The proxy depends on Panoptes' hook contract** (`panoptes-observe` 0.2.x) for what it reports about each exchange, and the red-team table above does not include its HTTP tests (`tests/test_model_proxy.py`, with mutation tests).
 - **Side effects are simulated.** Email goes to an `outbox` table. Every result here comes from mock models; the optional Claude adapter is tested only against a fake client.
 - **No compliance claims.** agentgate has not been audited.
 

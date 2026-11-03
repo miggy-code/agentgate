@@ -4,10 +4,12 @@ test_model_proxy_mutations.py remove the protection behind each and require thes
 """
 
 import contextlib
+import http.client
 import json
 import os
 import stat
 import threading
+import time
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -462,3 +464,49 @@ def test_the_proxy_does_not_start_without_a_key_for_its_upstream(tmp_path: Path)
             ModelProxy(world, STAFF, config).start()
     finally:
         world.close()
+
+
+# One run for tools and models
+
+
+def test_a_proxy_started_on_a_gateways_run_shares_its_caps_with_the_tools(tmp_path: Path) -> None:
+    from agentgate.model.proxy import ModelProxy
+    from agentgate.models import Action
+    from conftest import open_file_world
+    from proxyharness import STAFF
+
+    provider = Provider()
+    world = open_file_world(tmp_path)
+    rates = tmp_path / "rates.json"
+    rates.write_text(json.dumps(RATES))
+    staff = world.store.get_user(STAFF)
+    assert staff is not None
+    run = world.gate.start_run(staff.customer_id, STAFF)
+    proxy = ModelProxy(
+        world,
+        STAFF,
+        ProxyConfig(upstreams={_providers()[0]: provider.origin}, keys=_keys(), rate_table=rates),
+    )
+    try:
+        port = proxy.start(run)
+        assert proxy.run == run and proxy.token is not None
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(BODY),
+            headers={"Authorization": f"Bearer {proxy.token}", "Content-Type": "application/json"},
+        )
+        assert conn.getresponse().status == 200
+        conn.close()
+        deadline = time.monotonic() + 5
+        while world.gate.ledger.run_spent(run.run_id) == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert world.gate.ledger.run_spent(run.run_id) == OK_COST
+        assert world.gate.ledger.run_calls(run.run_id) == 1
+        world.gate.call_tool(run, "docs.search", Action.READ, {"query": "dispatch"})
+        assert world.gate.ledger.run_calls(run.run_id) == 2
+    finally:
+        proxy.stop()
+        world.close()
+        provider.close()

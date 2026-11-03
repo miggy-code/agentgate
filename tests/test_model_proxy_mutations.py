@@ -217,6 +217,22 @@ MUTATIONS = [
         ),
     ),
     ProxyMutation(
+        "the proxy starts its own run instead of the gateway's",
+        (whole(t.test_a_proxy_started_on_a_gateways_run_shares_its_caps_with_the_tools),),
+        edits=(
+            (
+                ModelProxy,
+                "start",
+                (
+                    _edit(
+                        "run if run is not None else",
+                        "world.gate.start_run(user.customer_id, user.id) if True else",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    ProxyMutation(
         "stopping leaves the token live",
         (whole(t.test_stopping_drains_ends_the_run_and_revokes_its_token),),
         edits=((ModelProxy, "_end_run", (_edit("if self._run is None:", "if True:"),)),),

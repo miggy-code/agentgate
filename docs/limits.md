@@ -18,13 +18,13 @@ What agentgate does not do, and where its guarantees stop. The README lists the 
 
 - Stdio only. There is no HTTP transport; one needs real client authentication, which is not built.
 - The gateway's `--as` is a demo identity, as on the rest of the CLI. One gateway process serves one user's run.
-- Model spend is not metered through the gateway. It never sees the model's calls, so the per-run and per-customer-day USD caps count tool costs only. Tool costs and `max_calls_per_run` still apply to every tool call.
+- A gateway started without `--model-proxy` does not meter model spend: it never sees the model's calls, so that run's USD caps count tool costs only. With `--model-proxy` the proxy reserves and settles model calls against the same run, so tool and model calls share the per-run and per-day caps and `max_calls_per_run`. The caps are the policy's, tightened by `--max-usd` and `--max-calls`, which apply to model calls only.
 - Requests so malformed that the MCP SDK rejects them before any gateway handler runs may get no response at all. At commit `b9e650b`, raw JSON-RPC lines sent over stdio to `agentgate gateway serve --as kc-staff-nadine` got no reply for a malformed JSON line, for params sent as an array, and for arguments nested about 200 levels deep (200 got no reply, 195 did), so a client waiting for a reply can hang. A numeric tool name got error -32602. None of them is audited, and nothing runs for them.
 - An exception inside the gate, for example the audit sink failing while an approval is created, reaches the client only as a generic `internal error`. The gateway logs the exception type on stderr. When the sink itself failed, nothing is recorded.
 
 ## Model gateway
 
-These apply to the model gateway: `Gate.admit_model`, provider keys, run tokens, the rate table and the proxy (`agentgate model-proxy serve`). The MCP gateway does not yet share a run with the proxy, so the MCP gateway entry above still holds for a gateway started without it.
+These apply to the model gateway: `Gate.admit_model`, provider keys, run tokens, the rate table and the proxy (`agentgate model-proxy serve`).
 
 - The proxy serves one run, one upstream per wire protocol and one policy provider per wire protocol, bound to a loopback address. The token is a bearer secret: whoever holds it can spend the run's caps, and `--as` is a demo identity as everywhere else.
 - A request Panoptes refuses before the hook (malformed JSON, an oversized body, no supported route) never reaches agentgate and has no decision event. The refusal is in Panoptes' events; join on `exchange_id`.

@@ -159,3 +159,17 @@ def _wait_for_port(log: Path, server: subprocess.Popen[str]) -> int:
                 return int(line.rsplit(":", 1)[1])
         time.sleep(0.05)
     raise AssertionError("the proxy did not start: " + log.read_text())
+
+
+def test_the_gateway_needs_its_model_options_together(tmp_path: Path) -> None:
+    rates, _ = _files(tmp_path)
+    upstream = ["--upstream", "openai_compatible=http://127.0.0.1:9"]
+    for args in (
+        ["--model-proxy"],
+        ["--model-proxy", *upstream, "--rate-table", str(rates)],  # no --token-file
+        [*upstream],
+        ["--max-calls", "3"],
+    ):
+        result = runner.invoke(app, ["gateway", "serve", "--as", STAFF, *args, *_paths(tmp_path)])
+        assert result.exit_code == 1 and "--model-proxy" in result.stderr, (args, result.stderr)
+        assert not _db(tmp_path).exists()
