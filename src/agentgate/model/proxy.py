@@ -19,15 +19,14 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol, cast
 
 from panoptes.db import AuditDB
 from panoptes.hooks import (
     Exchange,
     Identity,
+    OutboundHeaders,
     ProxyHooks,
     Reject,
-    RequestHeaders,
     Upstream,
 )
 from panoptes.hooks import User as ExchangeUser
@@ -117,37 +116,6 @@ def generation_route(method: str, target: str) -> Route | None:
     return None
 
 
-class _Seen(Protocol):
-    """The fields of a Panoptes `Exchange` this module reads or sets. Panoptes does not
-    declare them as attributes (it sets them with object.__setattr__), so a type checker
-    sees none; this is the contract in docs/hooks.md as types."""
-
-    exchange_id: str
-    correlation_id: str
-    correlation_source: str
-    provider: str
-    method: str
-    path: str
-    request_headers: RequestHeaders
-    query_credentials: tuple[str, ...]
-    request_body: bytes
-    identity: Identity
-    outbound_headers: Any
-    state: dict[str, Any]
-    request_sent: bool
-    produced_output: bool
-    complete: bool
-    upstream_status: int | None
-    estimated_usd_micros: int | None
-    usage: dict[str, Any]
-
-    def drop_query_credentials(self) -> None: ...
-
-
-def _seen(exchange: Exchange) -> _Seen:
-    return cast(_Seen, exchange)
-
-
 @dataclass
 class _Admitted:
     """What `before_forward` hands `after_exchange` through `exchange.state`."""
@@ -177,7 +145,7 @@ class ModelGatewayHooks(ProxyHooks):
         self._caps = caps
 
     def before_forward(self, exchange: Exchange) -> Reject | None:
-        ex = _seen(exchange)
+        ex = exchange
         # 1. Only a POST to a generation endpoint.
         route = generation_route(ex.method, ex.path)
         if route is None:
@@ -228,21 +196,19 @@ class ModelGatewayHooks(ProxyHooks):
         # owed for every entered exchange, finds request_sent False and releases the
         # reservation.
         ex.drop_query_credentials()
-        ex.outbound_headers = dict(headers)
+        ex.outbound_headers = OutboundHeaders(dict(headers))
         return None
 
     def after_exchange(self, exchange: Exchange) -> None:
-        self._finish(_seen(exchange))
+        self._finish(exchange)
 
-    def _finish(self, exchange: _Seen) -> None:
+    def _finish(self, exchange: Exchange) -> None:
         """End the exchange's reservation, once. A rejected exchange has none."""
         admitted = exchange.state.pop("agentgate", None)
         if not isinstance(admitted, _Admitted):
             return
-        # A reply that reported no usage cannot have been priced. Panoptes 0.2.0.dev1
-        # still reports 0 micro-dollars for one, which would make the call free.
         status = exchange.upstream_status
-        micros = exchange.estimated_usd_micros if exchange.usage else None
+        micros = exchange.estimated_usd_micros
         ended = ModelExchange(
             request_sent=bool(exchange.request_sent),
             provider_error=status is not None and status >= 400,
@@ -257,7 +223,7 @@ class ModelGatewayHooks(ProxyHooks):
             # The reservation stays open for the stale sweep, which reclaims it.
             log.exception("could not end a model call's reservation")
 
-    def _token_refused(self, refused: TokenRejected, exchange: _Seen) -> Reject:
+    def _token_refused(self, refused: TokenRejected, exchange: Exchange) -> Reject:
         # A token that names a run is recorded on that run; a missing or unknown one
         # names none, and is on Panoptes' record of the rejected exchange.
         named = None if refused.run_id is None else self._tokens.run(refused.run_id)

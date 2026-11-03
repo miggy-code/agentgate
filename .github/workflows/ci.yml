@@ -59,9 +59,9 @@ jobs:
   # Panoptes change that breaks agentgate shows up before Panoptes is released.
   #
   # It runs on the schedule and by hand only. Panoptes main moves on its own, and a change there
-  # should not turn an agentgate pull request red. Panoptes will become 0.2.0.dev, which is
-  # outside the `<0.2` pin in pyproject.toml; `uv pip install` below ignores that pin, as the
-  # job intends, but a plain `uv sync` against that version would not resolve.
+  # should not turn an agentgate pull request red. Main may report a version outside the
+  # `<0.3` pin in pyproject.toml; `uv pip install` below ignores that pin, as the job intends,
+  # but a plain `uv sync` against that version would not resolve.
   panoptes-main:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -77,8 +77,8 @@ jobs:
       - name: Install
         run: uv sync --locked
 
-      # The git checkout reports the same version as the pinned release, so uv would keep the
-      # release unless told to replace it.
+      # Main can report the same version as the pinned release (until it is bumped), so uv would
+      # keep the release unless told to replace it.
       - name: Install Panoptes main
         run: >
           uv pip install --reinstall-package panoptes-observe

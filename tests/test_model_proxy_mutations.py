@@ -155,22 +155,6 @@ MUTATIONS = [
         ),
     ),
     ProxyMutation(
-        "a reply without usage is free",
-        (whole(t.test_a_reply_without_usage_is_charged_the_whole_reservation),),
-        edits=(
-            (
-                HOOKS,
-                "_finish",
-                (
-                    _edit(
-                        "exchange.estimated_usd_micros if exchange.usage else None",
-                        "exchange.estimated_usd_micros",
-                    ),
-                ),
-            ),
-        ),
-    ),
-    ProxyMutation(
         "a provider error is charged",
         (whole(t.test_a_provider_error_with_no_output_is_released),),
         edits=(
@@ -203,7 +187,7 @@ MUTATIONS = [
             whole(t.test_a_failure_after_the_reservation_is_a_hook_error_and_releases_it),
             whole(t.test_a_complete_reply_is_charged_what_it_cost_and_joined_to_its_exchange),
         ),
-        edits=((HOOKS, "after_exchange", (_edit("self._finish(_seen(exchange))", "pass"),)),),
+        edits=((HOOKS, "after_exchange", (_edit("self._finish(exchange)", "pass"),)),),
     ),
     ProxyMutation(
         "an error in the decision lets the request through",
@@ -295,6 +279,9 @@ def test_every_guard_has_a_mutation() -> None:
         "test_the_generation_routes",
         "test_a_body_that_is_not_one_json_object_is_denied",
         "test_a_connection_header_cannot_remove_the_injected_key",
+        # Panoptes returns an unknown cost for it; the gate's charge-in-full rule for an
+        # unknown cost has its own mutation (mb-017).
+        "test_a_reply_without_usage_is_charged_the_whole_reservation",
         "test_a_provider_error_with_no_output_is_released",
         "test_a_reply_cut_short_is_charged_the_whole_reservation",
         "test_concurrent_requests_are_each_reserved_and_settled",

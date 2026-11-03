@@ -7,9 +7,6 @@ resolution-markers = [
     "python_full_version < '3.14'",
 ]
 
-[options]
-prerelease-mode = "allow"
-
 [[package]]
 name = "agentgate"
 version = "0.0.1"
@@ -40,7 +37,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=1.0,<2" },
     { name = "mcp", specifier = ">=2.3,<3" },
-    { name = "panoptes-observe", extras = ["proxy"], directory = "../../../../Developer/Projects/Panoptes" },
+    { name = "panoptes-observe", extras = ["proxy"], specifier = ">=0.2.0,<0.3" },
     { name = "pydantic", specifier = ">=2.9,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "typer", specifier = ">=0.12,<1" },
@@ -750,27 +747,17 @@ wheels = [
 
 [[package]]
 name = "panoptes-observe"
-version = "0.2.0.dev1"
-source = { directory = "../../../../Developer/Projects/Panoptes" }
-dependencies = [
-    { name = "pyyaml" },
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/52/f1a6921dbf76351225b98cdc2baaffce9705cdf9bb8ec75a209314d7be4e/panoptes_observe-0.2.0.tar.gz", hash = "sha256:e5522b16529c74410822591bb3b1d76711ec858d6527ec5708f60e94008f8dcf", size = 190807, upload-time = "2026-11-03T21:51:05.918Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/41/66d0e0ce276b7748c1050198fba1f9a37cff17bab57ee3dbc46e65cc2b98/panoptes_observe-0.2.0-py3-none-any.whl", hash = "sha256:f887edc562e33220d931f2d1aa10a607b5e5a60b903b7cfc4124a15e40a5217f", size = 124875, upload-time = "2026-11-03T21:51:04.372Z" },
 ]
 
 [package.optional-dependencies]
 proxy = [
     { name = "httpx" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "build", marker = "extra == 'release'", specifier = ">=1.2,<2" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
-    { name = "httpx", marker = "extra == 'proxy'", specifier = ">=0.27,<1" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },
-    { name = "pyyaml", specifier = ">=6,<7" },
-    { name = "twine", marker = "extra == 'release'", specifier = ">=6,<7" },
-]
-provides-extras = ["proxy", "dev", "release"]
 
 [[package]]
 name = "pathspec"

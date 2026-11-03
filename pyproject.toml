@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Miguel Padilla" }]
 dependencies = [
     "mcp>=2.3,<3",
-    "panoptes-observe[proxy]>=0.2.0.dev1,<0.3",
+    "panoptes-observe[proxy]>=0.2.0,<0.3",
     "pydantic>=2.9,<3",
     "pyyaml>=6,<7",
     "typer>=0.12,<1",
@@ -49,16 +49,6 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
-
-[tool.uv]
-# Panoptes 0.2.0 is a pre-release until it ships.
-prerelease = "allow"
-
-[tool.uv.sources]
-# TEMPORARY: the Panoptes hooks are on a local, unpushed branch (feat/proxy-hooks). This must
-# become a git ref (panoptes-observe = { git = "https://github.com/miggy-code/Panoptes", rev = ... })
-# before anything is pushed, or nobody else can install agentgate.
-panoptes-observe = { path = "/Users/meeg/Developer/Projects/Panoptes" }
 
 [tool.mypy]
 python_version = "3.12"
