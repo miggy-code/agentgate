@@ -103,7 +103,7 @@ def _output_free(
     rate = self.models.get(model)
     if rate is None:
         return None
-    tokens = -(-request_bytes // 4)
+    tokens = request_bytes
     usd = tokens * max(rate.input_per_million, rate.cached_input_per_million) / 1_000_000
     return usd.quantize(Decimal("0.000001"))
 
@@ -112,7 +112,7 @@ def _unknown_is_free(self: RateTable, model: str, max_tokens: int, request_bytes
     rate = self.models.get(model)
     if rate is None:
         return Decimal(0)
-    return Decimal("0.006440")
+    return Decimal("0.019040")
 
 
 def _lax_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -489,6 +489,23 @@ MUTATIONS = [
     ),
     Mutation("caps are ignored", ids(14, 15, 16), replace=((Caps, "tighten", _caps_ignored),)),
     Mutation("caps can widen the policy", ids(15), replace=((Caps, "tighten", _caps_widen),)),
+    Mutation(
+        "a fixed reserve replaces the computed worst case",
+        ids(25),
+        edits=(
+            (
+                Gate,
+                "admit_model",
+                (
+                    (
+                        "amount = fixed if computed is None else "
+                        "computed if fixed is None else max(fixed, computed)",
+                        "amount = fixed if fixed is not None else computed",
+                    ),
+                ),
+            ),
+        ),
+    ),
     Mutation(
         "release keeps the reservation",
         (*ids(17), "bn-020"),

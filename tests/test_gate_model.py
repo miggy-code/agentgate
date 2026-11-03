@@ -90,9 +90,9 @@ def last_decision(world: World) -> AuditEvent:
 def test_an_allowed_request_reserves_its_worst_case(world: World) -> None:
     ctx = world.run(STAFF)
     reservation = reserved(admit(world, ctx))
-    # 8000 output tokens and 30000 prompt tokens, at the table's rates.
-    assert reservation.amount_usd == Decimal("0.006440")
-    assert spent(world, ctx) == Decimal("0.006440")
+    # 8000 output tokens and 120000 prompt tokens (a token a byte), at the table's rates.
+    assert reservation.amount_usd == Decimal("0.019040")
+    assert spent(world, ctx) == Decimal("0.019040")
     assert world.gate.ledger.run_calls(ctx.run_id) == 1
 
 
@@ -111,7 +111,7 @@ def test_the_allow_is_recorded_with_what_was_decided(world: World) -> None:
         "n": None,
         "asserted_correlation_id": "trial-7",
         "rate_table_version": "test-rates-1",
-        "reserved_usd": "0.006440",
+        "reserved_usd": "0.019040",
         "reserve": "computed",
         "reservation_id": reservation.id,
     }
@@ -128,7 +128,7 @@ def test_an_unpriced_response_settles_at_the_full_reservation(world: World) -> N
     ctx = world.run(STAFF)
     reservation = reserved(admit(world, ctx))
     world.gate.settle_model(ctx, reservation, reservation.amount_usd)
-    assert spent(world, ctx) == Decimal("0.006440")
+    assert spent(world, ctx) == Decimal("0.019040")
 
 
 def test_a_provider_error_is_not_billed(world: World) -> None:
@@ -144,11 +144,11 @@ def test_a_provider_error_is_not_billed(world: World) -> None:
         (ModelExchange(request_sent=False), "0"),
         (ModelExchange(request_sent=False, complete=False, cost_usd=Decimal("0.001")), "0"),
         (ModelExchange(request_sent=True, provider_error=True), "0"),
-        (ModelExchange(request_sent=True, provider_error=True, produced_output=True), "0.006440"),
+        (ModelExchange(request_sent=True, provider_error=True, produced_output=True), "0.019040"),
         (ModelExchange(request_sent=True, cost_usd=Decimal("0.001")), "0.001"),
-        (ModelExchange(request_sent=True), "0.006440"),
-        (ModelExchange(request_sent=True, complete=False), "0.006440"),
-        (ModelExchange(request_sent=True, complete=False, cost_usd=Decimal("0.001")), "0.006440"),
+        (ModelExchange(request_sent=True), "0.019040"),
+        (ModelExchange(request_sent=True, complete=False), "0.019040"),
+        (ModelExchange(request_sent=True, complete=False, cost_usd=Decimal("0.001")), "0.019040"),
     ],
 )
 def test_finish_model_charges_by_what_happened_to_the_call(
@@ -300,13 +300,23 @@ def test_a_fixed_reserve_prices_a_model_the_table_does_not(world: World, tmp_pat
     assert event.details["reserve"] == "fixed" and event.details["reserved_usd"] == "0.02"
 
 
-def test_a_fixed_reserve_is_used_even_when_the_table_prices_the_model(
-    world: World, tmp_path: Path
-) -> None:
+def test_a_fixed_reserve_above_the_computed_worst_case_stands(world: World, tmp_path: Path) -> None:
     gate = gate_for(world, tmp_path, models={"reserve": "0.02"})
     ctx = gate.start_run(KC, STAFF)
     outcome = gate.admit_model(ctx, call(), rates=RATE_TABLE)
     assert isinstance(outcome, Reservation) and outcome.amount_usd == Decimal("0.02")
+    assert last_decision(world).details["reserve"] == "fixed"
+
+
+def test_a_fixed_reserve_cannot_lower_the_computed_worst_case(world: World, tmp_path: Path) -> None:
+    gate = gate_for(world, tmp_path, models={"reserve": "0.000001"})
+    ctx = gate.start_run(KC, STAFF)
+    outcome = gate.admit_model(ctx, call(), rates=RATE_TABLE)
+    assert isinstance(outcome, Reservation) and outcome.amount_usd == Decimal("0.019040")
+    assert last_decision(world).details["reserve"] == "computed"
+    # Without a price the fixed amount is all there is.
+    unpriced = gate.admit_model(ctx, call(), rates=None)
+    assert isinstance(unpriced, Reservation) and unpriced.amount_usd == Decimal("0.000001")
 
 
 # Caps
@@ -314,17 +324,17 @@ def test_a_fixed_reserve_is_used_even_when_the_table_prices_the_model(
 
 def test_a_cap_after_the_run_cap_gets_a_cap_hit_and_nothing_more_is_reserved(world: World) -> None:
     ctx = world.run(STAFF)
-    caps = Caps(max_usd=Decimal("0.013"))
+    caps = Caps(max_usd=Decimal("0.04"))
     first, second = admit(world, ctx, caps=caps), admit(world, ctx, caps=caps)
     assert isinstance(first, Reservation) and isinstance(second, Reservation)
     for _ in range(3):
         outcome = admit(world, ctx, caps=caps)
         assert outcome == CapReached(CapKind.RUN)
-    assert spent(world, ctx) == Decimal("0.012880")
+    assert spent(world, ctx) == Decimal("0.038080")
     assert world.gate.ledger.run_calls(ctx.run_id) == 2
     hit = world.events(EventKind.CAP_HIT)[-1]
     assert hit.reason == "run_cap" and hit.details["source"] == "model"
-    assert hit.details["limit"] == "0.013"
+    assert hit.details["limit"] == "0.04"
 
 
 def test_the_call_cap_tightens_and_never_widens(world: World) -> None:
@@ -334,9 +344,10 @@ def test_the_call_cap_tightens_and_never_widens(world: World) -> None:
     assert admit(world, ctx, caps=Caps(max_calls=2)) == CapReached(CapKind.CALLS)
 
     wide = world.run(STAFF)
+    small = call(max_tokens=10, request_bytes=100)
     for _ in range(40):
-        assert isinstance(admit(world, wide, caps=Caps(max_calls=10_000)), Reservation)
-    assert admit(world, wide, caps=Caps(max_calls=10_000)) == CapReached(CapKind.CALLS)
+        assert isinstance(admit(world, wide, call=small, caps=Caps(max_calls=10_000)), Reservation)
+    assert admit(world, wide, call=small, caps=Caps(max_calls=10_000)) == CapReached(CapKind.CALLS)
 
 
 def test_a_usd_cap_above_the_policys_does_not_widen_it(world: World, tmp_path: Path) -> None:

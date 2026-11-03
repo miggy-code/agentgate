@@ -677,7 +677,8 @@ class Gate:
         be read strictly, or that has a top-level field the provider's list does not name, is
         denied; the policy's models section decides (deny by default, exact model, role,
         output limit, one completion, body size, server-side features); the reservation is
-        priced from the rate table, or is the policy's fixed `reserve`; the run's caps, as
+        priced from the rate table (the policy's fixed `reserve` is a floor on that, and the
+        price itself for a model the table lacks); the run's caps, as
         tightened by `caps`, and the customer's day cap are checked; and the allow is
         recorded before the reservation is handed back. A model the table does not price is
         denied unless the policy sets a fixed reserve. If the allow cannot be recorded the
@@ -726,16 +727,19 @@ class Gate:
 
         models = run.policy.models
         assert models is not None and call.max_tokens is not None  # an allow implies both
-        if isinstance(models.reserve, Decimal):
-            amount: Decimal | None = models.reserve
-        else:
-            amount = (
-                None
-                if rates is None
-                else rates.worst_case_usd(call.model, call.max_tokens, call.request_bytes)
-            )
-            if rates is not None:
-                values["rate_table_version"] = rates.version
+        # The table's worst case is a floor the policy's fixed reserve cannot lower: a tiny
+        # fixed reserve would otherwise let parallel full-size calls slip under the run cap.
+        # The fixed amount only stands in for a model the table does not price.
+        computed = (
+            None
+            if rates is None
+            else rates.worst_case_usd(call.model, call.max_tokens, call.request_bytes)
+        )
+        if rates is not None:
+            values["rate_table_version"] = rates.version
+        fixed = models.reserve if isinstance(models.reserve, Decimal) else None
+        amount = fixed if computed is None else computed if fixed is None else max(fixed, computed)
+        basis = "computed" if amount == computed else "fixed"
         if amount is None:
             return self._deny(
                 asked,
@@ -763,7 +767,7 @@ class Gate:
                 details={
                     **values,
                     "reserved_usd": str(amount),
-                    "reserve": "fixed" if isinstance(models.reserve, Decimal) else "computed",
+                    "reserve": basis,
                     "reservation_id": reserved.id,
                 },
             )

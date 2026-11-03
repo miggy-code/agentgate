@@ -70,7 +70,7 @@ MAX_TOKENS = 8000
 MAX_BYTES = 120_000
 
 # A made-up price list: 0.28 USD per million output tokens and 0.14 per million prompt tokens.
-# At the limits of the envelope a call reserves 0.006440 USD.
+# At the limits of the envelope a call reserves 0.019040 USD.
 RATES = RateTable.from_dict(
     {
         "version": "redteam-rates",
@@ -85,10 +85,10 @@ RATES = RateTable.from_dict(
         },
     }
 )
-WORST_CASE = Decimal("0.006440")
+WORST_CASE = Decimal("0.019040")
 # Dropped-connection calls that fit under DROP_CAP.
 DROP_CALLS = 3
-DROP_CAP = Decimal("0.02")
+DROP_CAP = Decimal("0.06")
 # A price at which one full-envelope call reserves exactly 0.20 USD.
 DEAR_RATES = RateTable.from_dict(
     {
@@ -791,7 +791,7 @@ def client_credentials(arena: Arena) -> None:
 @scenario("mb-014", MB, "Concurrent model calls cannot jointly pass the run's cap")
 def concurrent_reservations(arena: Arena) -> None:
     ctx = arena.start(STAFF)
-    caps = Caps(max_usd=Decimal("0.02"))
+    caps = Caps(max_usd=Decimal("0.06"))
     outcomes: list[object] = []
     barrier = threading.Barrier(16)
 
@@ -807,12 +807,12 @@ def concurrent_reservations(arena: Arena) -> None:
     granted = [o for o in outcomes if isinstance(o, Reservation)]
     refused = [o for o in outcomes if isinstance(o, CapReached) and o.cap.value == "run_cap"]
     spent, calls = _spent(arena, ctx)
-    arena.expect("exactly three fit under 0.02", len(granted) == 3, f"{len(granted)} granted")
+    arena.expect("exactly three fit under 0.06", len(granted) == 3, f"{len(granted)} granted")
     arena.expect(
         "every other call is refused by the run cap", len(refused) == 13, f"{len(refused)} refused"
     )
     arena.expect(
-        "the reserved total stays under the cap", spent <= Decimal("0.02"), f"spent {spent}"
+        "the reserved total stays under the cap", spent <= Decimal("0.06"), f"spent {spent}"
     )
     arena.expect("only the granted calls count", calls == 3, f"{calls} calls")
 
@@ -853,11 +853,12 @@ def caps_only_tighten(arena: Arena) -> None:
     )
 
     forty = arena.start(MANAGER)
+    small = _call(max_tokens=10, request_bytes=100)
     for _ in range(40):
-        _admit(arena, forty, caps=wide)
+        _admit(arena, forty, small, caps=wide)
     _expect_cap(
         arena,
-        _admit(arena, forty, caps=wide),
+        _admit(arena, forty, small, caps=wide),
         "max_calls",
         name="a call cap above the policy's does not raise it",
     )
@@ -1018,7 +1019,7 @@ def worst_case(arena: Arena) -> None:
     reserved = _admitted(arena, _admit(arena, ctx), "a full-envelope call is reserved")
     floor = (
         Decimal(MAX_TOKENS) * Decimal("0.28") / 1_000_000
-        + Decimal(MAX_BYTES // 4) * Decimal("0.14") / 1_000_000
+        + Decimal(MAX_BYTES) * Decimal("0.14") / 1_000_000
     )
     arena.expect(
         "the reservation covers the output limit and the prompt",
@@ -1074,6 +1075,45 @@ def worst_case(arena: Arena) -> None:
         "model_max_tokens_required",
         _call(max_tokens=None),
         rates=None,
+    )
+
+
+@scenario("mb-025", MB, "A tiny fixed reserve cannot lower the worst case the table gives")
+def fixed_reserve_is_a_floor(arena: Arena) -> None:
+    gate = _with_fixed_reserve(arena, Decimal("0.000001"))
+    ctx = arena.start(STAFF)
+    caps = Caps(max_usd=DROP_CAP)
+    first = _admitted(
+        arena, gate.admit_model(ctx, _call(), rates=RATES, caps=caps), "a call is reserved"
+    )
+    arena.expect(
+        "it reserves the computed worst case, not the fixed amount",
+        first is not None and first.amount_usd == WORST_CASE,
+        f"{first.amount_usd if first else None}",
+    )
+    outcomes: list[object] = []
+    barrier = threading.Barrier(12)
+
+    def attempt() -> None:
+        barrier.wait()
+        outcomes.append(gate.admit_model(ctx, _call(), rates=RATES, caps=caps))
+
+    threads = [threading.Thread(target=attempt) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    granted = sum(isinstance(o, Reservation) for o in outcomes)
+    arena.expect(
+        "two more fit under the cap, no more", granted == DROP_CALLS - 1, f"{granted} granted"
+    )
+    spent = _spent(arena, ctx)[0]
+    arena.expect("the reserved total stays under the cap", spent <= DROP_CAP, f"spent {spent}")
+    unpriced = gate.admit_model(arena.start(STAFF), _call(), rates=None)
+    arena.expect(
+        "the fixed amount still prices a model the table lacks",
+        isinstance(unpriced, Reservation) and unpriced.amount_usd == Decimal("0.000001"),
+        describe(unpriced),
     )
 
 

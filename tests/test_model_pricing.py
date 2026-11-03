@@ -31,7 +31,7 @@ RATES: dict[str, Any] = {
 def test_the_worst_case_prices_the_output_limit_and_the_prompt_estimate() -> None:
     table = RateTable.from_dict(RATES)
     # 8000 output tokens at 0.28 and 30000 prompt tokens (120000 bytes / 4) at 0.14 per million.
-    assert table.worst_case_usd("deepseek-flash", 8000, 120000) == Decimal("0.006440")
+    assert table.worst_case_usd("deepseek-flash", 8000, 120000) == Decimal("0.019040")
 
 
 def test_the_estimate_rounds_the_prompt_up_and_the_dollars_up() -> None:
@@ -40,15 +40,15 @@ def test_the_estimate_rounds_the_prompt_up_and_the_dollars_up() -> None:
     assert table.worst_case_usd("deepseek-flash", 0, 1) == Decimal("0.000001")
     assert table.worst_case_usd("deepseek-flash", 0, 0) == Decimal("0.000000")
     assert table.worst_case_usd("deepseek-flash", 0, 5) == Decimal("0.000001")
-    # 4 bytes are exactly one token and 5 are two, so the cost steps at 5.
-    one = table.worst_case_usd("dear-cache", 0, 4_000_000)
-    two = table.worst_case_usd("dear-cache", 0, 4_000_001)
+    # A byte is a token, so the cost steps with every byte.
+    one = table.worst_case_usd("dear-cache", 0, 1_000_000)
+    two = table.worst_case_usd("dear-cache", 0, 1_000_001)
     assert one == Decimal("3.000000") and two is not None and two > one
 
 
 def test_the_prompt_is_priced_at_the_dearer_of_input_and_cached_input() -> None:
     table = RateTable.from_dict(RATES)
-    assert table.worst_case_usd("dear-cache", 0, 4_000_000) == Decimal("3.000000")
+    assert table.worst_case_usd("dear-cache", 0, 1_000_000) == Decimal("3.000000")
 
 
 def test_a_model_the_table_does_not_name_has_no_price() -> None:

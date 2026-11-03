@@ -9,14 +9,17 @@ The table is a versioned JSON file in the format Panoptes uses to price observed
 
 agentgate never guesses a price. A model the table does not name has none, and a call to it
 reserves nothing it could justify, so the gate denies it unless the policy sets a fixed
-reserve (`models.reserve`).
+reserve (`models.reserve`). A fixed reserve never lowers a price the table does give: the
+larger of the two is reserved.
 
-The worst case is the request's declared `max_tokens` at the output rate, plus an estimate
-of the prompt at the dearer of the input and cached-input rates: one token per 4 bytes of
-body. That estimate is not an upper bound (text in some scripts, or dense JSON, runs closer
-to one token per byte), so a response can cost more than was reserved. The ledger records
-what a call actually cost even then, and the next reservation is refused if that put the
-run over its cap; see docs/limits.md.
+The worst case is the request's declared `max_tokens` at the output rate, plus the prompt at
+the dearer of the input and cached-input rates, counted at one token per byte of body. A
+tokenizer does not emit more tokens than it reads bytes, so for text that is an upper bound.
+It is not one for what the body only points at: an image, a file or an audio clip is priced
+by the provider by its size or length, not by the bytes of its base64 or its URL, and a
+provider-run tool is priced by the provider (the gate denies those unless the policy entry
+allows them). The ledger records what a call actually cost even when that exceeds the
+reservation; see docs/limits.md.
 """
 
 import json
@@ -29,7 +32,9 @@ from agentgate._json import no_duplicate_keys
 
 MILLION = Decimal(1_000_000)
 MICRO = Decimal("0.000001")
-BYTES_PER_TOKEN = 4
+# One token per byte: a tokenizer does not emit more tokens than bytes, so this bounds the
+# prompt's token count for text. It is far above the usual 4 bytes per token on purpose.
+BYTES_PER_TOKEN = 1
 RATE_FIELDS = ("input_per_million", "cached_input_per_million", "output_per_million")
 MAX_TABLE_BYTES = 1024 * 1024
 # USD per million tokens. Far above any real price; it keeps a typo from overflowing a reserve.
