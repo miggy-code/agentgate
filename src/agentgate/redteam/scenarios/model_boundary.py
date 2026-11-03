@@ -55,7 +55,7 @@ from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import ModelProvider
 from agentgate.redteam.core import Arena, Category, describe, scenario
 from agentgate.redteam.files import FileWorlds
-from agentgate.spend import Reservation, SpendError
+from agentgate.spend import Reservation
 from agentgate.world import World
 
 MB = Category.MODEL_BOUNDARY
@@ -704,6 +704,12 @@ def dead_tokens(arena: Arena) -> None:
         {e.subject for e in revocations}
         == {ended.record.token_id, kept.record.token_id, short.record.token_id},
     )
+    try:
+        _issue(arena, tokens, ctx.run_id)
+        reissued = True
+    except TokenError:
+        reissued = False
+    arena.expect("no token is issued for the run once it has ended", not reissued)
     for name, token in {"an ended run's token": ended, "its other token": kept}.items():
         arena.expect(f"{name} is refused", _token_refusal(tokens, token.token) == "revoked")
     stored = tokens.get(ended.record.token_id)
@@ -1080,16 +1086,33 @@ def sent_calls_are_charged(arena: Arena) -> None:
         ),
     )
     finishers: dict[str, Callable[[], object]] = {
-        "settling twice": lambda: arena.gate.settle_model(ctx, last, Decimal(0)),
+        "settling a finished call": lambda: arena.gate.settle_model(ctx, last, Decimal(0)),
         "finishing twice": lambda: arena.gate.finish_model(ctx, last, never),
     }
     for name, finish in finishers.items():
         try:
             finish()
             raised = False
-        except SpendError:
+        except ValueError:
             raised = True
         arena.expect(f"{name} is refused", raised)
+    open_call = _admitted(arena, _admit(arena, ctx), "a call to settle by hand")
+    if open_call is not None:
+        before = _spent(arena, ctx)
+        try:
+            arena.gate.settle_model(ctx, open_call, Decimal(0))
+            by_hand = True
+        except ValueError:
+            by_hand = False
+        arena.expect(
+            "a gateway call cannot be settled at an amount of the caller's choice", not by_hand
+        )
+        arena.expect(
+            "the refused settle changed nothing",
+            _spent(arena, ctx) == before,
+            f"{_spent(arena, ctx)}",
+        )
+        arena.gate.finish_model(ctx, open_call, never)
     theirs = _admitted(arena, _admit(arena, arena.start(STAFF)), "another run reserves")
     if theirs is None:
         return
@@ -1415,7 +1438,17 @@ def model_work(arena: Arena) -> None:
             if reservation is None:
                 continue
             actual = Decimal("0.0001") * (index + 1)
-            arena.gate.settle_model(ctx, reservation, actual)
+            arena.gate.finish_model(
+                ctx,
+                reservation,
+                ModelExchange(
+                    request_sent=True,
+                    provider_error=False,
+                    complete=True,
+                    produced_output=True,
+                    cost_usd=actual,
+                ),
+            )
             total += actual
         arena.expect(
             f"{ctx.user_id}'s spend is what the calls cost",

@@ -13,7 +13,8 @@ user's status and the spend caps. A token is refused when:
 - its run is unknown, or its user is unknown, of another customer or suspended.
 
 A token dies with its run. `end_run` revokes every token of a run, which a gateway serving
-one run does when it stops, and a token still expires on its own after its lifetime. A
+one run does when it stops, and marks the run ended so no token is issued for it again; a
+token also expires on its own after its lifetime. A
 refusal says why in a reason code and never shows the token.
 """
 
@@ -51,6 +52,14 @@ _SCHEMA = (
     ) STRICT
     """,
     "CREATE INDEX IF NOT EXISTS run_tokens_run ON run_tokens(run_id)",
+    # A run whose gateway has ended it. A run has no end state of its own, so this is the
+    # record that no token may be issued for it any more.
+    """
+    CREATE TABLE IF NOT EXISTS ended_runs (
+        run_id TEXT PRIMARY KEY,
+        ended_at TEXT NOT NULL
+    ) STRICT
+    """,
 )
 
 
@@ -151,6 +160,10 @@ class TokenStore:
         )
         with self._store.transaction():
             self._run(run_id)
+            if self._store.connection.execute(
+                "SELECT 1 FROM ended_runs WHERE run_id = ?", (run_id,)
+            ).fetchone():
+                raise TokenError("the run has ended")
             live = self._store.connection.execute(
                 "SELECT COUNT(*) FROM run_tokens WHERE run_id = ? AND revoked_at IS NULL"
                 " AND expires_at > ?",
@@ -218,6 +231,10 @@ class TokenStore:
                 "UPDATE run_tokens SET revoked_at = ?, revoked_reason = ?"
                 " WHERE run_id = ? AND revoked_at IS NULL",
                 (self._clock.now().isoformat(), TokenReason.RUN_ENDED.value, run_id),
+            )
+            self._store.connection.execute(
+                "INSERT OR IGNORE INTO ended_runs (run_id, ended_at) VALUES (?, ?)",
+                (run_id, self._clock.now().isoformat()),
             )
             for token_id in ids:
                 revoked = self.get(token_id)

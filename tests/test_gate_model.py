@@ -20,7 +20,7 @@ from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_mode
 from agentgate.model.pricing import RateTable
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import ModelProvider, load_bundle
-from agentgate.spend import CapKind, Reservation, SpendError
+from agentgate.spend import CapKind, Reservation
 from conftest import KC, POLICIES, World
 from test_gate import FailingSink
 from test_model_pricing import RATES
@@ -121,14 +121,24 @@ def test_the_allow_is_recorded_with_what_was_decided(world: World) -> None:
 def test_settling_replaces_the_reservation_with_the_actual_cost(world: World) -> None:
     ctx = world.run(STAFF)
     reservation = reserved(admit(world, ctx))
-    world.gate.settle_model(ctx, reservation, Decimal("0.001"))
+    exchange = ModelExchange(
+        request_sent=True,
+        provider_error=False,
+        complete=True,
+        produced_output=True,
+        cost_usd=Decimal("0.001"),
+    )
+    world.gate.finish_model(ctx, reservation, exchange)
     assert spent(world, ctx) == Decimal("0.001")
 
 
 def test_an_unpriced_response_settles_at_the_full_reservation(world: World) -> None:
     ctx = world.run(STAFF)
     reservation = reserved(admit(world, ctx))
-    world.gate.settle_model(ctx, reservation, reservation.amount_usd)
+    exchange = ModelExchange(
+        request_sent=True, provider_error=False, complete=True, produced_output=True
+    )
+    world.gate.finish_model(ctx, reservation, exchange)
     assert spent(world, ctx) == Decimal("0.019040")
 
 
@@ -228,7 +238,7 @@ def test_a_finished_call_cannot_be_finished_again(world: World) -> None:
             request_sent=True, provider_error=False, complete=True, produced_output=False
         ),
     )
-    with pytest.raises(SpendError):
+    with pytest.raises(ValueError, match="already finished"):
         world.gate.finish_model(
             ctx,
             reservation,
@@ -670,3 +680,36 @@ def test_a_provider_error_with_output_is_charged_in_full_whatever_its_price(worl
     )
     assert exchange.cost_usd is None
     assert world.gate.finish_model(ctx, reservation, exchange) == Decimal("0.019040")
+
+
+def test_a_gateway_reservation_cannot_be_settled_by_hand(world: World) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    with pytest.raises(ValueError, match="finish_model"):
+        world.gate.settle_model(ctx, reservation, Decimal(0))
+    assert spent(world, ctx) == reservation.amount_usd
+
+
+def test_finish_model_ends_only_what_admit_model_made(world: World) -> None:
+    ctx = world.run(STAFF)
+    agent_call = world.gate.charge_model(ctx, Decimal("0.10"))
+    assert isinstance(agent_call, Reservation)
+    sent = ModelExchange(
+        request_sent=True, provider_error=False, complete=True, produced_output=True
+    )
+    with pytest.raises(ValueError, match="admit_model"):
+        world.gate.finish_model(ctx, agent_call, sent)
+    # The reference agent's own path still settles at its host's figure.
+    world.gate.settle_model(ctx, agent_call, Decimal("0.05"))
+    assert spent(world, ctx) == Decimal("0.05")
+
+
+def test_a_reservation_another_gate_made_is_not_finished_here(world: World) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    other = world.gate_with()
+    sent = ModelExchange(
+        request_sent=True, provider_error=False, complete=True, produced_output=True
+    )
+    with pytest.raises(ValueError, match="admit_model"):
+        other.finish_model(ctx, reservation, sent)

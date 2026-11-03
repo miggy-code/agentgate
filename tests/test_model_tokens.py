@@ -478,3 +478,37 @@ def test_neither_issue_nor_revoke_has_an_unrecorded_form(world: World, tokens: T
     issued = _issue(tokens, ctx.run_id)
     with pytest.raises(TypeError):
         tokens.revoke(issued.record.token_id)  # type: ignore[call-arg]
+
+
+def test_no_token_is_issued_for_a_run_that_has_ended(world: World, tokens: TokenStore) -> None:
+    ended, other = world.run(STAFF), world.run(STAFF)
+    _issue(tokens, ended.run_id)
+    tokens.end_run(ended.run_id, record=lambda _: None)
+    with pytest.raises(TokenError, match="ended"):
+        _issue(tokens, ended.run_id)
+    # Another run is not affected, and ending a run again changes nothing.
+    assert _issue(tokens, other.run_id) is not None
+    assert tokens.end_run(ended.run_id, record=lambda _: None) == 0
+    with pytest.raises(TokenError, match="ended"):
+        _issue(tokens, ended.run_id)
+
+
+def test_a_run_with_no_tokens_still_ends(world: World, tokens: TokenStore) -> None:
+    ctx = world.run(STAFF)
+    assert tokens.end_run(ctx.run_id, record=lambda _: None) == 0
+    with pytest.raises(TokenError, match="ended"):
+        _issue(tokens, ctx.run_id)
+
+
+def test_a_run_that_could_not_be_recorded_as_ended_is_not_ended(
+    world: World, tokens: TokenStore
+) -> None:
+    ctx = world.run(STAFF)
+    _issue(tokens, ctx.run_id)
+
+    def refuse(record: TokenRecord) -> None:
+        raise RuntimeError("audit down")
+
+    with pytest.raises(RuntimeError):
+        tokens.end_run(ctx.run_id, record=refuse)
+    assert _issue(tokens, ctx.run_id) is not None

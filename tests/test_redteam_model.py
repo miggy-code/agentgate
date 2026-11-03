@@ -407,6 +407,11 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "a token can be issued for a run that has ended",
+        ids(10),
+        edits=((TokenStore, "issue", (('raise TokenError("the run has ended")', "pass"),)),),
+    ),
+    Mutation(
         "ending a run records nothing",
         ids(10),
         edits=((TokenStore, "end_run", (("record(revoked)", "pass"),)),),
@@ -544,6 +549,19 @@ MUTATIONS = [
         "release keeps the reservation",
         (*ids(17), "bn-020"),
         replace=((SpendLedger, "release", lambda self, reservation: None),),
+    ),
+    Mutation(
+        "a gateway reservation can be settled by hand",
+        ids(17),
+        edits=(
+            (
+                Gate,
+                "settle_model",
+                (('raise ValueError("a gateway reservation is ended by finish_model")', "pass"),),
+            ),
+        ),
+        # The call is settled by hand, and the scenario's later finish finds it settled.
+        crashes=("SpendError",),
     ),
     Mutation(
         "a dropped connection is released",

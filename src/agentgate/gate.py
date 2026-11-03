@@ -326,6 +326,10 @@ class Gate:
         self._index = index
         self._tools = adapters
         self._ledger = SpendLedger(store, clock)
+        # Reservations admit_model made and finish_model has not ended. Only finish_model may
+        # end these, and it may end nothing else, so a model call cannot be settled at an
+        # amount its exchange did not give.
+        self._gateway_reservations: set[str] = set()
         self._approvals = ApprovalQueue(store, clock)
         with store.locked():
             store.connection.execute(_SCHEMA)
@@ -613,7 +617,12 @@ class Gate:
     # Model spend
 
     def charge_model(self, ctx: RunContext, estimated_usd: Decimal) -> Reservation | CapReached:
-        """Reserve a model call against the run and customer-day caps.
+        """Reserve a call of the in-process reference agent (agent.loop) against the run and
+        customer-day caps, at the amount its host estimates.
+
+        This is not the model gateway's path: the host trusts its own model adapter for the
+        estimate and for what `settle_model` is later given. A gateway call goes through
+        `admit_model` and `finish_model`, which price it from the request and the exchange.
 
         Raises IdentityError, after recording a DENY, for an invalid run or user.
         """
@@ -626,8 +635,12 @@ class Gate:
         return reserved
 
     def settle_model(self, ctx: RunContext, reservation: Reservation, actual_usd: Decimal) -> None:
+        """Settle a `charge_model` reservation at the cost its host reports. Refuses one made
+        by `admit_model`: those are ended only by `finish_model`."""
         if reservation.run_id != ctx.run_id:
             raise ValueError("reservation belongs to another run")
+        if reservation.id in self._gateway_reservations:
+            raise ValueError("a gateway reservation is ended by finish_model")
         self._ledger.settle(reservation, actual_usd)
 
     def finish_model(
@@ -646,14 +659,18 @@ class Gate:
         """
         if reservation.run_id != ctx.run_id:
             raise ValueError("reservation belongs to another run")
+        if reservation.id not in self._gateway_reservations:
+            raise ValueError("not a reservation admit_model made, or already finished")
         if not exchange.request_sent or (exchange.provider_error and not exchange.produced_output):
             self._ledger.release(reservation)
-            return Decimal(0)
-        if exchange.complete and exchange.cost_usd is not None:
-            charge = exchange.cost_usd
+            charge = Decimal(0)
         else:
-            charge = reservation.amount_usd
-        self._ledger.settle(reservation, charge)
+            if exchange.complete and exchange.cost_usd is not None:
+                charge = exchange.cost_usd
+            else:
+                charge = reservation.amount_usd
+            self._ledger.settle(reservation, charge)
+        self._gateway_reservations.discard(reservation.id)
         return charge
 
     def admit_model(
@@ -780,6 +797,7 @@ class Gate:
         except Exception:
             self._ledger.release(reserved)
             return Denied(GateReason.AUDIT_UNAVAILABLE.value)
+        self._gateway_reservations.add(reserved.id)
         return reserved
 
     # Policies and operator actions
