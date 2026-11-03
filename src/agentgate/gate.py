@@ -630,14 +630,6 @@ class Gate:
             raise ValueError("reservation belongs to another run")
         self._ledger.settle(reservation, actual_usd)
 
-    def release_model(self, ctx: RunContext, reservation: Reservation) -> None:
-        """Give back the reservation of a call that never reached the provider. Money and
-        call both return to the run. A call that was sent is not released with this: whether
-        the provider billed it is not the caller's to guess (`finish_model`)."""
-        if reservation.run_id != ctx.run_id:
-            raise ValueError("reservation belongs to another run")
-        self._ledger.release(reservation)
-
     def finish_model(
         self, ctx: RunContext, reservation: Reservation, exchange: ModelExchange
     ) -> Decimal:

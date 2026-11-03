@@ -88,6 +88,14 @@ WORST_CASE = Decimal("0.019040")
 # Dropped-connection calls that fit under DROP_CAP.
 DROP_CALLS = 3
 DROP_CAP = Decimal("0.06")
+# A call that never reached the provider, and one it refused with an error and no output:
+# the two endings that give a reservation back (Gate.finish_model).
+NEVER_SENT = ModelExchange(
+    request_sent=False, provider_error=False, complete=True, produced_output=False
+)
+PROVIDER_REFUSED = ModelExchange(
+    request_sent=True, provider_error=True, complete=True, produced_output=False
+)
 # A price at which one full-envelope call reserves exactly 0.20 USD.
 DEAR_RATES = RateTable.from_dict(
     {
@@ -179,7 +187,7 @@ def _refused(
     outcome = _admit(arena, ctx, call, **kwargs)  # type: ignore[arg-type]
     arena.expect(name, isinstance(outcome, Denied) and outcome.reason == reason, describe(outcome))
     if isinstance(outcome, Reservation):
-        arena.gate.release_model(ctx, outcome)
+        arena.gate.finish_model(ctx, outcome, NEVER_SENT)
     after = _spent(arena, ctx)
     arena.expect(f"{name}: nothing reserved", after == before, f"{before} then {after}")
 
@@ -271,7 +279,7 @@ def model_swap(arena: Arena) -> None:
     arena.update_user(STAFF, role=Role.CONTRACTOR)
     _refused(arena, ctx, "a demoted user's next call is denied", "role_changed")
     if first is not None:
-        arena.gate.release_model(ctx, first)
+        arena.gate.finish_model(ctx, first, NEVER_SENT)
 
 
 @scenario("mb-003", MB, "An output limit above the envelope, or none at all, is denied")
@@ -911,7 +919,7 @@ def after_the_cap(arena: Arena) -> None:
         outcome = _admit(arena, ctx, rates=DEAR_RATES, caps=caps)
         refused += isinstance(outcome, CapReached) and outcome.cap.value == "run_cap"
         if isinstance(outcome, Reservation):
-            arena.gate.release_model(ctx, outcome)
+            arena.gate.finish_model(ctx, outcome, NEVER_SENT)
     arena.expect("all fifty later calls are refused", refused == 50, f"{refused} refused")
     arena.expect(
         "nothing more is reserved",
@@ -1034,7 +1042,6 @@ def sent_calls_are_charged(arena: Arena) -> None:
     finishers: dict[str, Callable[[], object]] = {
         "settling twice": lambda: arena.gate.settle_model(ctx, last, Decimal(0)),
         "finishing twice": lambda: arena.gate.finish_model(ctx, last, never),
-        "releasing a settled call": lambda: arena.gate.release_model(ctx, last),
     }
     for name, finish in finishers.items():
         try:
@@ -1048,7 +1055,6 @@ def sent_calls_are_charged(arena: Arena) -> None:
         return
     foreign = theirs
     moves: dict[str, Callable[[], object]] = {
-        "release": lambda: arena.gate.release_model(ctx, foreign),
         "finish": lambda: arena.gate.finish_model(ctx, foreign, never),
     }
     for name, move in moves.items():
@@ -1233,7 +1239,7 @@ def forged_correlation(arena: Arena) -> None:
             describe(reservation),
         )
         if isinstance(reservation, Reservation):
-            arena.gate.release_model(ctx, reservation)
+            arena.gate.finish_model(ctx, reservation, NEVER_SENT)
     events = _model_events(arena, ctx)
     allows = [e for e in events if e.kind is EventKind.ALLOW]
     arena.expect(
@@ -1380,7 +1386,7 @@ def model_work(arena: Arena) -> None:
         settled = _spent(arena, ctx)
         failed = _admit(arena, ctx)
         if isinstance(failed, Reservation):
-            arena.gate.release_model(ctx, failed)
+            arena.gate.finish_model(ctx, failed, PROVIDER_REFUSED)
         arena.expect(
             f"{ctx.user_id}'s failed call costs nothing",
             _spent(arena, ctx) == (settled[0], settled[1]),
@@ -1393,4 +1399,10 @@ def model_work(arena: Arena) -> None:
         if e.kind in (EventKind.DENY, EventKind.CAP_HIT)
     ]
     arena.expect("no denial or cap hit", not blocked, ", ".join(sorted(set(blocked))) or "none")
-    arena.expect("ending a run revokes its token", tokens.end_run(runs[0].run_id) == 1)
+    ended = tokens.end_run(
+        runs[0].run_id,
+        record=lambda token: arena.gate.record_token_event(
+            OperatorAction.TOKEN_REVOKED, token, customer_id=runs[0].customer_id, actor=None
+        ),
+    )
+    arena.expect("ending a run revokes its token", ended == 1)

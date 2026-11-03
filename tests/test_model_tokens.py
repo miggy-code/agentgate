@@ -182,13 +182,13 @@ def test_end_run_revokes_that_runs_tokens_only(world: World, tokens: TokenStore)
     ended, kept = world.run(STAFF), world.run(STAFF)
     first, second = tokens.issue(ended.run_id), tokens.issue(ended.run_id)
     survivor = tokens.issue(kept.run_id)
-    assert tokens.end_run(ended.run_id) == 2
+    assert tokens.end_run(ended.run_id, record=lambda _: None) == 2
     assert _reason(tokens, first.token) is TokenReason.REVOKED
     assert _reason(tokens, second.token) is TokenReason.REVOKED
     assert tokens.resolve(survivor.token) == kept
     stored = tokens.get(first.record.token_id)
     assert stored is not None and stored.revoked_reason == "run_ended"
-    assert tokens.end_run(ended.run_id) == 0
+    assert tokens.end_run(ended.run_id, record=lambda _: None) == 0
 
 
 def test_end_run_records_each_revocation_in_its_transaction(
@@ -428,3 +428,22 @@ def test_a_token_file_does_not_follow_a_link(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         write_token_file(link, "agt_secret")
     assert not target.exists()
+
+
+def test_end_run_has_no_unrecorded_form(tokens: TokenStore) -> None:
+    with pytest.raises(TypeError):
+        tokens.end_run("any-run")  # type: ignore[call-arg]
+
+
+def test_a_token_that_vanishes_during_revocation_is_an_error_not_an_assert(
+    world: World, tokens: TokenStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = world.run(STAFF)
+    issued = tokens.issue(ctx.run_id)
+    monkeypatch.setattr(TokenStore, "get", lambda self, token_id: None)
+    with pytest.raises(TokenError, match="disappeared"):
+        tokens.revoke(issued.record.token_id, record=lambda _: None)
+    with pytest.raises(TokenError, match="disappeared"):
+        tokens.end_run(ctx.run_id, record=lambda _: None)
+    monkeypatch.undo()
+    assert tokens.resolve(issued.token) == ctx

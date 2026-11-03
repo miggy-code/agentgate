@@ -194,16 +194,17 @@ class TokenStore:
                 return False
             if record is not None:
                 revoked = self.get(token_id)
-                assert revoked is not None
+                if revoked is None:
+                    raise TokenError("a token disappeared while it was being revoked")
                 record(revoked)
             return True
 
-    def end_run(self, run_id: str, *, record: Callable[[TokenRecord], None] | None = None) -> int:
+    def end_run(self, run_id: str, *, record: Callable[[TokenRecord], None]) -> int:
         """Revoke every live token of a run, and return how many.
 
-        `record` runs inside the transaction once for each token revoked, with the token as
-        revoked, so a revocation that cannot be recorded is not made: if it raises, no token
-        of the run is revoked.
+        `record` is required: it runs inside the transaction once for each token revoked, with
+        the token as revoked, so a revocation that cannot be recorded is not made (if it
+        raises, no token of the run is revoked) and none is made unrecorded.
         """
         with self._store.transaction():
             ids = [
@@ -219,11 +220,11 @@ class TokenStore:
                 " WHERE run_id = ? AND revoked_at IS NULL",
                 (self._clock.now().isoformat(), TokenReason.RUN_ENDED.value, run_id),
             )
-            if record is not None:
-                for token_id in ids:
-                    revoked = self.get(token_id)
-                    assert revoked is not None
-                    record(revoked)
+            for token_id in ids:
+                revoked = self.get(token_id)
+                if revoked is None:
+                    raise TokenError("a token disappeared while its run was ending")
+                record(revoked)
             return len(ids)
 
     def get(self, token_id: str) -> TokenRecord | None:

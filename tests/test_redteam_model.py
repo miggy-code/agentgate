@@ -414,7 +414,7 @@ MUTATIONS = [
     Mutation(
         "ending a run revokes nothing",
         (*ids(10), "bn-020"),
-        replace=((TokenStore, "end_run", lambda self, run_id, record=None: 0),),
+        replace=((TokenStore, "end_run", lambda self, run_id, *, record: 0),),
     ),
     Mutation(
         "a token is stored as it is",
@@ -600,9 +600,15 @@ MUTATIONS = [
         ),
     ),
     Mutation(
-        "a refused model call is not released",
-        ("bn-020",),
-        replace=((Gate, "release_model", lambda self, ctx, reservation: None),),
+        "a provider error with no output is charged",
+        (*ids(17), "bn-020"),
+        edits=(
+            (
+                Gate,
+                "finish_model",
+                (("(exchange.provider_error and not exchange.produced_output)", "False"),),
+            ),
+        ),
     ),
     Mutation(
         "the worst case forgets the output limit",

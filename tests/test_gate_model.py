@@ -135,7 +135,10 @@ def test_an_unpriced_response_settles_at_the_full_reservation(world: World) -> N
 def test_a_provider_error_is_not_billed(world: World) -> None:
     ctx = world.run(STAFF)
     reservation = reserved(admit(world, ctx))
-    world.gate.release_model(ctx, reservation)
+    refused = ModelExchange(
+        request_sent=True, provider_error=True, complete=True, produced_output=False
+    )
+    world.gate.finish_model(ctx, reservation, refused)
     assert spent(world, ctx) == 0 and world.gate.ledger.run_calls(ctx.run_id) == 0
 
 
@@ -243,13 +246,16 @@ def test_a_finished_call_cannot_be_finished_again(world: World) -> None:
         )
 
 
-def test_a_reservation_of_another_run_cannot_be_settled_or_released(world: World) -> None:
+def test_a_reservation_of_another_run_cannot_be_settled_or_finished(world: World) -> None:
     mine, theirs = world.run(STAFF), world.run(STAFF)
     reservation = reserved(admit(world, theirs))
     with pytest.raises(ValueError):
         world.gate.settle_model(mine, reservation, Decimal(0))
+    never = ModelExchange(
+        request_sent=False, provider_error=False, complete=True, produced_output=False
+    )
     with pytest.raises(ValueError):
-        world.gate.release_model(mine, reservation)
+        world.gate.finish_model(mine, reservation, never)
     assert spent(world, theirs) == reservation.amount_usd
 
 
