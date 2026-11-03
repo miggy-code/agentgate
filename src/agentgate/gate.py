@@ -729,7 +729,8 @@ class Gate:
         For a token that named a run (revoked, expired, for another run, its user suspended),
         so the refusal is on that run's record. The run and user are checked as for any call;
         a suspended user's refusal is recorded as that. `token_reason` is a model.tokens
-        TokenReason value, recorded in details.
+        TokenReason value, recorded in details as `refused_because` (a key with "token" in
+        its name is redacted by the log).
         """
         base = self._begin(run, None, None)
         checked = self._check_run(run, base)
@@ -739,7 +740,7 @@ class Gate:
         return self._deny(
             asked,
             GateReason.TOKEN_REFUSED,
-            details={"source": "model", "token_reason": token_reason},
+            details={"source": "model", "refused_because": token_reason},
         )
 
     def admit_model(

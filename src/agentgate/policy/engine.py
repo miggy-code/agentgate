@@ -218,6 +218,10 @@ class PolicyEngine:
         """The entry for exactly this provider and model, or None."""
         return self._models.get((provider, model))
 
+    def listed_models(self) -> frozenset[tuple[ModelProvider, str]]:
+        """Every (provider, model) the policy's models section lists."""
+        return frozenset(self._models)
+
     @staticmethod
     def _model_envelope_reason(entry: ModelEntry, request: ModelRequest) -> Reason | None:
         if request.role not in entry.roles:

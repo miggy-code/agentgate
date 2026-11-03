@@ -102,6 +102,24 @@ An example MCP client configuration, in the `mcpServers` format many clients use
 
 `uv run --directory` runs the command from the checkout, so the default `data/`, `policies/` and `fixtures/` paths resolve there. At commit `b9e650b` this command line, launched from another directory with `--db` and `--audit-db` added to point at a scratch folder, answered `initialize`, `tools/list` and a `docs_read` over stdio and wrote 7 audit events: a `policy_loaded` and a `fixture_sync` event for each of the two customers on the first open, then `run_started`, `allow` and `executed`. `tests/test_gateway.py::test_cli_serves_over_stdio` launches `agentgate gateway serve --as kc-staff-nadine` as a subprocess and checks the same on every test run.
 
+### The model proxy
+
+`agentgate model-proxy serve --as USER --upstream openai_compatible=https://api.deepseek.com --rate-table rates.json` serves the model APIs for one run. It is Panoptes' reverse proxy with agentgate's decision plugged into its two hooks (`panoptes.hooks`, `docs/hooks.md` in Panoptes): Panoptes forwards, parses, prices and records what it observed; agentgate decides and never touches the body. Both write to one audit file, through one `AuditDB`, on one hash chain.
+
+`before_forward` runs these steps, in order, and any of them can end the request with a status and a reason code (never a policy detail or a key):
+
+1. Only a `POST` to a generation endpoint (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `.../models/<model>:generateContent` and `:streamGenerateContent`) goes on. `/v1/models`, `count_tokens`, `/v1/responses/<id>` and every other route or method is refused (403 `route_not_allowed`). A Gemini model is read from the path as received, never percent-decoded.
+2. Panoptes names the wire protocol; the operator's `--upstream` names the policy provider that speaks it (`openai_compatible` is an OpenAI-wire upstream). A protocol the proxy does not serve is refused.
+3. The raw request body is read with agentgate's strict parser (`parse_model_call`), not Panoptes' `request_json`.
+4. The token is read from `Authorization`, `x-api-key`, `x-goog-api-key`, `api-key` or a `?key=` query value (two different credentials are refused as ambiguous) and resolved to the run it belongs to. A bad token is a 401 `token_refused`; one that names a run is recorded on that run's record with why.
+5. The identity (`session_id` and `run_id` are the run id, the user is the run's user) is built and validated, and anything else that can raise is done, before a reservation exists.
+6. `Gate.admit_model` decides (policy, worst-case reservation, caps) and records. A denial is a 403 with its reason code, a reached cap a 429 with the cap, a failure to decide a 503.
+7. The client's query credentials are dropped, every client credential header is removed (agentgate's list is wider than Panoptes': it adds `api-key`, `cookie` and `proxy-authorization`), and the provider's key is the only one sent.
+
+`after_exchange` runs once for every exchange that entered `before_forward` and ends the reservation through `Gate.finish_model`: released if the request never reached the provider, or the provider answered 4xx or 5xx with no output; otherwise settled at the priced cost when the reply is complete and priced, else at the full reservation. The cost is Panoptes' `estimated_usd_micros` as `Decimal(micros).scaleb(-6)`; a reply that reported no usage is treated as unpriced, since Panoptes reports 0 for one. An exchange's decision events carry its `exchange_id`, the join key to Panoptes' events for the same exchange.
+
+The process starts the run and issues its one token at startup (printed once, or written 0600 to `--token-file`), sweeps reservations older than the lease every minute, and on shutdown stops accepting, lets in-flight exchanges finish and settle, then ends the run and revokes its token. At startup it refuses to serve unless the policy lists a model for each upstream, each upstream has a provider key, and the reservation's rate table (`RateTable`) and the settlement's (Panoptes' `PricingTable`) read one file to the same version, source and rates for every policy model. `agentgate doctor model-proxy` runs those checks without serving.
+
 ## Policy format
 
 Each customer has a folder under `policies/` with three files: `policy.yaml` (rules, caps, approvals, lists), `tools.yaml` (the tools the customer has) and `tests.yaml` (expected decisions). A trimmed excerpt of `policies/kettle-creek-hvac/policy.yaml`:

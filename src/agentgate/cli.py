@@ -18,12 +18,14 @@ import json
 import shlex
 import sqlite3
 import sys
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NoReturn
 
 import typer
 from pydantic import JsonValue
@@ -46,6 +48,10 @@ from agentgate.context import RunContext
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
 from agentgate.fixtures import FixtureError
 from agentgate.gate import GateReason, IdentityError, store_audit_reference
+from agentgate.model.admission import Caps
+from agentgate.model.keys import KeyConfigError, load_provider_keys
+from agentgate.model.pricing import RateTableError
+from agentgate.model.proxy import ProxyConfig
 from agentgate.model.tokens import (
     DEFAULT_TTL,
     MAX_TTL,
@@ -56,7 +62,7 @@ from agentgate.model.tokens import (
 )
 from agentgate.models import Role, User, UserStatus
 from agentgate.policy.engine import Reason
-from agentgate.policy.schema import PolicyError
+from agentgate.policy.schema import ModelProvider, PolicyError
 from agentgate.policy.testing import load_policy_bundles, run_policy_tests
 from agentgate.policy.version import bundle_version, git_revision
 from agentgate.redteam import bench as redteam_bench
@@ -92,6 +98,9 @@ from agentgate.world import (
     suspend_user,
 )
 
+if TYPE_CHECKING:
+    from agentgate.model.proxy import ProxyConfig
+
 app = typer.Typer(
     help="Permissions, approval and audit layer between an AI agent and a company's tools.",
     no_args_is_help=True,
@@ -125,6 +134,14 @@ token_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(token_app, name="token")
+
+model_proxy_app = typer.Typer(
+    help="Serve model APIs to a run's client: every request through the gate.",
+    no_args_is_help=True,
+)
+app.add_typer(model_proxy_app, name="model-proxy")
+doctor_app = typer.Typer(help="Check that a service can start.", no_args_is_help=True)
+app.add_typer(doctor_app, name="doctor")
 
 PoliciesOption = Annotated[
     Path, typer.Option("--policies", help="Directory holding one folder per customer policy.")
@@ -1232,6 +1249,176 @@ def gateway_serve(
             serve_stdio(world, ctx)
         except KeyboardInterrupt:
             raise typer.Exit(code=130) from None
+
+
+# model proxy
+
+UpstreamOption = Annotated[
+    list[str],
+    typer.Option(
+        "--upstream",
+        metavar="PROVIDER=URL",
+        help="The origin serving a provider (anthropic, openai, openai_compatible, gemini), "
+        "e.g. openai_compatible=https://api.deepseek.com. One per wire protocol; repeat it.",
+    ),
+]
+RateTableOption = Annotated[
+    Path,
+    typer.Option(
+        "--rate-table",
+        help="Panoptes-format rate table (JSON). It prices the reservation and the settlement.",
+    ),
+]
+KeysFileOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--keys-file",
+        help="Owner-only JSON of provider keys. Without it, AGENTGATE_<PROVIDER>_API_KEY.",
+    ),
+]
+
+
+def _proxy_config(
+    upstream: list[str],
+    keys_file: Path | None,
+    rate_table: Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    max_usd: str | None = None,
+    max_calls: int | None = None,
+    ttl_minutes: int | None = None,
+    token_file: Path | None = None,
+) -> "ProxyConfig":
+    from agentgate.model.proxy import ProxyConfig
+
+    upstreams: dict[ModelProvider, str] = {}
+    for item in upstream:
+        name, _, url = item.partition("=")
+        try:
+            provider = ModelProvider(name)
+        except ValueError:
+            _fail(f"unknown provider in --upstream (expected PROVIDER=URL): {name!r}")
+        if not url or provider in upstreams:
+            _fail("--upstream is PROVIDER=URL, once per provider")
+        upstreams[provider] = url
+    try:
+        keys = load_provider_keys(keys_file)
+        caps = Caps(
+            max_usd=None if max_usd is None else Decimal(max_usd),
+            max_calls=max_calls,
+        )
+    except (KeyConfigError, ArithmeticError, ValueError) as exc:
+        _fail(str(exc))
+    return ProxyConfig(
+        upstreams=upstreams,
+        keys=keys,
+        rate_table=rate_table,
+        host=host,
+        port=port,
+        caps=caps,
+        token_file=token_file,
+        token_ttl=DEFAULT_TTL if ttl_minutes is None else timedelta(minutes=ttl_minutes),
+    )
+
+
+@model_proxy_app.command("serve")
+def model_proxy_serve(
+    as_user: AsOption,
+    upstream: UpstreamOption,
+    rate_table: RateTableOption,
+    keys_file: KeysFileOption = None,
+    host: Annotated[str, typer.Option("--host", help="Loopback address to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port to bind (0 picks a free one).")] = 0,
+    token_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--token-file", help="Write the run's token to this new file (mode 0600), not stdout."
+        ),
+    ] = None,
+    ttl_minutes: Annotated[
+        int | None, typer.Option("--ttl-minutes", min=1, help="The token's lifetime, at most.")
+    ] = None,
+    max_usd: Annotated[
+        str | None, typer.Option("--max-usd", help="Cap the run's model spend below the policy's.")
+    ] = None,
+    max_calls: Annotated[
+        int | None,
+        typer.Option("--max-calls", min=1, help="Cap the run's calls below the policy's."),
+    ] = None,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Serve model APIs for one run of the acting user until interrupted.
+
+    The client sends the run's token where it would send its provider key; the proxy
+    decides each request against the policy's models section, reserves its worst-case cost,
+    swaps in the provider's key, and settles what the provider reports. Everything, the
+    gate's decisions and Panoptes' observation of each exchange, goes to one audit chain.
+    Stopping drains in-flight exchanges, then ends the run and revokes its token."""
+    from agentgate.model.proxy import ModelProxy, ProxySetupError
+
+    config = _proxy_config(
+        upstream,
+        keys_file,
+        rate_table,
+        host=host,
+        port=port,
+        max_usd=max_usd,
+        max_calls=max_calls,
+        ttl_minutes=ttl_minutes,
+        token_file=token_file,
+    )
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
+        proxy = ModelProxy(world, as_user, config)
+        try:
+            bound = proxy.start()
+        except ProxySetupError as exc:
+            _fail(str(exc))
+        except (OSError, RateTableError) as exc:
+            _fail(f"cannot start: {exc}")
+        try:
+            typer.echo(
+                f"model proxy: run {proxy.run.run_id} for {as_user}, http://{host}:{bound}",
+                err=True,
+            )
+            if proxy.token is not None:
+                typer.echo(proxy.token)
+            else:
+                typer.echo(f"token written to {token_file}", err=True)
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            proxy.stop()
+
+
+@doctor_app.command("model-proxy")
+def doctor_model_proxy(
+    as_user: AsOption,
+    upstream: UpstreamOption,
+    rate_table: RateTableOption,
+    keys_file: KeysFileOption = None,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Check that `model-proxy serve` would start, without starting it: one upstream per
+    wire protocol, a provider key for each, a policy model for them, one rate table that
+    prices the reservation and the settlement alike, and a Panoptes audit log."""
+    from agentgate.model.proxy import ModelProxy, ProxySetupError
+
+    config = _proxy_config(upstream, keys_file, rate_table)
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
+        try:
+            ModelProxy(world, as_user, config).validate()
+        except ProxySetupError as exc:
+            typer.echo(f"model-proxy: FAIL: {exc}")
+            raise typer.Exit(code=1) from None
+    typer.echo("model-proxy: ok")
 
 
 # red team

@@ -238,6 +238,10 @@ A run's request to a model, and the keys, tokens and spend behind the model gate
 | mb-024 | Server-side state, tools and cache writes are denied unless allowed | 30 |
 | mb-025 | A tiny fixed reserve cannot lower the worst case the table gives | 5 |
 
+### Model proxy tests
+
+The proxy's own boundaries are tested over real HTTP, against a fake provider that records what reaches it (`tests/test_model_proxy.py`), not in the in-process suite above. Each is one test, and `tests/test_model_proxy_mutations.py` removes the protection behind it and requires the test to fail: a request to any other route or method is not forwarded; a missing, unknown, revoked or ambiguous token is refused; a token in the query is read and not forwarded; every client credential is replaced by the provider's key (a `Connection` header cannot remove it); a denial, a cap and an error in the decision all stop the request; an exchange is recorded under its run and joined to its decision by `exchange_id`; a complete reply is charged its priced cost, a provider error released, a reply with no usage or a reply cut short charged in full; a failure after the reservation releases it; stopping the proxy revokes the token; two rate tables that disagree, a missing provider key, and a token file others can read all stop the start.
+
 ## benign_control
 
 Not an attack. Ordinary tasks that must still succeed, so a gate that denied everything would fail this category.
