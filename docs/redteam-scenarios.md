@@ -226,7 +226,7 @@ A run's request to a model, and the keys, tokens and spend behind the model gate
 | mb-012 | A provider key never appears in an error, a printout or an echoed reply | 11 |
 | mb-013 | A client's own credentials are stripped and the provider's is the only one sent | 13 |
 | mb-014 | Concurrent model calls cannot jointly pass the run's cap | 4 |
-| mb-015 | Command-line caps tighten the policy and never widen it | 9 |
+| mb-015 | Caps passed to the gate tighten the policy and never widen it | 9 |
 | mb-016 | After the cap every model call is refused and nothing more is reserved | 6 |
 | mb-017 | A call the provider refused is released, and an unpriced reply settles in full | 8 |
 | mb-018 | A reservation covers the worst case, and an unpriced model is denied | 12 |

@@ -295,10 +295,18 @@ class Caps:
     max_calls: int | None = None
 
     def __post_init__(self) -> None:
-        if self.max_usd is not None and not (self.max_usd.is_finite() and self.max_usd > 0):
-            raise ValueError("max_usd must be a positive amount")
-        if self.max_calls is not None and (isinstance(self.max_calls, bool) or self.max_calls < 1):
-            raise ValueError("max_calls must be at least 1")
+        # Types are checked at runtime too: a float would carry binary rounding into the
+        # ledger, and 1.5 calls or True calls would pass a bare comparison.
+        if self.max_usd is not None:
+            if not isinstance(self.max_usd, Decimal):
+                raise TypeError("max_usd must be a Decimal")
+            if not (self.max_usd.is_finite() and self.max_usd > 0):
+                raise ValueError("max_usd must be a positive amount")
+        if self.max_calls is not None:
+            if isinstance(self.max_calls, bool) or not isinstance(self.max_calls, int):
+                raise TypeError("max_calls must be an int")
+            if self.max_calls < 1:
+                raise ValueError("max_calls must be at least 1")
 
     def tighten(self, limits: SpendLimits) -> SpendLimits:
         """limits with the run's spend and call caps lowered to these, never raised. The

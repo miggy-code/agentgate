@@ -164,11 +164,28 @@ def test_caps_equal_to_the_limits_change_nothing() -> None:
         {"max_usd": Decimal("inf")},
         {"max_calls": 0},
         {"max_calls": -1},
+    ],
+)
+def test_caps_with_a_bad_value_are_refused(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        Caps(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_usd": 0.5},
+        {"max_usd": 1},
+        {"max_usd": "0.5"},
+        {"max_usd": True},
+        {"max_calls": 1.5},
+        {"max_calls": 2.0},
+        {"max_calls": "3"},
         {"max_calls": True},
     ],
 )
-def test_invalid_caps_are_refused(kwargs: dict[str, Any]) -> None:
-    with pytest.raises(ValueError):
+def test_caps_of_the_wrong_type_are_refused(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(TypeError):
         Caps(**kwargs)
 
 

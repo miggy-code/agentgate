@@ -4,6 +4,7 @@ trail of one model request."""
 import copy
 import json
 import threading
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -520,3 +521,17 @@ def test_server_features_are_denied_unless_the_entry_allows_them(
     assert isinstance(gate.admit_model(run, parsed, rates=RATE_TABLE), Reservation)
     event = last_decision(world)
     assert event.details["server_features"]
+
+
+def test_the_gate_denies_a_request_with_no_limit_even_if_the_engine_allowed_it(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = PolicyEngine.decide_model
+
+    def allow_anything(self: PolicyEngine, request: Any) -> Any:
+        return real(self, replace(request, max_tokens=1))
+
+    monkeypatch.setattr(PolicyEngine, "decide_model", allow_anything)
+    ctx = world.run(STAFF)
+    assert denied(admit(world, ctx, call=call(max_tokens=None))) == "model_max_tokens_required"
+    assert spent(world, ctx) == 0

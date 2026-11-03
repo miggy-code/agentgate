@@ -240,6 +240,8 @@ def test_a_model_case_loads(tmp_path: Path) -> None:
         {"tool": "docs.read", "action": "read"},
         {"document": "acme-handbook"},
         {"recipients": ["a@b.example"]},
+        {"amount_usd": 0},
+        {"amount_usd": "0"},
         {"model": {"provider": "openai_compatible", "name": "x"}},
         {"model": {"provider": "nope", "name": "x", "request_bytes": 1}},
     ],

@@ -77,7 +77,12 @@ class PolicyTestCase(BaseModel):
     def _one_kind(self) -> "PolicyTestCase":
         is_tool = self.tool is not None or self.action is not None
         if self.model is not None:
-            if is_tool or self.document is not None or self.recipients or self.amount_usd:
+            if (
+                is_tool
+                or self.document is not None
+                or self.recipients
+                or self.amount_usd is not None
+            ):
                 raise ValueError("a model case takes only user, model and the expectation")
         elif self.tool is None or self.action is None:
             raise ValueError("a case needs tool and action, or model")

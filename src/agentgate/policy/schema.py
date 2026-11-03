@@ -150,8 +150,9 @@ class ModelPolicy(_Model):
 
     allow: tuple[ModelEntry, ...] = Field(min_length=1)
     # What one model call reserves before it is sent: "computed" prices the worst case from
-    # the request and the rate table; a fixed USD amount is reserved instead, so a model the
-    # table does not price, or a request that does not declare max_tokens, can still run.
+    # the request and the rate table. A fixed USD amount stands in for a model the table does
+    # not price, and is a floor under the computed amount for one it does. A request that
+    # declares no max_tokens is denied either way (model_max_tokens_required).
     reserve: Literal["computed"] | PositiveUsd = "computed"
 
     @model_validator(mode="after")

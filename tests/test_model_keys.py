@@ -16,6 +16,7 @@ from agentgate.model.keys import (
     ProviderKeys,
     key_env_name,
     load_provider_keys,
+    prepare_upstream_request,
     strip_query_credentials,
     validate_key,
     with_provider_credential,
@@ -290,3 +291,15 @@ def test_a_client_header_with_no_credential_is_left_alone() -> None:
 )
 def test_query_credentials_are_stripped(path: str, kept: str, removed: list[str]) -> None:
     assert strip_query_credentials(path) == (kept, removed)
+
+
+def test_an_upstream_request_carries_only_the_providers_credential() -> None:
+    keys = ProviderKeys(ALL)
+    path, headers = prepare_upstream_request(
+        keys,
+        ModelProvider.GEMINI,
+        "/v1beta/models/m:generateContent?key=client-secret&alt=sse",
+        [("X-Api-Key", "client-secret"), ("Authorization", "Bearer client-secret"), ("x-t", "1")],
+    )
+    assert path == "/v1beta/models/m:generateContent?alt=sse"
+    assert headers == [("x-t", "1"), ("x-goog-api-key", GEMINI_KEY)]

@@ -201,6 +201,13 @@ MUTATIONS = [
     Mutation(
         "a missing output limit is allowed",
         ids(3, 18),
+        edits=(
+            (
+                Gate,
+                "admit_model",
+                (("if models is None or call.max_tokens is None:", "if False:"),),
+            ),
+        ),
         replace=(
             (
                 PolicyEngine,
@@ -208,7 +215,7 @@ MUTATIONS = [
                 _envelope_without(Reason.MODEL_MAX_TOKENS_REQUIRED),
             ),
         ),
-        crashes=("AssertionError",),
+        crashes=("TypeError",),
     ),
     Mutation(
         "the number of completions is not checked",
@@ -479,28 +486,32 @@ MUTATIONS = [
     Mutation(
         "query parameter names are compared case-sensitively",
         ids(13),
-        replace=everywhere(
-            keys_module,
-            "strip_query_credentials",
-            mutant(
+        replace=(
+            (
                 keys_module,
                 "strip_query_credentials",
-                (("unquote_plus(name).casefold()", "unquote_plus(name)"),),
-                {},
+                mutant(
+                    keys_module,
+                    "strip_query_credentials",
+                    (("unquote_plus(name).casefold()", "unquote_plus(name)"),),
+                    {},
+                ),
             ),
         ),
     ),
     Mutation(
         "query parameter names are not decoded",
         ids(13),
-        replace=everywhere(
-            keys_module,
-            "strip_query_credentials",
-            mutant(
+        replace=(
+            (
                 keys_module,
                 "strip_query_credentials",
-                (("unquote_plus(name).casefold()", "name.casefold()"),),
-                {},
+                mutant(
+                    keys_module,
+                    "strip_query_credentials",
+                    (("unquote_plus(name).casefold()", "name.casefold()"),),
+                    {},
+                ),
             ),
         ),
     ),

@@ -230,3 +230,17 @@ def with_provider_credential(
         (name, value) for name, value in headers if name.lower() not in CLIENT_CREDENTIAL_HEADERS
     ]
     return [*kept, (credential.name, credential.value)]
+
+
+def prepare_upstream_request(
+    keys: ProviderKeys,
+    provider: ModelProvider,
+    path: str,
+    headers: Iterable[tuple[str, str]],
+) -> tuple[str, list[tuple[str, str]]]:
+    """The path and headers to send to a provider: the client's credentials removed from both
+    and the provider's own added. This is the one function the proxy's hook calls to build an
+    upstream request, so what it returns is exactly what the provider can see of the
+    client's credentials."""
+    clean_path, _ = strip_query_credentials(path)
+    return clean_path, with_provider_credential(headers, keys.credential(provider))

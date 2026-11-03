@@ -727,7 +727,20 @@ class Gate:
             )
 
         models = run.policy.models
-        assert models is not None and call.max_tokens is not None  # an allow implies both
+        if models is None or call.max_tokens is None:
+            # The engine allows only a request that declares its limit, under a policy with
+            # models; this keeps a bug there from becoming an unpriced reservation.
+            reason = (
+                Reason.MODEL_NOT_ALLOWED if models is None else Reason.MODEL_MAX_TOKENS_REQUIRED
+            )
+            return self._deny(
+                asked,
+                reason,
+                subject=subject,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                details=values,
+            )
         # The table's worst case is a floor the policy's fixed reserve cannot lower: a tiny
         # fixed reserve would otherwise let parallel full-size calls slip under the run cap.
         # The fixed amount only stands in for a model the table does not price.
