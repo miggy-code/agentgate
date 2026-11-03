@@ -57,7 +57,13 @@ jobs:
 
   # The same suite against Panoptes main from git, next to the pinned PyPI version above, so a
   # Panoptes change that breaks agentgate shows up before Panoptes is released.
+  #
+  # It runs on the schedule and by hand only. Panoptes main moves on its own, and a change there
+  # should not turn an agentgate pull request red. Panoptes will become 0.2.0.dev, which is
+  # outside the `<0.2` pin in pyproject.toml; `uv pip install` below ignores that pin, as the
+  # job intends, but a plain `uv sync` against that version would not resolve.
   panoptes-main:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -78,10 +84,23 @@ jobs:
           uv pip install --reinstall-package panoptes-observe
           "panoptes-observe @ git+https://github.com/miggy-code/Panoptes@main"
 
-      - name: Show the Panoptes commit
-        run: >
-          uv run --no-sync python -c "import importlib.metadata as m;
-          print(m.distribution('panoptes-observe').read_text('direct_url.json'))"
+      # Fail unless the install is the git checkout: a direct URL with a commit id. The pinned
+      # release has neither, so a skipped or failed replacement cannot go green.
+      - name: Check that Panoptes main is what is installed
+        run: |
+          uv run --no-sync python - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import sys
+
+          raw = metadata.distribution("panoptes-observe").read_text("direct_url.json")
+          if raw is None:
+              sys.exit("panoptes-observe was not installed from git: no direct_url.json")
+          commit = json.loads(raw).get("vcs_info", {}).get("commit_id")
+          if not commit:
+              sys.exit("panoptes-observe direct_url.json holds no commit id")
+          print("panoptes-observe commit", commit)
+          PY
 
       # No lint or type check: those say nothing about Panoptes. `uv run` must not sync, or
       # it would put the pinned release back.
