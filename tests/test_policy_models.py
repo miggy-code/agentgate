@@ -140,6 +140,7 @@ def test_the_limits_themselves_are_allowed(tmp_path: Path) -> None:
         ({"n": 0}, Reason.MODEL_N_NOT_ONE),
         ({"n": -1}, Reason.MODEL_N_NOT_ONE),
         ({"request_bytes": 120001}, Reason.MODEL_REQUEST_TOO_LARGE),
+        ({"server_features": True}, Reason.MODEL_SERVER_FEATURE),
     ],
 )
 def test_a_request_outside_the_entry_is_denied(
@@ -148,6 +149,12 @@ def test_a_request_outside_the_entry_is_denied(
     decision = _engine(tmp_path).decide_model(_request(**changes))
     assert decision.effect is Effect.DENY
     assert decision.reason is reason
+
+
+def test_an_entry_that_allows_server_features_admits_them(tmp_path: Path) -> None:
+    models = {"allow": [{**ENTRY, "allow_server_features": True}]}
+    decision = _engine(tmp_path, models).decide_model(_request(server_features=True))
+    assert decision.effect is Effect.ALLOW
 
 
 def test_a_policy_without_the_section_denies_every_model(tmp_path: Path) -> None:
@@ -187,6 +194,7 @@ def test_a_policy_without_the_section_keeps_its_earlier_canonical_form(tmp_path:
         {**MODELS, "allow": [{**ENTRY, "model": "other"}]},
         {**MODELS, "allow": [{**ENTRY, "provider": "openai"}]},
         {**MODELS, "reserve": "0.02"},
+        {**MODELS, "allow": [{**ENTRY, "allow_server_features": True}]},
         None,
     ],
 )

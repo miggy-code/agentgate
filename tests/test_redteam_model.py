@@ -262,6 +262,70 @@ MUTATIONS = [
             ),
         ),
     ),
+    Mutation(
+        "the body is decoded leniently",
+        ids(6),
+        replace=everywhere(
+            admission_module,
+            "parse_model_call",
+            mutant(admission_module, "parse_model_call", (('body.decode("utf-8")', "body"),), {}),
+        ),
+    ),
+    Mutation(
+        "a body nested past the parser is not caught",
+        ids(6),
+        replace=everywhere(
+            admission_module,
+            "parse_model_call",
+            mutant(
+                admission_module,
+                "parse_model_call",
+                (("except (ValueError, RecursionError):", "except ValueError:"),),
+                {},
+            ),
+        ),
+        crashes=("RecursionError",),
+    ),
+    Mutation(
+        "unread fields are not counted",
+        ids(23),
+        replace=everywhere(
+            admission_module,
+            "parse_model_call",
+            mutant(
+                admission_module,
+                "parse_model_call",
+                (
+                    (
+                        "unknown_fields=sum(1 for name in data if name not in _FIELDS[provider])",
+                        "unknown_fields=0",
+                    ),
+                ),
+                {},
+            ),
+        ),
+    ),
+    Mutation(
+        "the gate lets unread fields through",
+        ids(23),
+        edits=((Gate, "admit_model", (("if call.unknown_fields:", "if False:"),)),),
+    ),
+    Mutation(
+        "server features are not seen",
+        ids(24),
+        replace=((admission_module, "_server_features", lambda provider, data: ()),),
+    ),
+    Mutation(
+        "server features are allowed",
+        ids(24),
+        replace=(
+            (
+                PolicyEngine,
+                "_model_envelope_reason",
+                _envelope_without(Reason.MODEL_SERVER_FEATURE),
+            ),
+        ),
+    ),
     # Tokens
     Mutation(
         "a token of a suspended user still resolves",

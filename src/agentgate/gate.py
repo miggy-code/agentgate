@@ -189,6 +189,8 @@ class GateReason(StrEnum):
     AUDIT_UNAVAILABLE = "audit_unavailable"
     # A model request whose body could not be read strictly (see model.admission).
     MODEL_REQUEST_INVALID = "model_request_invalid"
+    # The body has a top-level field the provider's list does not name.
+    MODEL_UNKNOWN_FIELD = "model_unknown_field"
     # The policy reserves a computed worst case and the rate table cannot give one.
     MODEL_UNPRICED = "model_unpriced"
     TOOL_ERROR = "tool_error"
@@ -672,8 +674,9 @@ class Gate:
         """Decide a model request for the run and, if allowed, reserve its worst-case cost.
 
         In order: the run and its user are checked as for a tool call; a body that could not
-        be read strictly is denied; the policy's models section decides (deny by default,
-        exact model, role, output limit, one completion, body size); the reservation is
+        be read strictly, or that has a top-level field the provider's list does not name, is
+        denied; the policy's models section decides (deny by default, exact model, role,
+        output limit, one completion, body size, server-side features); the reservation is
         priced from the rate table, or is the policy's fixed `reserve`; the run's caps, as
         tightened by `caps`, and the customer's day cap are checked; and the allow is
         recorded before the reservation is handed back. A model the table does not price is
@@ -691,6 +694,9 @@ class Gate:
         if not call.valid:
             return self._deny(asked, GateReason.MODEL_REQUEST_INVALID, details=values)
 
+        if call.unknown_fields:
+            return self._deny(asked, GateReason.MODEL_UNKNOWN_FIELD, details=values)
+
         decision = run.engine.decide_model(
             ModelRequest(
                 customer_id=run.ctx.customer_id,
@@ -700,6 +706,7 @@ class Gate:
                 max_tokens=call.max_tokens,
                 n=call.n,
                 request_bytes=call.request_bytes,
+                server_features=bool(call.server_features),
             )
         )
         listed = run.engine.model_entry(call.provider, call.model) is not None
@@ -1835,6 +1842,10 @@ def _model_values(gate: Gate, call: ModelCall) -> dict[str, JsonValue]:
     if call.valid:
         values["max_tokens"] = call.max_tokens
         values["n"] = call.n
+        if call.unknown_fields:
+            values["unknown_fields"] = call.unknown_fields
+        if call.server_features:
+            values["server_features"] = list(call.server_features)
     asserted = call.correlation_id
     if asserted is not None:
         if _CORRELATION_ID.fullmatch(asserted) and storable_identifier(asserted):

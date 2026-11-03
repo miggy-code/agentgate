@@ -139,6 +139,10 @@ class ModelEntry(_Model):
     max_output_tokens: int = Field(ge=1, le=10_000_000)
     # Bodies above 16 MiB are refused before they are read (model.admission.MAX_BODY_BYTES).
     max_request_bytes: int = Field(ge=1, le=16 * 1024 * 1024)
+    # Whether a request may start server-side work: state kept by the provider between
+    # calls, tools the provider runs itself, prompt-cache writes. Each can bill far more
+    # than the body's size suggests, so the default is no.
+    allow_server_features: bool = False
 
 
 class ModelPolicy(_Model):

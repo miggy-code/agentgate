@@ -92,7 +92,7 @@ def test_a_body_over_the_read_limit_is_invalid_without_being_parsed() -> None:
 
 
 def test_the_model_is_taken_exactly_as_sent() -> None:
-    for name in ("deepseek-flash ", "DeepSeek-Flash", "deepseek-flash​", ""):
+    for name in ("deepseek-flash ", "DeepSeek-Flash", "deepseek-flash\u200b", ""):
         call = _parse(_body(model=name, max_tokens=1))
         assert call.valid and call.model == name
 
@@ -170,3 +170,135 @@ def test_caps_equal_to_the_limits_change_nothing() -> None:
 def test_invalid_caps_are_refused(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         Caps(**kwargs)
+
+
+# Fields the parser does not read
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"MAX_TOKENS": 100_000},
+        {"Max_Tokens": 100_000},
+        {"max_tokens ": 100_000},
+        {"max_tokens\u200b": 100_000},
+        {"\uff4dax_tokens": 100_000},
+        {"best_of": 20},
+        {"models": ["gpt-5"]},
+        {"route": "fallback"},
+        {"provider": {"order": ["x"]}},
+        {"service_tier": "priority"},
+        {"prompt_cache_retention": "24h"},
+    ],
+)
+def test_a_field_the_provider_list_does_not_name_is_counted(extra: dict[str, Any]) -> None:
+    call = _parse(_body(max_tokens=10, **extra))
+    assert call.valid and call.max_tokens == 10 and call.unknown_fields == 1
+
+
+def test_every_unknown_field_is_counted_and_known_ones_are_not() -> None:
+    call = _parse(_body(max_tokens=10, temperature=0.1, stream=False, a=1, b=2, c=3))
+    assert call.unknown_fields == 3
+
+
+@pytest.mark.parametrize(
+    ("provider", "body"),
+    [
+        (ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 5, "n": 2}),
+        (ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 5, "max_completion_tokens": 9}),
+        (ModelProvider.GEMINI, {"contents": [], "model": "m"}),
+        (ModelProvider.GEMINI, {"contents": [], "max_tokens": 5}),
+    ],
+)
+def test_each_provider_has_its_own_list(provider: ModelProvider, body: dict[str, Any]) -> None:
+    call = parse_model_call(provider, json.dumps(body).encode(), path_model="m")
+    assert call.valid and call.unknown_fields == 1
+
+
+def test_the_known_fields_of_each_provider_are_not_counted() -> None:
+    anthropic = {"model": "m", "max_tokens": 5, "messages": [], "system": "s", "tools": []}
+    gemini = {"contents": [], "generationConfig": {"maxOutputTokens": 5}, "tools": []}
+    assert (
+        parse_model_call(ModelProvider.ANTHROPIC, json.dumps(anthropic).encode()).unknown_fields
+        == 0
+    )
+    assert (
+        parse_model_call(
+            ModelProvider.GEMINI, json.dumps(gemini).encode(), path_model="m"
+        ).unknown_fields
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"model": "m", "max_tokens": 5}',
+    ],
+)
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-8-sig"])
+def test_only_utf8_is_read(text: str, encoding: str) -> None:
+    assert _parse(text.encode(encoding)).valid is False
+    assert _parse(text.encode("utf-8")).valid is True
+
+
+def test_a_deep_but_well_formed_body_hits_the_recursion_limit() -> None:
+    # The premise of the red-team case: this body is valid JSON that the parser cannot read.
+    deep = b'{"model":"m","max_tokens":1,"messages":' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+    with pytest.raises(RecursionError):
+        json.loads(deep)
+    call = _parse(deep)
+    assert not call.valid
+
+
+@pytest.mark.parametrize(
+    ("provider", "fields", "expected"),
+    [
+        (OPENAI, {"previous_response_id": "r"}, ("server_state",)),
+        (OPENAI, {"conversation": "c"}, ("server_state",)),
+        (OPENAI, {"background": True}, ("server_state",)),
+        (OPENAI, {"tools": [{"type": "web_search"}]}, ("server_tool",)),
+        (OPENAI, {"tools": [{"type": "function", "function": {}}]}, ()),
+        (OPENAI, {"tools": [{"function": {}}]}, ("server_tool",)),
+        (OPENAI, {"tools": "web_search"}, ("server_tool",)),
+        (OPENAI, {"tools": ["web_search"]}, ("server_tool",)),
+        (OPENAI, {"messages": [{"c": [{"cache_control": {}}]}]}, ("cache_write",)),
+        (
+            OPENAI,
+            {"previous_response_id": "r", "tools": [{"type": "mcp"}]},
+            ("server_state", "server_tool"),
+        ),
+        (OPENAI, {"tools": None}, ()),
+    ],
+)
+def test_server_features_are_seen(
+    provider: ModelProvider, fields: dict[str, Any], expected: tuple[str, ...]
+) -> None:
+    assert _parse(_body(max_tokens=5, **fields), provider).server_features == expected
+
+
+def test_server_features_of_the_other_providers() -> None:
+    def seen(provider: ModelProvider, body: dict[str, Any]) -> tuple[str, ...]:
+        return parse_model_call(provider, json.dumps(body).encode(), path_model="m").server_features
+
+    custom = {"name": "t", "input_schema": {}}
+    assert seen(ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 1, "tools": [custom]}) == ()
+    typed = {"type": "custom", **custom}
+    assert seen(ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 1, "tools": [typed]}) == ()
+    search = {"type": "web_search_20250305", "name": "web_search"}
+    assert seen(ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 1, "tools": [search]}) == (
+        "server_tool",
+    )
+    assert seen(ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 1, "mcp_servers": []}) == (
+        "server_state",
+    )
+    system = [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]
+    assert seen(ModelProvider.ANTHROPIC, {"model": "m", "max_tokens": 1, "system": system}) == (
+        "cache_write",
+    )
+    functions = {"functionDeclarations": [{"name": "f"}]}
+    assert seen(ModelProvider.GEMINI, {"contents": [], "tools": [functions]}) == ()
+    assert seen(ModelProvider.GEMINI, {"contents": [], "tools": [{"googleSearch": {}}]}) == (
+        "server_tool",
+    )
+    assert seen(ModelProvider.GEMINI, {"contents": [], "cachedContent": "c"}) == ("server_state",)

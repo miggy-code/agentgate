@@ -48,6 +48,7 @@ class Reason(StrEnum):
     MODEL_MAX_TOKENS_EXCEEDED = "model_max_tokens_exceeded"
     MODEL_N_NOT_ONE = "model_n_not_one"
     MODEL_REQUEST_TOO_LARGE = "model_request_too_large"
+    MODEL_SERVER_FEATURE = "model_server_feature"
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,8 @@ class ModelRequest:
     # The number of completions asked for, or None when the body leaves it at the default (1).
     n: int | None
     request_bytes: int
+    # Whether the request starts server-side work (state, provider-run tools, cache writes).
+    server_features: bool = False
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,8 @@ class PolicyEngine:
             return Reason.MODEL_N_NOT_ONE
         if request.request_bytes > entry.max_request_bytes:
             return Reason.MODEL_REQUEST_TOO_LARGE
+        if request.server_features and not entry.allow_server_features:
+            return Reason.MODEL_SERVER_FEATURE
         return None
 
     def _decision(self, effect: Effect, reason: Reason, rule_ids: Iterable[str] = ()) -> Decision:

@@ -9,6 +9,14 @@ deeper than the parser allows, or whose model, limit or count has the wrong type
 guessed at but marked invalid, and the gate denies it. Where a provider has several spellings
 of an output limit (`max_tokens` and `max_completion_tokens`), the largest one declared is the
 limit, so naming the small one cannot hide the large one.
+
+Only fields the code knows are allowed. Each provider has a list of the top-level body fields
+its API takes; a body with any other (`best_of`, OpenRouter's `models` fallback list, a
+differently cased `MAX_TOKENS`) is denied, because a field the parser does not read can still
+change what the provider does and what it charges. Fields that start server-side work the
+policy entry must allow (`allow_server_features`) are listed apart: state kept by the
+provider between calls, tools the provider runs itself, and prompt-cache writes. A body must
+be UTF-8; the JSON parser would otherwise accept UTF-16 and UTF-32 too.
 """
 
 import json
@@ -37,6 +45,98 @@ _COUNT_FIELDS: dict[ModelProvider, tuple[str, ...]] = {
 }
 
 
+_OPENAI_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "n",
+        "stream",
+        "stream_options",
+        "temperature",
+        "top_p",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "seed",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "user",
+        "reasoning_effort",
+        "functions",
+        "function_call",
+        "input",
+        "instructions",
+        "text",
+        "reasoning",
+        "truncation",
+        "include",
+        "metadata",
+        "previous_response_id",
+        "conversation",
+        "background",
+    }
+)
+_FIELDS: dict[ModelProvider, frozenset[str]] = {
+    ModelProvider.OPENAI: _OPENAI_FIELDS,
+    ModelProvider.OPENAI_COMPATIBLE: _OPENAI_FIELDS | {"top_k", "min_p"},
+    ModelProvider.ANTHROPIC: frozenset(
+        {
+            "model",
+            "messages",
+            "max_tokens",
+            "system",
+            "temperature",
+            "top_p",
+            "top_k",
+            "stop_sequences",
+            "stream",
+            "tools",
+            "tool_choice",
+            "metadata",
+            "thinking",
+            "mcp_servers",
+            "container",
+        }
+    ),
+    ModelProvider.GEMINI: frozenset(
+        {
+            "contents",
+            "generationConfig",
+            "generation_config",
+            "systemInstruction",
+            "system_instruction",
+            "safetySettings",
+            "safety_settings",
+            "tools",
+            "toolConfig",
+            "tool_config",
+            "cachedContent",
+            "cached_content",
+        }
+    ),
+}
+# Top-level fields that start work or keep state on the provider's side.
+_SERVER_STATE_FIELDS: dict[ModelProvider, frozenset[str]] = {
+    ModelProvider.OPENAI: frozenset({"previous_response_id", "conversation", "background"}),
+    ModelProvider.OPENAI_COMPATIBLE: frozenset(
+        {"previous_response_id", "conversation", "background"}
+    ),
+    ModelProvider.ANTHROPIC: frozenset({"mcp_servers", "container"}),
+    ModelProvider.GEMINI: frozenset({"cachedContent", "cached_content"}),
+}
+SERVER_STATE = "server_state"
+SERVER_TOOL = "server_tool"
+CACHE_WRITE = "cache_write"
+
+
 @dataclass(frozen=True)
 class ModelCall:
     """One model request, as the gate decides it. Nothing here is the request's text."""
@@ -53,6 +153,12 @@ class ModelCall:
     correlation_id: str | None = None
     # False when the body could not be read as a request (see parse_model_call).
     valid: bool = True
+    # How many top-level fields the provider's list does not name. Their names are the
+    # client's text and are not kept.
+    unknown_fields: int = 0
+    # Which kinds of server-side work the body asks for (SERVER_STATE, SERVER_TOOL,
+    # CACHE_WRITE), sorted.
+    server_features: tuple[str, ...] = ()
 
 
 def parse_model_call(
@@ -72,7 +178,8 @@ def parse_model_call(
     if len(body) > MAX_BODY_BYTES:
         return invalid
     try:
-        data = json.loads(body, object_pairs_hook=no_duplicate_keys)
+        # Decoded here, so only UTF-8 is read: json.loads would take UTF-16 and UTF-32 bytes.
+        data = json.loads(body.decode("utf-8"), object_pairs_hook=no_duplicate_keys)
     except (ValueError, RecursionError):
         # Not UTF-8, not JSON, a repeated key, or nested too deep to parse.
         return invalid
@@ -104,7 +211,48 @@ def parse_model_call(
         n=counts[0] if counts else None,
         request_bytes=len(body),
         correlation_id=correlation_id,
+        unknown_fields=sum(1 for name in data if name not in _FIELDS[provider]),
+        server_features=_server_features(provider, data),
     )
+
+
+def _server_features(provider: ModelProvider, data: dict[str, object]) -> tuple[str, ...]:
+    """The kinds of server-side work the body asks for. A field it cannot read is counted."""
+    found: set[str] = set()
+    if any(name in data for name in _SERVER_STATE_FIELDS[provider]):
+        found.add(SERVER_STATE)
+    tools = data.get("tools")
+    if tools is not None and not isinstance(tools, list):
+        found.add(SERVER_TOOL)
+    for tool in tools if isinstance(tools, list) else ():
+        if not isinstance(tool, dict) or _is_server_tool(provider, tool):
+            found.add(SERVER_TOOL)
+    if _contains_key(data, "cache_control"):
+        found.add(CACHE_WRITE)
+    return tuple(sorted(found))
+
+
+def _is_server_tool(provider: ModelProvider, tool: dict[str, object]) -> bool:
+    if provider is ModelProvider.GEMINI:
+        # Gemini's own tools (search, code execution, URL context) are keys of their own.
+        return any(key not in {"functionDeclarations", "function_declarations"} for key in tool)
+    if provider is ModelProvider.ANTHROPIC:
+        return tool.get("type", "custom") != "custom"
+    return tool.get("type") != "function"
+
+
+def _contains_key(value: object, name: str) -> bool:
+    """Whether any object in the parsed body, at any depth, has this key."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if name in item:
+                return True
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
 
 
 def _integers(sources: list[dict[str, object]], names: tuple[str, ...]) -> list[int] | None:

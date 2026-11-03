@@ -125,13 +125,16 @@ def _call(**changes: object) -> ModelCall:
     return ModelCall(**fields)  # type: ignore[arg-type]
 
 
-def _body(size: int | None = None, **fields: object) -> bytes:
-    """A request body for deepseek-flash, padded with message text to exactly `size` bytes."""
+def _body(**fields: object) -> bytes:
+    """A request body for deepseek-flash with the given extra or replaced fields."""
     data: dict[str, object] = {"model": MODEL, "max_tokens": 100, "messages": [{"role": "user"}]}
     data |= fields
-    raw = json.dumps(data).encode()
-    if size is None:
-        return raw
+    return json.dumps(data).encode()
+
+
+def _padded(size: int) -> bytes:
+    """A request body of exactly `size` bytes, padded with message text."""
+    data: dict[str, object] = {"model": MODEL, "max_tokens": 100, "messages": []}
     data["messages"] = [{"role": "user", "content": ""}]
     base = len(json.dumps(data).encode())
     data["messages"] = [{"role": "user", "content": "x" * (size - base)}]
@@ -348,11 +351,11 @@ def oversized_body(arena: Arena) -> None:
             "model_request_too_large",
             _call(request_bytes=size),
         )
-    over = parse_model_call(PROVIDER, _body(MAX_BYTES + 1))
+    over = parse_model_call(PROVIDER, _padded(MAX_BYTES + 1))
     _refused(arena, ctx, "a real body one byte over is denied", "model_request_too_large", over)
     huge = parse_model_call(PROVIDER, b" " * (16 * 1024 * 1024 + 1))
     _refused(arena, ctx, "a body too large to read is denied", "model_request_invalid", huge)
-    exact = parse_model_call(PROVIDER, _body(MAX_BYTES))
+    exact = parse_model_call(PROVIDER, _padded(MAX_BYTES))
     arena.expect("the exact-size body was read", exact.valid and exact.request_bytes == MAX_BYTES)
     _admitted(arena, _admit(arena, ctx, exact), "a body at the limit goes through")
 
@@ -383,7 +386,15 @@ def ambiguous_bodies(arena: Arena) -> None:
         "a boolean limit": b'{"model": "deepseek-flash", "max_tokens": true}',
         "a model that is a list": b'{"model": ["deepseek-flash"], "max_tokens": 10}',
         "no model": b'{"max_tokens": 10}',
-        "nesting past the parser": b'{"a":' * 100_000,
+        "nesting past the parser": (
+            b'{"model":"deepseek-flash","max_tokens":10,"messages":'
+            + b"[" * 100_000
+            + b"]" * 100_000
+            + b"}"
+        ),
+        "UTF-16 text": json.dumps({"model": MODEL, "max_tokens": 10}).encode("utf-16"),
+        "UTF-32 text": json.dumps({"model": MODEL, "max_tokens": 10}).encode("utf-32"),
+        "a byte order mark": b"\xef\xbb\xbf" + _body(),
         "a limit of thousands of digits": b'{"model": "deepseek-flash", "max_tokens": '
         + b"9" * 6000
         + b"}",
@@ -391,6 +402,117 @@ def ambiguous_bodies(arena: Arena) -> None:
         parsed = parse_model_call(PROVIDER, body)
         arena.expect(f"{name} is read as invalid", not parsed.valid, f"valid {parsed.valid}")
         _refused(arena, ctx, f"{name} is denied", "model_request_invalid", parsed)
+
+
+@scenario("mb-023", MB, "A body field the parser does not read is denied, not ignored")
+def unread_fields(arena: Arena) -> None:
+    ctx = arena.start(STAFF)
+    unread: dict[str, dict[str, object]] = {
+        "an upper-cased MAX_TOKENS": {"max_tokens": 10, "MAX_TOKENS": 100_000},
+        "a mixed-case Max_Tokens": {"max_tokens": 10, "Max_Tokens": 100_000},
+        "a full-width max_tokens": {"max_tokens": 10, "\uff4dax_tokens": 100_000},
+        "a zero-width max_tokens": {"max_tokens": 10, "max_tokens\u200b": 100_000},
+        "best_of": {"best_of": 20},
+        "an OpenRouter models fallback list": {"models": ["gpt-5", "claude-opus-4"]},
+        "an OpenRouter route": {"route": "fallback"},
+        "an OpenRouter provider block": {"provider": {"order": ["anywhere"]}},
+        "a priority service tier": {"service_tier": "priority"},
+        "a prompt cache retention": {"prompt_cache_retention": "24h"},
+        "a made-up field": {"please_be_generous": True},
+    }
+    for name, fields in unread.items():
+        parsed = parse_model_call(PROVIDER, _body(**fields))
+        arena.expect(f"{name} is counted", parsed.valid and parsed.unknown_fields == 1)
+        _refused(arena, ctx, f"{name} is denied", "model_unknown_field", parsed)
+    clean = parse_model_call(PROVIDER, _body(temperature=0.2, stream=False, user="u-1"))
+    arena.expect("known fields are not counted", clean.valid and clean.unknown_fields == 0)
+    _admitted(arena, _admit(arena, ctx, clean), "a body of known fields goes through")
+
+
+@scenario(
+    "mb-024",
+    MB,
+    "Server-side state, tools and cache writes are denied unless allowed",
+)
+def server_features(arena: Arena) -> None:
+    ctx = arena.start(STAFF)
+    function_tool = {"type": "function", "function": {"name": "lookup", "parameters": {}}}
+    cases: dict[str, dict[str, object]] = {
+        "a previous response id": {"previous_response_id": "resp_1"},
+        "a stored conversation": {"conversation": "conv_1"},
+        "a background run": {"background": True},
+        "a provider-run web search": {"tools": [{"type": "web_search"}]},
+        "a provider-run code interpreter": {"tools": [function_tool, {"type": "code_interpreter"}]},
+        "a tool list that is not a list": {"tools": {"type": "web_search"}},
+        "a tool that is not an object": {"tools": ["web_search"]},
+        "a cache write inside a message": {
+            "messages": [
+                {"role": "user", "content": [{"text": "x", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        },
+    }
+    for name, fields in cases.items():
+        parsed = parse_model_call(PROVIDER, _body(**fields))
+        arena.expect(
+            f"{name} is seen",
+            parsed.valid and bool(parsed.server_features),
+            f"{parsed.server_features}",
+        )
+        _refused(arena, ctx, f"{name} is denied", "model_server_feature", parsed)
+    plain = parse_model_call(PROVIDER, _body(tools=[function_tool]))
+    arena.expect(
+        "a plain function tool is not a server feature", plain.valid and not plain.server_features
+    )
+    _admitted(arena, _admit(arena, ctx, plain), "a function tool goes through")
+
+    others: dict[ModelProvider, dict[str, object]] = {
+        ModelProvider.ANTHROPIC: {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+        ModelProvider.GEMINI: {"tools": [{"googleSearch": {}}], "contents": []},
+    }
+    for provider, extra in others.items():
+        body = json.dumps({"model": MODEL, "max_tokens": 10, **extra}).encode()
+        seen = parse_model_call(provider, body, path_model=MODEL)
+        arena.expect(
+            f"{provider.value}: a provider-run tool is seen",
+            seen.server_features == ("server_tool",),
+            f"{seen.server_features}",
+        )
+    anthropic_cache = json.dumps(
+        {
+            "model": MODEL,
+            "max_tokens": 10,
+            "system": [{"type": "text", "text": "x", "cache_control": {}}],
+        }
+    ).encode()
+    arena.expect(
+        "anthropic: a cache write is seen",
+        parse_model_call(ModelProvider.ANTHROPIC, anthropic_cache).server_features
+        == ("cache_write",),
+    )
+
+    gate = _with_server_features(arena)
+    allowed = parse_model_call(PROVIDER, _body(previous_response_id="resp_1"))
+    outcome = gate.admit_model(arena.start(STAFF), allowed, rates=RATES)
+    _admitted(arena, outcome, "an entry that allows server features admits one")
+
+
+def _with_server_features(arena: Arena) -> Gate:
+    engines: dict[str, PolicyEngine] = {}
+    for customer_id, engine in arena.engines.items():
+        policy = engine.bundle.policy
+        models = policy.models
+        if models is not None:
+            entries = tuple(
+                e.model_copy(update={"allow_server_features": True}) for e in models.allow
+            )
+            policy = policy.model_copy(
+                update={"models": models.model_copy(update={"allow": entries})}
+            )
+        bundle = engine.bundle.model_copy(update={"policy": policy})
+        customer = arena.store.get_customer(customer_id)
+        assert customer is not None
+        engines[customer_id] = PolicyEngine(bundle, customer)
+    return arena.regate(engines=engines)
 
 
 # Who is asking

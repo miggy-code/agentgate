@@ -460,3 +460,52 @@ def test_a_reservation_left_by_a_killed_proxy_is_released_on_the_next_sweep(
     world.clock.advance(timedelta(minutes=16))
     assert world.gate.release_stale(timedelta(minutes=15)) == 1
     assert spent(world, ctx) == 0
+
+
+# Fields the provider list does not name, and server-side features
+
+
+def test_a_body_with_an_unread_field_is_denied_and_the_field_is_not_recorded(world: World) -> None:
+    ctx = world.run(STAFF)
+    body = json.dumps(
+        {"model": "deepseek-flash", "max_tokens": 10, "MAX_TOKENS": 100000, "best_of": 20}
+    ).encode()
+    parsed = parse_model_call(PROVIDER, body)
+    assert denied(admit(world, ctx, call=parsed)) == "model_unknown_field"
+    event = last_decision(world)
+    assert event.kind is EventKind.DENY and event.details["unknown_fields"] == 2
+    assert "MAX_TOKENS" not in json.dumps(event.model_dump(mode="json"))
+    assert spent(world, ctx) == 0
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"previous_response_id": "resp_1"},
+        {"tools": [{"type": "web_search"}]},
+        {"messages": [{"role": "user", "content": [{"cache_control": {}}]}]},
+    ],
+)
+def test_server_features_are_denied_unless_the_entry_allows_them(
+    world: World, tmp_path: Path, fields: dict[str, Any]
+) -> None:
+    body = json.dumps({"model": "deepseek-flash", "max_tokens": 10, **fields}).encode()
+    parsed = parse_model_call(PROVIDER, body)
+    ctx = world.run(STAFF)
+    assert denied(admit(world, ctx, call=parsed)) == "model_server_feature"
+    assert spent(world, ctx) == 0
+
+    entry = {
+        "id": "deepseek-flash",
+        "provider": "openai_compatible",
+        "model": "deepseek-flash",
+        "roles": ["owner", "manager", "staff"],
+        "max_output_tokens": 8000,
+        "max_request_bytes": 120000,
+        "allow_server_features": True,
+    }
+    gate = gate_for(world, tmp_path, models={"allow": [entry]})
+    run = gate.start_run(KC, STAFF)
+    assert isinstance(gate.admit_model(run, parsed, rates=RATE_TABLE), Reservation)
+    event = last_decision(world)
+    assert event.details["server_features"]
