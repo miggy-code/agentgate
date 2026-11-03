@@ -12,13 +12,14 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 from click.testing import Result
 
 from agentgate.audit.panoptes import read_events
 from agentgate.cli import app
 from conftest import FIXTURES, POLICIES
 from proxyharness import BODY, PROVIDER_KEY, RATES, STAFF, Provider
-from test_cli_ops import _audit, _cli, _db, _ok, _paths, runner
+from test_cli_ops import _audit, _cli, _db, _error, _ok, _paths, runner
 
 
 def _files(tmp_path: Path, provider: str = "openai_compatible") -> tuple[Path, Path]:
@@ -83,7 +84,10 @@ def test_a_malformed_upstream_is_an_error_before_anything_opens(tmp_path: Path) 
     assert not _db(tmp_path).exists()
 
 
-def test_serve_runs_a_run_for_a_client_and_ends_it_on_interrupt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stop", [signal.SIGINT, signal.SIGTERM])
+def test_serve_runs_a_run_for_a_client_and_ends_it_on_a_stop_signal(
+    tmp_path: Path, stop: signal.Signals
+) -> None:
     executable = shutil.which("agentgate", path=str(Path(sys.executable).parent))
     assert executable is not None
     rates, keys = _files(tmp_path)
@@ -137,7 +141,7 @@ def test_serve_runs_a_run_for_a_client_and_ends_it_on_interrupt(tmp_path: Path) 
             f"Bearer {PROVIDER_KEY}"
         )
     finally:
-        server.send_signal(signal.SIGINT)
+        server.send_signal(stop)
         server.wait(timeout=30)
         provider.close()
     assert server.returncode == 0, log.read_text()
@@ -173,3 +177,25 @@ def test_the_gateway_needs_its_model_options_together(tmp_path: Path) -> None:
         result = runner.invoke(app, ["gateway", "serve", "--as", STAFF, *args, *_paths(tmp_path)])
         assert result.exit_code == 1 and "--model-proxy" in result.stderr, (args, result.stderr)
         assert not _db(tmp_path).exists()
+
+
+def test_spend_show_reports_a_runs_model_spend(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from proxyharness import OK_COST, rig
+
+    with rig(tmp_path) as (made, _):
+        assert made.post().status == 200
+        made.reservations()
+        run = made.run.run_id
+        lines = dict(
+            line.split(" ", 1)
+            for line in _ok(
+                _cli(tmp_path, "spend", "show", "--as", STAFF, "--run", run)
+            ).stdout.splitlines()
+        )
+    assert Decimal(lines["spent_usd"]) == OK_COST and lines["calls"] == "1"
+    assert lines["settled"] == "1" and lines["open"] == "0"
+    assert "not found" in _error(
+        _cli(tmp_path, "spend", "show", "--as", "jr-owner-marisol", "--run", run)
+    )

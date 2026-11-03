@@ -16,6 +16,7 @@ something it says so on stderr, after the demo-identity note, and never on stdou
 
 import json
 import shlex
+import signal
 import sqlite3
 import sys
 import threading
@@ -903,6 +904,39 @@ def users_reinstate(
 # spend
 
 
+@spend_app.command("show")
+def spend_show(
+    as_user: AsOption,
+    run: Annotated[str, typer.Option("--run", metavar="RUN_ID", help="The run to show.")],
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Show what a run has spent: USD (settled plus still reserved), calls counted against
+    its cap, and its reservations by status. For a run of the acting user, or of their
+    customer if they own it; another customer's run reads like a missing one."""
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
+        user = _active_user(world, as_user)
+        found = TokenStore(world.store, world.clock).run(run)
+        if not _may_manage(user, found):
+            _fail(f"run {run!r} not found")
+        ledger = world.gate.ledger
+        with world.store.locked():
+            rows = world.store.connection.execute(
+                "SELECT status, COUNT(*) AS n FROM spend_reservations WHERE run_id = ?"
+                " GROUP BY status",
+                (run,),
+            ).fetchall()
+        counts = {str(row["status"]): int(row["n"]) for row in rows}
+        spent, calls = ledger.run_spent(run), ledger.run_calls(run)
+    typer.echo(f"run {run}")
+    typer.echo(f"spent_usd {spent}")
+    typer.echo(f"calls {calls}")
+    for status in ("open", "settled", "released"):
+        typer.echo(f"{status} {counts.get(status, 0)}")
+
+
 @spend_app.command("release-stale")
 def spend_release_stale(
     as_user: AsOption,
@@ -1472,6 +1506,8 @@ def model_proxy_serve(
                 typer.echo(proxy.token)
             else:
                 typer.echo(f"token written to {token_file}", err=True)
+            # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
+            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
