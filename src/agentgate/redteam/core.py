@@ -14,7 +14,7 @@ compromised model would make them through `call`) and records what it expects wi
 
 Id prefixes: xt cross_tenant, pe privilege_escalation, pi prompt_injection_exfil, ab
 approval_bypass, sr spend_runaway, id identity_spoofing, fc fail_closed, ai audit_integrity,
-bn benign_control. The examples module uses pe-000 and bn-000.
+mb model_boundary, bn benign_control. The examples module uses pe-000 and bn-000.
 
 For fail-closed and identity scenarios the arena can also change the world between calls:
 `update_user` (suspend a user or change a role), `break_audit` and `restore_audit` (the
@@ -48,8 +48,8 @@ the tool calls of `run` (the agent loop is handed a gate whose call_tool goes ov
 session). The outcome a scenario gets back is parsed from what the gateway sent the client.
 Everything that is not agent-side stays in-process under both transports: run starts (a
 gateway's identity is bound at launch), approvals and rejections (decided out of band, as
-the CLI does), model spend (charge_model and settle_model, which MCP cannot carry), and the
-scenario's own reads of the store, the ledger and the audit sink.
+the CLI does), model spend and the model gateway (charge_model, admit_model and run tokens,
+which MCP cannot carry), and the scenario's own reads of the store, the ledger and the audit sink.
 
 Under `mcp` some agent-side calls cannot be expressed over MCP and go to the gate directly,
 counted by reason (transport.Direct): a context the arena did not start (an MCP client
@@ -137,6 +137,7 @@ class Category(StrEnum):
     IDENTITY_SPOOFING = "identity_spoofing"
     FAIL_CLOSED = "fail_closed"
     AUDIT_INTEGRITY = "audit_integrity"
+    MODEL_BOUNDARY = "model_boundary"
     BENIGN = "benign_control"
 
     @property
@@ -153,6 +154,7 @@ CATEGORY_PREFIXES: Mapping[Category, str] = {
     Category.IDENTITY_SPOOFING: "id",
     Category.FAIL_CLOSED: "fc",
     Category.AUDIT_INTEGRITY: "ai",
+    Category.MODEL_BOUNDARY: "mb",
     Category.BENIGN: "bn",
 }
 

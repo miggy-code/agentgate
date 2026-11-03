@@ -22,9 +22,18 @@ def bundle_version(bundle: PolicyBundle) -> str:
     """Return "sha256:" plus the first 16 hex chars of the canonical bundle hash."""
     # Python mode keeps sets distinguishable from ordered tuples, so sets can be sorted
     # while rule and label order, which is meaningful, is kept as written.
-    canonical = _canonical(bundle.model_dump(mode="python", by_alias=True))
-    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    encoded = canonical_text(bundle)
     return "sha256:" + hashlib.sha256(encoded.encode("ascii")).hexdigest()[:16]
+
+
+def canonical_text(bundle: PolicyBundle) -> str:
+    """The canonical JSON of a bundle, the text bundle_version hashes."""
+    data = bundle.model_dump(mode="python", by_alias=True)
+    if data["policy"]["models"] is None:
+        # A policy without a models section keeps the version it had before the section
+        # existed, so past audit events still name it.
+        del data["policy"]["models"]
+    return json.dumps(_canonical(data), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
 type _Json = bool | int | str | list[_Json] | dict[str, _Json] | None

@@ -31,6 +31,8 @@ A reservation is a lease. One still open 15 minutes after it was made, such as o
 
 The default sink is [Panoptes](https://pypi.org/project/panoptes-observe/) (`panoptes-observe`): a hash-chained SQLite log in which each row's hash covers the row and the previous hash. Every decision is recorded before anything runs. Events carry ids, labels, counts, reason codes, rule ids and the policy version hash, never document bodies, message text, notes or search queries. If a decision cannot be recorded, the action does not happen (see [Limits](limits.md#audit) for the events recorded after their change).
 
+An event is stored as a Panoptes schema-v5 event of type `agentgate.<kind>` under agent type `agentgate`, with its agentgate fields in `attributes`, its run and user in Panoptes' own fields, and, for a model request through the proxy, `exchange_id` in `attributes` and the exchange's `correlation_id` on the event. An event with no run has no run id (its session is `customer:<id>`), an event with no user has no user, and agentgate records no auth method since it never saw a credential. Identifiers are written with strict ingest: one that Panoptes would redact is refused, never stored changed. Logs written under schema v4 (the same fields under `context.agentgate`) still read and verify, and new events extend their chain.
+
 So that an incident can be reconstructed from the log, decision events also carry values derived from the arguments, never the text: the args hash of a call whose arguments validated (sha256 over the tool, the action and the validated arguments, the hash approvals are bound to), for a send the number of recipients inside and outside the company, for a spend its amount, and for an executed call the id of the row it wrote (`effect_ref`). Approval events carry the approval's own args hash. A search carries no args hash, since its query is free text.
 
 A value a caller chose that names nothing the store knows (an invented document slug, an unknown approver, a claimed run id), or that Panoptes would refuse (an id shaped like an API key), is recorded as a keyed reference: `ref:` plus the first 16 hex characters of an HMAC-SHA256 whose key is kept in the store. The same value always gives the same reference, so repeated probes can be counted, and the log never holds the value itself. A call with a key-shaped id is denied and audited like any other; if Panoptes still refuses an event for its content, a copy with every caller value as a reference is recorded instead.
@@ -99,6 +101,26 @@ An example MCP client configuration, in the `mcpServers` format many clients use
 ```
 
 `uv run --directory` runs the command from the checkout, so the default `data/`, `policies/` and `fixtures/` paths resolve there. At commit `b9e650b` this command line, launched from another directory with `--db` and `--audit-db` added to point at a scratch folder, answered `initialize`, `tools/list` and a `docs_read` over stdio and wrote 7 audit events: a `policy_loaded` and a `fixture_sync` event for each of the two customers on the first open, then `run_started`, `allow` and `executed`. `tests/test_gateway.py::test_cli_serves_over_stdio` launches `agentgate gateway serve --as kc-staff-nadine` as a subprocess and checks the same on every test run.
+
+### The model proxy
+
+`agentgate model-proxy serve --as USER --upstream openai_compatible=https://api.deepseek.com --rate-table rates.json` serves the model APIs for one run. It is Panoptes' reverse proxy with agentgate's decision plugged into its two hooks (`panoptes.hooks`, `docs/hooks.md` in Panoptes): Panoptes forwards, parses, prices and records what it observed; agentgate decides and never touches the body. Both write to one audit file, through one `AuditDB`, on one hash chain.
+
+`before_forward` runs these steps, in order, and any of them can end the request with a status and a reason code (never a policy detail or a key):
+
+1. Only a `POST` to a generation endpoint (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `.../models/<model>:generateContent` and `:streamGenerateContent`) goes on. `/v1/models`, `count_tokens`, `/v1/responses/<id>` and every other route or method is refused (403 `route_not_allowed`). A Gemini model is read from the path as received, never percent-decoded.
+2. Panoptes names the wire protocol; the operator's `--upstream` names the policy provider that speaks it (`openai_compatible` is an OpenAI-wire upstream). A protocol the proxy does not serve is refused.
+3. The raw request body is read with agentgate's strict parser (`parse_model_call`), not Panoptes' `request_json`.
+4. The token is read from `Authorization`, `x-api-key`, `x-goog-api-key`, `api-key` or a `?key=` query value (two different credentials are refused as ambiguous) and resolved to the run it belongs to. A bad token is a 401 `token_refused`; one that names a run is recorded on that run's record with why.
+5. The identity (`session_id` and `run_id` are the run id, the user is the run's user) is built and validated, and anything else that can raise is done, before a reservation exists.
+6. `Gate.admit_model` decides (policy, worst-case reservation, caps) and records. A denial is a 403 with its reason code, a reached cap a 429 with the cap, a failure to decide a 503.
+7. The client's query credentials are dropped, every client credential header is removed (agentgate's list is wider than Panoptes': it adds `api-key`, `cookie` and `proxy-authorization`), and the provider's key is the only one sent.
+
+`after_exchange` runs once for every exchange that entered `before_forward` and ends the reservation through `Gate.finish_model`: released if the request never reached the provider, or the provider answered 4xx or 5xx with no output; otherwise settled at the priced cost when the reply is complete and priced, else at the full reservation. The cost is Panoptes' `estimated_usd_micros` as `Decimal(micros).scaleb(-6)`; a reply that reported no usage is unpriced (`None`), so it is charged the full reservation. An exchange's decision events carry its `exchange_id`, the join key to Panoptes' events for the same exchange.
+
+The process starts the run and issues its one token at startup (printed once, or written 0600 to `--token-file`), sweeps reservations older than the lease every minute, and on shutdown stops accepting, lets in-flight exchanges finish and settle, then ends the run and revokes its token. At startup it refuses to serve unless the policy lists a model for each upstream, each upstream has a provider key, and the reservation's rate table (`RateTable`) and the settlement's (Panoptes' `PricingTable`) read one file to the same version, source and rates for every policy model. `agentgate doctor model-proxy` runs those checks without serving.
+
+`agentgate gateway serve --model-proxy --upstream ... --rate-table ... --token-file ...` starts the same proxy inside the MCP gateway's run: one run id, so a model call and a tool call reserve against the same per-run USD cap, per-day cap and call count. The token goes to `--token-file` only, since stdout is the MCP stream. `--max-usd` and `--max-calls` tighten the run's caps for model calls and can never raise the policy's.
 
 ## Policy format
 
@@ -185,6 +207,40 @@ The full file has 7 directory addresses and 14 rules.
 | `doc_tags_any: [<tag>]` | the document has any of the tags (read, write) |
 | `doc_assigned_to_user: true` | the document is assigned to the acting user (read, write) |
 
+### Models
+
+`policy.yaml` may also list the models a run may call through the model gateway. It is deny by default, like the rules: a model not listed is denied (`model_not_allowed`), and so is every model request under a policy with no `models:` section. From `policies/kettle-creek-hvac/policy.yaml`:
+
+```yaml
+models:
+  allow:
+    - id: deepseek-flash
+      provider: openai_compatible
+      model: deepseek-flash
+      roles: [owner, manager, staff]
+      max_output_tokens: 8000
+      max_request_bytes: 120000
+  reserve: computed
+```
+
+- `provider` is the wire protocol the request must use: `anthropic`, `openai`, `gemini` or `openai_compatible`. `model` is compared exactly with the request body's `model` field, never as a prefix or a pattern. Two entries cannot name the same provider and model.
+- Every field of an entry is required. `roles` is never optional, so a missing line cannot widen access.
+- A request is allowed only if it fits its entry, and each way it can miss has its own reason code, which is all the caller sees:
+
+| Reason | The request |
+| --- | --- |
+| `model_not_allowed` | names a model or provider no entry lists |
+| `model_role_denied` | comes from a role the entry does not list |
+| `model_max_tokens_required` | declares no output limit (or one below 1) |
+| `model_max_tokens_exceeded` | declares a limit above `max_output_tokens` |
+| `model_n_not_one` | asks for any number of completions but one |
+| `model_request_too_large` | has a body above `max_request_bytes` |
+| `model_server_feature` | starts provider-side state, a provider-run tool or a prompt-cache write, and the entry does not set `allow_server_features: true` |
+
+- A request that declares no `max_tokens` is denied even when `reserve` is a fixed amount: the output limit is part of the envelope, and without it the entry's cap is not checked.
+- `reserve` is what one model call holds against the spend caps before it is sent. `computed` prices the worst case from the request and the rate table; a fixed USD string such as `"0.02"` is what a model the rate table does not price reserves, and a floor under the computed amount for one it does (the larger is reserved), so a tiny fixed value cannot lower the worst case.
+- A `tests.yaml` case for a model call gives `model: {provider, name, max_tokens, n, request_bytes}` in place of `tool` and `action`, and may state the decision's `reason` as well as `rules` (the entry id).
+
 ### tools.yaml
 
 Each shipped tool has exactly one action, a base risk for the risk score, an optional `customer_facing` flag, and a per-call platform cost counted against the spend caps. From `policies/kettle-creek-hvac/tools.yaml`:
@@ -223,16 +279,27 @@ A policy's version is a content hash of the validated bundle (policy and tools),
 
 ```console
 $ uv run agentgate policy lint
-juniper-row-apothecary  sha256:091571d97a0826e8  15 rules  5 tools  git 87a4801
-kettle-creek-hvac  sha256:66ca6bb217693239  14 rules  5 tools  git 87a4801
+juniper-row-apothecary  sha256:091571d97a0826e8  15 rules  5 tools  git f5b8eba
+kettle-creek-hvac  sha256:0505f513f2ee6853  14 rules  5 tools  1 models  git 329c4d3
 
 $ uv run agentgate policy test
-juniper-row-apothecary  sha256:091571d97a0826e8  59/59 passed
-kettle-creek-hvac  sha256:66ca6bb217693239  67/67 passed
-total  126/126 passed
+juniper-row-apothecary  sha256:091571d97a0826e8  60/60 passed
+kettle-creek-hvac  sha256:0505f513f2ee6853  78/78 passed
+total  138/138 passed
 ```
 
-Both outputs are from commit `87a4801`.
+Both outputs are from commit `ec526fb`. The version covers the `models:` section too, and a policy without one keeps the version it had before the section existed.
+
+## Model gateway
+
+agentgate also decides what a run may ask of a model. Most of it is built; the HTTP proxy that puts it in front of a provider is not (see [Limits](limits.md#model-gateway)). The pieces are in `src/agentgate/model/` and `Gate.admit_model`:
+
+- **Keys** (`model/keys.py`). Provider keys are loaded once from an owner-only JSON file (`{"openai_compatible": "..."}`) or from `AGENTGATE_<PROVIDER>_API_KEY` variables, and held only in the agentgate process. An error names the provider and the path, never a value, and a parser error is never chained to it. The key object prints without its values, cannot be pickled, and `redact` removes a key from text that is on its way out. Every client credential (`Authorization`, `x-api-key`, `x-goog-api-key`, `api-key`, `Cookie`, `Proxy-Authorization`) is stripped from the headers before the provider's own is added. Credential query parameters (`key`, `api_key`, `apikey`, `access_token`) are removed by Panoptes when the proxy hook calls `exchange.drop_query_credentials()`.
+- **Tokens** (`model/tokens.py`). An agent holds a token, never a key. A token is bound to one agentgate run, stored only as a hash, and refused when it is unknown, revoked or expired, when it belongs to another run than the one served, and when its run's user is unknown, of another customer or suspended. It dies with its run (`end_run` revokes every token of a run and records each revocation, with reason `run_ended` and no actor, in the transaction that makes it) or at its lifetime, 8 hours by default and 30 days at most. A run holds at most 16 live tokens. Two different credentials in one request are ambiguous and refused.
+- **The decision** (`Gate.admit_model`). In order: the run and its user are checked as for a tool call; the body is read strictly (`model/admission.py`: UTF-8, one JSON object, no repeated key, whole-number limits, the largest declared output limit counts) and one that cannot be is denied `model_request_invalid`, and one with a top-level field the provider's list does not name is denied `model_unknown_field`; the policy's `models:` entry decides; the reservation is priced; the caps are checked; and the allow is recorded before the reservation is returned. If the allow cannot be recorded the reservation is released and the call is denied `audit_unavailable`. A model name the policy does not list is recorded only as a keyed reference. A correlation id the client sent is recorded as `asserted_correlation_id` only in a plain identifier shape, otherwise as a reference, and never decides who the run is.
+- **The reservation** (`model/pricing.py`). The worst case of a call is its declared `max_tokens` at the output rate plus the prompt, counted at one token per byte of body, at the dearer of the input and cached-input rates, rounded up to a micro-dollar. Rates come from a versioned JSON table in the format Panoptes uses to price observed responses (`{"version", "source", "currency": "USD", "models": {name: {input_per_million, cached_input_per_million, output_per_million}}}`). A model the table does not name has no price, and the call is denied `model_unpriced` unless the policy sets a fixed `reserve`, which then stands in for the missing price and is a floor under a price the table does give. The reservation goes through the same ledger as every tool call, so tool and model spend share the run and customer-day caps, and a call counts toward `max_calls_per_run`.
+- **Caps** (`Caps`). A process serving one run may lower the run's USD cap and call cap and never raise them: the policy's value is the ceiling.
+- **After the call** (`Gate.finish_model`). The reservation is released only if the request never reached the provider, or the provider answered 4xx or 5xx and produced no output. Every other ending is charged: the priced cost when the reply is complete and priced, else the full reservation. That includes a client that drops the connection and a stream that breaks, because the provider may have billed them. A reservation a killed process left open is released by the stale sweep the next time a world opens.
 
 ## Latency
 
@@ -261,6 +328,9 @@ uv run agentgate users list --as kc-owner-dale
 uv run agentgate users suspend kc-staff-nadine --as kc-owner-dale --reason investigation
 uv run agentgate users reinstate kc-staff-nadine --as kc-owner-dale --reason resolved
 uv run agentgate spend release-stale --as kc-owner-dale [--older-than 15]
+uv run agentgate token issue --as kc-staff-nadine --run <RUN_ID> [--ttl-minutes 480] [--token-file run.token]
+uv run agentgate token list --as kc-staff-nadine [--run <RUN_ID>]
+uv run agentgate token revoke <TOKEN_ID> --as kc-staff-nadine
 uv run agentgate audit show --as kc-mgr-terrence [--run <RUN_ID>] [--kind deny] [--limit 20] [--json]
 uv run agentgate audit policy sha256:66ca6bb217693239 --as kc-mgr-terrence
 uv run agentgate audit check-store --as kc-owner-dale
@@ -273,11 +343,13 @@ uv run agentgate audit verify [--db data/audit.db]
 
 `users list` prints the acting user's customer's users with role and status; a user suspended with `users suspend` shows as `suspended (by operator)`. `users suspend` and `users reinstate` are for owners, and an owner cannot suspend themselves. A suspension takes effect on the user's next gate call in any process that uses the same database, a live run or gateway included. It is sticky: a fixture sync does not reactivate the user until `users reinstate`, after which the fixtures decide the user's status again. Both record the acting owner, the user and the `--reason` code. `spend release-stale` releases reservations open longer than `--older-than` minutes (default 15) for all customers and prints only the count; the acting user must be an active owner.
 
+`token issue` makes a model-gateway token for a run of the acting user, or for any run of their customer if they own it, and prints it once on stdout (or writes it to `--token-file`, a new file with mode 0600, which it never overwrites). Only the token's sha256 is stored. `token list` shows ids, runs, status and times, never a token, and `token revoke` revokes one by id. Another customer's run or token reads like a missing one. Both `issue` and `revoke` are recorded in the audit log as operator actions, in the transaction that makes them, so a token whose issue cannot be recorded does not exist.
+
 `audit show` prints the acting user's customer's events, oldest first, one per line, for owners and managers. A value the log holds as a reference prints as its `ref:` and why (`unknown value`: it named nothing the store knew). `audit policy` prints the policy bundle stored for a version and checks its sha256 against the snapshot, the version and every `policy_loaded` event for it, for owners and managers. `audit check-store`, for owners, verifies the chain, then checks each of the customer's approval, outbox, parts order, refund and note rows against the hashes its events carry. Both checks exit 1 on any mismatch. The three `audit` commands open the store read-only and change neither file.
 
 No approvals command queues an approval. A pending approval comes from an agent run against an on-disk world: the host calls `call_tool` as in the integration sample and a call that needs approval returns `PendingApproval`, or an MCP client calls a tool through `agentgate gateway serve`, which uses the same files by default. `agentgate agent run` uses a fresh in-memory world that is discarded when it exits, so an approval it creates cannot be decided afterwards. After approval, the requester's run executes the call through `gate.execute_approved`, or over MCP through `approvals_execute` on the same gateway connection.
 
-`agentgate audit verify` checks the Panoptes hash chain and prints `<path>  N events  chain intact`, or `chain BROKEN: ...` and exits 1. An agentgate log is chained from its first event, so events outside the chain (a log whose hashes were nulled and chain metadata deleted) also fail. It verifies a private snapshot of the file and never writes to it. It has no checkpoint option; see [Limits](limits.md).
+`agentgate audit verify` checks the Panoptes hash chain and prints `<path>  N events  chain intact`, or `chain BROKEN: ...` and exits 1. An agentgate log is chained from its first event, so events outside the chain (a log whose hashes were nulled and chain metadata deleted) also fail. It opens the file read-only through Panoptes' read API, so it never migrates it, starts a chain or writes to it. It has no checkpoint option; see [Limits](limits.md).
 
 ## Optional real model
 
@@ -301,17 +373,18 @@ The same suite through the MCP gateway, with every agent-side tool call sent thr
 | Category | Scenarios | Passed | Pass rate |
 | --- | ---: | ---: | ---: |
 | cross_tenant | 14 | 14 | 14/14 (100%) |
-| privilege_escalation | 15 | 15 | 15/15 (100%) |
+| privilege_escalation | 16 | 16 | 16/16 (100%) |
 | prompt_injection_exfil | 16 | 16 | 16/16 (100%) |
 | approval_bypass | 15 | 15 | 15/15 (100%) |
 | spend_runaway | 14 | 14 | 14/14 (100%) |
 | identity_spoofing | 16 | 16 | 16/16 (100%) |
 | fail_closed | 17 | 17 | 17/17 (100%) |
 | audit_integrity | 19 | 19 | 19/19 (100%) |
-| **attacks total** | 126 | 126 | 126/126 (100%) |
-| benign_control | 20 | 20 | 20/20 (100%) |
+| model_boundary | 25 | 25 | 25/25 (100%) |
+| **attacks total** | 152 | 152 | 152/152 (100%) |
+| benign_control | 21 | 21 | 21/21 (100%) |
 
-Produced by `uv run agentgate redteam --transport mcp` at commit `b9e650b`: 146 scenarios, 1552 checks, baseline check 0 problems, calls over MCP: 1361, direct: 58. A call goes to the gate directly only when MCP cannot express it: 29 use a forged run context (an MCP client cannot pass a context at all), 23 use an action the tool does not have (over MCP the action comes from the gateway's own tool list), and 6 belong to a run whose customer has no policy (the gateway will not launch for it). 13 of the 126 attack scenarios make no MCP call: id-005, id-006, id-007, fc-002, fc-003 and pe-014 send only such direct calls; id-001, xt-013, sr-003, sr-006 and sr-007 test only run starts and model spend, which stay in-process because a gateway's identity is bound at launch and it never sees model calls; and fc-016 and fc-017 make no tool call at all, since they test how the store file is opened. Every benign_control scenario makes at least one MCP call. The suite's sessions use the MCP SDK's in-memory transport, one gateway per run; the stdio launch is covered by a test (see [Integration](#integration)).
+Produced by `uv run agentgate redteam --transport mcp` at commit `ec526fb`: 173 scenarios, 2025 checks, baseline check 0 problems, calls over MCP: 1359, direct: 58. A call goes to the gate directly only when MCP cannot express it: 29 use a forged run context (an MCP client cannot pass a context at all), 23 use an action the tool does not have (over MCP the action comes from the gateway's own tool list), and 6 belong to a run whose customer has no policy (the gateway will not launch for it). 38 of the 152 attack scenarios make no MCP call. 25 are the model_boundary scenarios, which call the gate, the token store and the key helpers directly, because the model gateway is not carried over MCP. The other 13: id-005, id-006, id-007, fc-002, fc-003 and pe-014 send only such direct calls; id-001, xt-013, sr-003, sr-006 and sr-007 test only run starts and model spend, which stay in-process because a gateway's identity is bound at launch and it never sees model calls; and fc-016 and fc-017 make no tool call at all, since they test how the store file is opened. Every benign_control scenario makes at least one MCP call. The suite's sessions use the MCP SDK's in-memory transport, one gateway per run; the stdio launch is covered by a test (see [Integration](#integration)).
 
 ## Project layout
 
@@ -324,6 +397,7 @@ Produced by `uv run agentgate redteam --transport mcp` at commit `b9e650b`: 146 
 | `src/agentgate/retrieval.py` | permission-aware search: filter, BM25F over the permitted set, re-check |
 | `src/agentgate/approvals.py` | approval queue bound to tool, action and args hash |
 | `src/agentgate/spend.py` | spend ledger: per-run calls and USD, per-customer-day USD |
+| `src/agentgate/model/` | model gateway pieces: provider keys, run tokens, strict request reading and caps, rate tables and the worst-case reservation |
 | `src/agentgate/audit/` | audit event type and keyed references, memory sink, Panoptes sink |
 | `src/agentgate/tools/` | tool adapter interface and the built-in tools |
 | `src/agentgate/agent/` | model protocol, reference agent loop, mock models, optional Anthropic adapter |

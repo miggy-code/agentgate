@@ -67,7 +67,7 @@ from agentgate.models import Action, Role, User, UserStatus
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import PolicyBundle
 from agentgate.policy.testing import load_policy_bundles
-from agentgate.policy.version import _canonical
+from agentgate.policy.version import canonical_text
 from agentgate.retrieval import DocumentIndex
 from agentgate.store import PolicySnapshot, Store, make_private_dirs, table_names
 from agentgate.tools.builtin import StoredEffect, stored_effects
@@ -300,8 +300,7 @@ def _build(
 
 def canonical_bundle(bundle: PolicyBundle) -> str:
     """The canonical JSON of a bundle: the text policy.version.bundle_version hashes."""
-    canonical = _canonical(bundle.model_dump(mode="python", by_alias=True))
-    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return canonical_text(bundle)
 
 
 def bundle_sha256(text: str) -> str:

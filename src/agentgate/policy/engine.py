@@ -18,7 +18,15 @@ from enum import StrEnum
 
 from agentgate.models import Action, Customer, Document, Role
 from agentgate.policy import addresses
-from agentgate.policy.schema import DOCUMENT_ACTIONS, Conditions, Effect, PolicyBundle, Rule
+from agentgate.policy.schema import (
+    DOCUMENT_ACTIONS,
+    Conditions,
+    Effect,
+    ModelEntry,
+    ModelProvider,
+    PolicyBundle,
+    Rule,
+)
 from agentgate.policy.version import bundle_version
 
 
@@ -33,6 +41,14 @@ class Reason(StrEnum):
     ACTION_NOT_SUPPORTED = "action_not_supported"
     UNKNOWN_LABEL = "unknown_label"
     DOCUMENT_REQUIRED = "document_required"
+    MODEL_ALLOWED = "model_allowed"
+    MODEL_NOT_ALLOWED = "model_not_allowed"
+    MODEL_ROLE_DENIED = "model_role_denied"
+    MODEL_MAX_TOKENS_REQUIRED = "model_max_tokens_required"
+    MODEL_MAX_TOKENS_EXCEEDED = "model_max_tokens_exceeded"
+    MODEL_N_NOT_ONE = "model_n_not_one"
+    MODEL_REQUEST_TOO_LARGE = "model_request_too_large"
+    MODEL_SERVER_FEATURE = "model_server_feature"
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,24 @@ class Request:
     amount_usd: Decimal | None = None
     # The most sensitive label this run has read so far.
     run_max_label: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelRequest:
+    """What the engine needs to know about one model call, without its messages."""
+
+    customer_id: str
+    role: Role
+    provider: ModelProvider
+    # The body's model field, as sent.
+    model: str
+    # The declared output limit, or None when the body does not declare one.
+    max_tokens: int | None
+    # The number of completions asked for, or None when the body leaves it at the default (1).
+    n: int | None
+    request_bytes: int
+    # Whether the request starts server-side work (state, provider-run tools, cache writes).
+    server_features: bool = False
 
 
 @dataclass(frozen=True)
@@ -133,6 +167,12 @@ class PolicyEngine:
         self._lists = {
             name: _AddressList(name, entries) for name, entries in bundle.policy.lists.items()
         }
+        models = bundle.policy.models
+        self._models = (
+            {}
+            if models is None
+            else {(entry.provider, entry.model): entry for entry in models.allow}
+        )
 
     @property
     def version(self) -> str:
@@ -161,6 +201,43 @@ class PolicyEngine:
         if matched[Effect.ALLOW]:
             return self._decision(Effect.ALLOW, Reason.MATCHED_ALLOW, matched[Effect.ALLOW])
         return self._decision(Effect.DENY, Reason.DEFAULT_DENY)
+
+    def decide_model(self, request: ModelRequest) -> Decision:
+        """Allow a model request that fits one listed entry, else deny with the reason."""
+        if request.customer_id != self._bundle.customer_id:
+            return self._decision(Effect.DENY, Reason.CUSTOMER_MISMATCH)
+        entry = self.model_entry(request.provider, request.model)
+        if entry is None:
+            return self._decision(Effect.DENY, Reason.MODEL_NOT_ALLOWED)
+        deny = self._model_envelope_reason(entry, request)
+        if deny is not None:
+            return self._decision(Effect.DENY, deny, (entry.id,))
+        return self._decision(Effect.ALLOW, Reason.MODEL_ALLOWED, (entry.id,))
+
+    def model_entry(self, provider: ModelProvider, model: str) -> ModelEntry | None:
+        """The entry for exactly this provider and model, or None."""
+        return self._models.get((provider, model))
+
+    def listed_models(self) -> frozenset[tuple[ModelProvider, str]]:
+        """Every (provider, model) the policy's models section lists."""
+        return frozenset(self._models)
+
+    @staticmethod
+    def _model_envelope_reason(entry: ModelEntry, request: ModelRequest) -> Reason | None:
+        if request.role not in entry.roles:
+            return Reason.MODEL_ROLE_DENIED
+        tokens = request.max_tokens
+        if tokens is None or tokens < 1:
+            return Reason.MODEL_MAX_TOKENS_REQUIRED
+        if tokens > entry.max_output_tokens:
+            return Reason.MODEL_MAX_TOKENS_EXCEEDED
+        if request.n is not None and request.n != 1:
+            return Reason.MODEL_N_NOT_ONE
+        if request.request_bytes > entry.max_request_bytes:
+            return Reason.MODEL_REQUEST_TOO_LARGE
+        if request.server_features and not entry.allow_server_features:
+            return Reason.MODEL_SERVER_FEATURE
+        return None
 
     def _decision(self, effect: Effect, reason: Reason, rule_ids: Iterable[str] = ()) -> Decision:
         return Decision(

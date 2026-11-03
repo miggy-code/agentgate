@@ -13,7 +13,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
-    { name = "panoptes-observe" },
+    { name = "panoptes-observe", extra = ["proxy"] },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "typer" },
@@ -37,7 +37,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=1.0,<2" },
     { name = "mcp", specifier = ">=2.3,<3" },
-    { name = "panoptes-observe", specifier = ">=0.1.1,<0.2" },
+    { name = "panoptes-observe", extras = ["proxy"], specifier = ">=0.2.0,<0.3" },
     { name = "pydantic", specifier = ">=2.9,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "typer", specifier = ">=0.12,<1" },
@@ -747,15 +747,16 @@ wheels = [
 
 [[package]]
 name = "panoptes-observe"
-version = "0.1.1"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx" },
-    { name = "pyyaml" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/be/c5/8ab3ad1f74262202d35f85567bb2620b3dce69151edf2b986ad9f77db159/panoptes_observe-0.1.1.tar.gz", hash = "sha256:9fc4fabdeebb9cf287f2a9dd790df53ae7880296c54b9295836299ffad9745ef", size = 160556, upload-time = "2026-10-21T21:03:27.467Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/52/f1a6921dbf76351225b98cdc2baaffce9705cdf9bb8ec75a209314d7be4e/panoptes_observe-0.2.0.tar.gz", hash = "sha256:e5522b16529c74410822591bb3b1d76711ec858d6527ec5708f60e94008f8dcf", size = 190807, upload-time = "2026-11-03T21:51:05.918Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9c/cc/099b284902c01d16b8a6f6858e7ac0fa4088ec36c4152b1057cbd47d4418/panoptes_observe-0.1.1-py3-none-any.whl", hash = "sha256:a4938be07b2c08026c195f87258ed8ef22714eae9f93767a7d391d1d4e4618b7", size = 107888, upload-time = "2026-10-21T21:03:25.788Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/41/66d0e0ce276b7748c1050198fba1f9a37cff17bab57ee3dbc46e65cc2b98/panoptes_observe-0.2.0-py3-none-any.whl", hash = "sha256:f887edc562e33220d931f2d1aa10a607b5e5a60b903b7cfc4124a15e40a5217f", size = 124875, upload-time = "2026-11-03T21:51:04.372Z" },
+]
+
+[package.optional-dependencies]
+proxy = [
+    { name = "httpx" },
 ]
 
 [[package]]

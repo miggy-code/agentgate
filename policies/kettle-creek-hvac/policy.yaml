@@ -33,6 +33,23 @@ lists:
     - tobias.m@mail-sample.example
     - yvette.d@mail-sample.example
 
+# Models agent runs may call through the model proxy. Deny by default: a model not listed here
+# is denied, and so is every model request when this section is absent. The request body must
+# fit the entry: the exact model name, the caller's role, an output limit it declares and that
+# is no higher than max_output_tokens, one completion, and a body no larger than the limit.
+models:
+  allow:
+    - id: deepseek-flash
+      provider: openai_compatible
+      model: deepseek-flash
+      roles: [owner, manager, staff]
+      max_output_tokens: 8000
+      max_request_bytes: 120000
+  # "computed" reserves the worst case from the request and the rate table. A fixed USD
+  # string such as "0.02" prices a model the table does not, and is a floor under the computed
+  # amount for one it does.
+  reserve: computed
+
 rules:
   # Reading documents (search and read). One rule per role, each up to that role's ceiling.
   - id: contractor-read-public

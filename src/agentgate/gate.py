@@ -103,10 +103,13 @@ from agentgate.audit.base import (
 from agentgate.audit.panoptes import storable_identifier
 from agentgate.clock import Clock
 from agentgate.context import RunContext
+from agentgate.model.admission import Caps, ModelCall, ModelExchange
+from agentgate.model.pricing import RateTable
+from agentgate.model.tokens import TokenRecord
 from agentgate.models import Action, Customer, Role, Tool, User, UserStatus
 from agentgate.policy.addresses import parse_address
-from agentgate.policy.engine import DocumentFacts, PolicyEngine, Reason, Request
-from agentgate.policy.schema import Effect, Policy
+from agentgate.policy.engine import DocumentFacts, ModelRequest, PolicyEngine, Reason, Request
+from agentgate.policy.schema import Effect, Policy, SpendLimits
 from agentgate.retrieval import DocumentIndex, RetrievalInvariantError, RetrievalResult
 from agentgate.spend import CapHit, CapKind, Reservation, SpendLedger
 from agentgate.store import Store
@@ -150,8 +153,8 @@ REFERENCE_HEX = 16
 # carry free text or a canary.
 _TOOL_ID = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 _APPROVAL_ID = re.compile(r"^apr_[A-Za-z0-9_-]{1,64}$")
-# A tool's effect_ref goes into events as written only in this id shape; anything else is
-# recorded as a reference.
+# A tool's effect_ref, and a correlation id a client sent, go into events as written only in
+# this id shape; anything else is recorded as a reference.
 _EFFECT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # IN lists of the stale sweep's follow-up query are sent in chunks of this many ids.
 _ID_CHUNK = 500
@@ -183,6 +186,17 @@ class GateReason(StrEnum):
     # An internal recipient may not read the most sensitive label the run has seen.
     ESCALATED_RECIPIENT_CLEARANCE = "escalated_recipient_clearance"
     AUDIT_UNAVAILABLE = "audit_unavailable"
+    # A model request whose body could not be read strictly (see model.admission).
+    MODEL_REQUEST_INVALID = "model_request_invalid"
+    # The body has a top-level field the provider's list does not name.
+    MODEL_UNKNOWN_FIELD = "model_unknown_field"
+    # The policy reserves a computed worst case and the rate table cannot give one.
+    MODEL_UNPRICED = "model_unpriced"
+    # A model request whose token was refused (unknown, revoked, expired, for another run).
+    TOKEN_REFUSED = "token_refused"
+    # How a model call's reservation ended, on its EXECUTED event.
+    MODEL_SETTLED = "model_settled"
+    MODEL_RELEASED = "model_released"
     TOOL_ERROR = "tool_error"
     RETRIEVAL_FILTER = "retrieval_filter"
     RETRIEVAL_INVARIANT = "retrieval_invariant"
@@ -259,6 +273,9 @@ class _Call:
     # The tool name the caller asked for, as given, when it differs from `tool` or may be
     # unknown; None when the tool came from the gate's own records.
     asked_tool: str | None = None
+    # For a model request through the proxy: the ids that join its events to the exchange.
+    exchange_id: str | None = None
+    correlation_id: str | None = None
 
     def latency_us(self) -> int:
         return (time.perf_counter_ns() - self.started_ns) // 1000
@@ -315,6 +332,10 @@ class Gate:
         self._index = index
         self._tools = adapters
         self._ledger = SpendLedger(store, clock)
+        # Reservations admit_model made and finish_model has not ended. Only finish_model may
+        # end these, and it may end nothing else, so a model call cannot be settled at an
+        # amount its exchange did not give.
+        self._gateway_reservations: set[str] = set()
         self._approvals = ApprovalQueue(store, clock)
         with store.locked():
             store.connection.execute(_SCHEMA)
@@ -602,7 +623,12 @@ class Gate:
     # Model spend
 
     def charge_model(self, ctx: RunContext, estimated_usd: Decimal) -> Reservation | CapReached:
-        """Reserve a model call against the run and customer-day caps.
+        """Reserve a call of the in-process reference agent (agent.loop) against the run and
+        customer-day caps, at the amount its host estimates.
+
+        This is not the model gateway's path: the host trusts its own model adapter for the
+        estimate and for what `settle_model` is later given. A gateway call goes through
+        `admit_model` and `finish_model`, which price it from the request and the exchange.
 
         Raises IdentityError, after recording a DENY, for an invalid run or user.
         """
@@ -615,9 +641,238 @@ class Gate:
         return reserved
 
     def settle_model(self, ctx: RunContext, reservation: Reservation, actual_usd: Decimal) -> None:
+        """Settle a `charge_model` reservation at the cost its host reports. Refuses one made
+        by `admit_model`: those are ended only by `finish_model`."""
         if reservation.run_id != ctx.run_id:
             raise ValueError("reservation belongs to another run")
+        if reservation.id in self._gateway_reservations:
+            raise ValueError("a gateway reservation is ended by finish_model")
         self._ledger.settle(reservation, actual_usd)
+
+    def finish_model(
+        self, ctx: RunContext, reservation: Reservation, exchange: ModelExchange
+    ) -> Decimal:
+        """End a model call's reservation by what happened to the call, and return the
+        amount charged (0 for a release).
+
+        A client that drops the connection, a stream that breaks and a reply that cannot be
+        priced do not make a call free: the provider may have billed all of it. So:
+
+        - the request never reached the provider: released;
+        - the provider answered 4xx or 5xx and produced no output: released;
+        - otherwise: settled at the priced cost when the reply is complete and the cost is a
+          usable one (see ModelExchange), else at the full reservation.
+        """
+        if reservation.run_id != ctx.run_id:
+            raise ValueError("reservation belongs to another run")
+        if reservation.id not in self._gateway_reservations:
+            raise ValueError("not a reservation admit_model made, or already finished")
+        released = not exchange.request_sent or (
+            exchange.provider_error and not exchange.produced_output
+        )
+        if released:
+            self._ledger.release(reservation)
+            charge = Decimal(0)
+        else:
+            if exchange.complete and exchange.cost_usd is not None:
+                charge = exchange.cost_usd
+            else:
+                charge = reservation.amount_usd
+            self._ledger.settle(reservation, charge)
+        self._gateway_reservations.discard(reservation.id)
+        # The money is settled first. If the event cannot be recorded the error propagates,
+        # and the charge stands.
+        self._record_model_end(reservation, exchange, charge, settled=not released)
+        return charge
+
+    def _record_model_end(
+        self, reservation: Reservation, exchange: ModelExchange, charge: Decimal, *, settled: bool
+    ) -> None:
+        with self._store.locked():
+            row = self._store.connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (reservation.run_id,)
+            ).fetchone()
+        if row is None:
+            return
+        engine = self._engines.get(row["customer_id"])
+        call = _Call(
+            time.perf_counter_ns(),
+            row["customer_id"],
+            user_id=row["user_id"],
+            role=Role(row["role"]),
+            run_id=row["run_id"],
+            policy_version=None if engine is None else engine.version,
+            exchange_id=_plain_id(exchange.exchange_id),
+        )
+        self._emit(
+            call,
+            EventKind.EXECUTED,
+            GateReason.MODEL_SETTLED if settled else GateReason.MODEL_RELEASED,
+            details={
+                "source": "model",
+                "reservation_id": reservation.id,
+                "charged_usd": str(charge),
+                "reserved_usd": str(reservation.amount_usd),
+                "request_sent": exchange.request_sent,
+                "provider_error": exchange.provider_error,
+                "complete": exchange.complete,
+                "produced_output": exchange.produced_output,
+                "priced": exchange.cost_usd is not None,
+            },
+        )
+
+    def refuse_token(
+        self, run: RunContext, token_reason: str, *, exchange_id: str | None = None
+    ) -> Denied:
+        """Record, on the run a refused token belongs to, that a model request presented it.
+
+        For a token that named a run (revoked, expired, for another run, its user suspended),
+        so the refusal is on that run's record. The run and user are checked as for any call;
+        a suspended user's refusal is recorded as that. `token_reason` is a model.tokens
+        TokenReason value, recorded in details as `refused_because` (a key with "token" in
+        its name is redacted by the log).
+        """
+        base = self._begin(run, None, None)
+        checked = self._check_run(run, base)
+        if isinstance(checked, Denied):
+            return checked
+        asked = replace(_bind(base, checked), exchange_id=_plain_id(exchange_id))
+        return self._deny(
+            asked,
+            GateReason.TOKEN_REFUSED,
+            details={"source": "model", "refused_because": token_reason},
+        )
+
+    def admit_model(
+        self,
+        ctx: RunContext,
+        call: ModelCall,
+        *,
+        rates: RateTable | None = None,
+        caps: Caps | None = None,
+    ) -> Reservation | Denied | CapReached:
+        """Decide a model request for the run and, if allowed, reserve its worst-case cost.
+
+        In order: the run and its user are checked as for a tool call; a body that could not
+        be read strictly, or that has a top-level field the provider's list does not name, is
+        denied; the policy's models section decides (deny by default, exact model, role,
+        output limit, one completion, body size, server-side features); the reservation is
+        priced from the rate table (the policy's fixed `reserve` is a floor on that, and the
+        price itself for a model the table lacks); the run's caps, as
+        tightened by `caps`, and the customer's day cap are checked; and the allow is
+        recorded before the reservation is handed back. A model the table does not price is
+        denied unless the policy sets a fixed reserve. If the allow cannot be recorded the
+        reservation is released and the call is denied.
+
+        The caller ends the reservation with `finish_model` once the exchange is over.
+        """
+        base = self._begin(ctx, None, None)
+        run = self._check_run(ctx, base)
+        if isinstance(run, Denied):
+            return run
+        asked = replace(
+            _bind(base, run),
+            exchange_id=_plain_id(call.exchange_id),
+            correlation_id=_plain_id(call.correlation_id),
+        )
+        values = _model_values(self, call)
+        if not call.valid:
+            return self._deny(asked, GateReason.MODEL_REQUEST_INVALID, details=values)
+
+        if call.unknown_fields:
+            return self._deny(asked, GateReason.MODEL_UNKNOWN_FIELD, details=values)
+
+        decision = run.engine.decide_model(
+            ModelRequest(
+                customer_id=run.ctx.customer_id,
+                role=run.ctx.role,
+                provider=call.provider,
+                model=call.model,
+                max_tokens=call.max_tokens,
+                n=call.n,
+                request_bytes=call.request_bytes,
+                server_features=bool(call.server_features),
+            )
+        )
+        listed = run.engine.model_entry(call.provider, call.model) is not None
+        # A model name is the caller's value: it is shown as written only if the policy lists it.
+        subject = call.model or None
+        unknown = None if listed else subject
+        if decision.effect is not Effect.ALLOW:
+            return self._deny(
+                asked,
+                decision.reason.value,
+                subject=subject,
+                unknown_subject=unknown,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                details=values,
+            )
+
+        models = run.policy.models
+        if models is None or call.max_tokens is None:
+            # The engine allows only a request that declares its limit, under a policy with
+            # models; this keeps a bug there from becoming an unpriced reservation.
+            reason = (
+                Reason.MODEL_NOT_ALLOWED if models is None else Reason.MODEL_MAX_TOKENS_REQUIRED
+            )
+            return self._deny(
+                asked,
+                reason,
+                subject=subject,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                details=values,
+            )
+        # The table's worst case is a floor the policy's fixed reserve cannot lower: a tiny
+        # fixed reserve would otherwise let parallel full-size calls slip under the run cap.
+        # The fixed amount only stands in for a model the table does not price.
+        computed = (
+            None
+            if rates is None
+            else rates.worst_case_usd(call.model, call.max_tokens, call.request_bytes)
+        )
+        if rates is not None:
+            values["rate_table_version"] = rates.version
+        fixed = models.reserve if isinstance(models.reserve, Decimal) else None
+        amount = fixed if computed is None else computed if fixed is None else max(fixed, computed)
+        basis = "computed" if amount == computed else "fixed"
+        if amount is None:
+            return self._deny(
+                asked,
+                GateReason.MODEL_UNPRICED,
+                subject=subject,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                details=values,
+            )
+
+        limits = run.policy.spend if caps is None else caps.tighten(run.policy.spend)
+        reserved = self._reserve(run, asked, amount, details=values, limits=limits)
+        if isinstance(reserved, CapReached):
+            return reserved
+        try:
+            # The allow is on record before the request is forwarded, or it is not forwarded.
+            self._emit(
+                asked,
+                EventKind.ALLOW,
+                decision.reason.value,
+                subject=subject,
+                rule_ids=decision.rule_ids,
+                policy_version=decision.policy_version,
+                decision=True,
+                details={
+                    **values,
+                    "reserved_usd": str(amount),
+                    "reserve": basis,
+                    "reservation_id": reserved.id,
+                },
+            )
+        except Exception:
+            self._ledger.release(reserved)
+            return Denied(GateReason.AUDIT_UNAVAILABLE.value)
+        self._gateway_reservations.add(reserved.id)
+        return reserved
 
     # Policies and operator actions
 
@@ -672,6 +927,27 @@ class Gate:
             action.value,
             subject=target,
             details=recorded,
+        )
+
+    def record_token_event(
+        self,
+        action: OperatorAction,
+        token: TokenRecord,
+        *,
+        customer_id: str,
+        actor: User | None,
+    ) -> None:
+        """Record that a run token was issued (TOKEN_ISSUED) or revoked (TOKEN_REVOKED) as an
+        operator action. A revocation also records why: `operator`, or `run_ended` when the
+        run's gateway ended it, which has no actor. Raises if not recorded."""
+        details: dict[str, JsonValue] = {
+            "run_id": token.run_id,
+            "expires_at": token.expires_at.isoformat(),
+        }
+        if action is OperatorAction.TOKEN_REVOKED and token.revoked_reason is not None:
+            details["reason"] = token.revoked_reason
+        self.record_operator_action(
+            action, customer_id=customer_id, actor=actor, target=token.token_id, details=details
         )
 
     def release_stale(
@@ -1018,12 +1294,13 @@ class Gate:
         call: _Call,
         amount: Decimal,
         details: dict[str, JsonValue] | None = None,
+        limits: SpendLimits | None = None,
     ) -> Reservation | CapReached:
         reserved = self._ledger.reserve(
             customer=run.customer,
             run_id=run.ctx.run_id,
             amount_usd=amount,
-            limits=run.policy.spend,
+            limits=run.policy.spend if limits is None else limits,
         )
         if isinstance(reserved, Reservation):
             return reserved
@@ -1439,6 +1716,8 @@ class Gate:
             policy_version=policy_version or call.policy_version,
             latency_us=latency_us,
             details=details or {},
+            exchange_id=call.exchange_id,
+            correlation_id=call.correlation_id,
             references=self._references(call, subject, unknown_subject),
         )
         try:
@@ -1674,6 +1953,38 @@ def _refusal_details(details: Mapping[str, JsonValue] | None) -> dict[str, JsonV
             raise ValueError(f"refusal detail {key} must be a list of strings")
         checked[key] = [*sorted(str(item) for item in value)]
     return checked
+
+
+def _model_values(gate: Gate, call: ModelCall) -> dict[str, JsonValue]:
+    """What the events of a model call record about it: counts and ids, never the request's
+    text. The correlation id is the client's claim, so it is recorded as asserted and only
+    in a plain shape; any other is recorded as a reference."""
+    values: dict[str, JsonValue] = {
+        "source": "model",
+        "provider": call.provider.value,
+        "request_bytes": call.request_bytes,
+    }
+    if call.valid:
+        values["max_tokens"] = call.max_tokens
+        values["n"] = call.n
+        if call.unknown_fields:
+            values["unknown_fields"] = call.unknown_fields
+        if call.server_features:
+            values["server_features"] = list(call.server_features)
+    asserted = call.correlation_id
+    if asserted is not None and call.correlation_source == "client":
+        if _plain_id(asserted) is not None:
+            values["asserted_correlation_id"] = asserted
+        else:
+            values["asserted_correlation_ref"] = gate.audit_reference(asserted)
+    return values
+
+
+def _plain_id(value: str | None) -> str | None:
+    """value if it may be recorded as written: a plain id shape the audit log accepts."""
+    if value is not None and _EFFECT_REF.fullmatch(value) and storable_identifier(value):
+        return value
+    return None
 
 
 def _model_reason(reason: str) -> str:

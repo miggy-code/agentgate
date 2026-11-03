@@ -55,6 +55,8 @@ class OperatorAction(StrEnum):
     USER_SUSPENDED = "user_suspended"
     USER_REINSTATED = "user_reinstated"
     STALE_RESERVATIONS_RELEASED = "stale_reservations_released"
+    TOKEN_ISSUED = "token_issued"
+    TOKEN_REVOKED = "token_revoked"
 
 
 # The fields of an event that can hold a caller's value, and so can be referenced.
@@ -107,6 +109,12 @@ class AuditEvent(BaseModel):
     # Time the gate spent deciding, excluding the tool itself.
     latency_us: int | None = Field(default=None, ge=0)
     details: dict[str, JsonValue] = {}
+    # For a model request through the proxy: the Panoptes exchange id, the key that joins this
+    # decision to the exchange Panoptes observed, and the correlation id that exchange carries.
+    # The correlation id may be the client's own claim (see details.asserted_correlation_id);
+    # it joins events and proves nothing.
+    exchange_id: str | None = None
+    correlation_id: str | None = None
     # Fields a durable log must store as a reference instead of the value above.
     references: dict[ReferencedField, Reference] = {}
 

@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  # Panoptes main moves without a push here, so the job below also runs weekly.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,5 +52,77 @@ jobs:
         with:
           name: reports-python-${{ matrix.python-version }}
           # reports/redteam.{json,md} (gate), reports/redteam-mcp.{json,md} (mcp), and the rest.
+          path: reports/
+          if-no-files-found: warn
+
+  # The same suite against Panoptes main from git, next to the pinned PyPI version above, so a
+  # Panoptes change that breaks agentgate shows up before Panoptes is released.
+  #
+  # It runs on the schedule and by hand only. Panoptes main moves on its own, and a change there
+  # should not turn an agentgate pull request red. Main may report a version outside the
+  # `<0.3` pin in pyproject.toml; `uv pip install` below ignores that pin, as the job intends,
+  # but a plain `uv sync` against that version would not resolve.
+  panoptes-main:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      # Main can report the same version as the pinned release (until it is bumped), so uv would
+      # keep the release unless told to replace it.
+      - name: Install Panoptes main
+        run: >
+          uv pip install --reinstall-package panoptes-observe
+          "panoptes-observe @ git+https://github.com/miggy-code/Panoptes@main"
+
+      # Fail unless the install is the git checkout: a direct URL with a commit id. The pinned
+      # release has neither, so a skipped or failed replacement cannot go green.
+      - name: Check that Panoptes main is what is installed
+        run: |
+          uv run --no-sync python - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import sys
+
+          raw = metadata.distribution("panoptes-observe").read_text("direct_url.json")
+          if raw is None:
+              sys.exit("panoptes-observe was not installed from git: no direct_url.json")
+          commit = json.loads(raw).get("vcs_info", {}).get("commit_id")
+          if not commit:
+              sys.exit("panoptes-observe direct_url.json holds no commit id")
+          print("panoptes-observe commit", commit)
+          PY
+
+      # No lint or type check: those say nothing about Panoptes. `uv run` must not sync, or
+      # it would put the pinned release back.
+      - name: Test
+        run: make test
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Policy tests
+        run: make policy
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Red-team suite
+        run: make redteam
+        env:
+          UV_NO_SYNC: "1"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-panoptes-main
           path: reports/
           if-no-files-found: warn

@@ -238,7 +238,7 @@ def test_audit_verify_rejects_a_stripped_chain(tmp_path: Path) -> None:
     result = runner.invoke(app, ["audit", "verify", "--db", str(db)])
     assert result.exit_code == 1
     assert result.stdout == (
-        f"{db}  3 events  chain BROKEN: events exist but the hash chain is not initialized\n"
+        f"{db}  3 events  chain BROKEN: Hash-chain metadata is missing from a chained database\n"
     )
     # Verifying never starts a new chain over the stripped events.
     assert db.read_bytes() == before
