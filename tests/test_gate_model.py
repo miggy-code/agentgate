@@ -15,11 +15,11 @@ import yaml
 from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.context import RunContext
 from agentgate.gate import CapReached, Denied, Gate
-from agentgate.model.admission import Caps, ModelCall, parse_model_call
+from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_model_call
 from agentgate.model.pricing import RateTable
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import ModelProvider, load_bundle
-from agentgate.spend import CapKind, Reservation
+from agentgate.spend import CapKind, Reservation, SpendError
 from conftest import KC, POLICIES, World
 from test_gate import FailingSink
 from test_model_pricing import RATES
@@ -136,6 +136,40 @@ def test_a_provider_error_is_not_billed(world: World) -> None:
     reservation = reserved(admit(world, ctx))
     world.gate.release_model(ctx, reservation)
     assert spent(world, ctx) == 0 and world.gate.ledger.run_calls(ctx.run_id) == 0
+
+
+@pytest.mark.parametrize(
+    ("exchange", "charged"),
+    [
+        (ModelExchange(request_sent=False), "0"),
+        (ModelExchange(request_sent=False, complete=False, cost_usd=Decimal("0.001")), "0"),
+        (ModelExchange(request_sent=True, provider_error=True), "0"),
+        (ModelExchange(request_sent=True, provider_error=True, produced_output=True), "0.006440"),
+        (ModelExchange(request_sent=True, cost_usd=Decimal("0.001")), "0.001"),
+        (ModelExchange(request_sent=True), "0.006440"),
+        (ModelExchange(request_sent=True, complete=False), "0.006440"),
+        (ModelExchange(request_sent=True, complete=False, cost_usd=Decimal("0.001")), "0.006440"),
+    ],
+)
+def test_finish_model_charges_by_what_happened_to_the_call(
+    world: World, exchange: ModelExchange, charged: str
+) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    assert world.gate.finish_model(ctx, reservation, exchange) == Decimal(charged)
+    assert spent(world, ctx) == Decimal(charged)
+    released = exchange.request_sent is False or charged == "0"
+    assert world.gate.ledger.run_calls(ctx.run_id) == (0 if released else 1)
+
+
+def test_a_finished_call_cannot_be_finished_again(world: World) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    world.gate.finish_model(ctx, reservation, ModelExchange(request_sent=True))
+    with pytest.raises(SpendError):
+        world.gate.finish_model(ctx, reservation, ModelExchange(request_sent=False))
+    with pytest.raises(ValueError):
+        world.gate.finish_model(world.run(STAFF), reservation, ModelExchange(request_sent=True))
 
 
 def test_a_reservation_of_another_run_cannot_be_settled_or_released(world: World) -> None:

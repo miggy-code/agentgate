@@ -30,7 +30,7 @@ from pathlib import Path
 from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.context import RunContext
 from agentgate.gate import CapReached, Denied, Gate
-from agentgate.model.admission import Caps, ModelCall, parse_model_call
+from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_model_call
 from agentgate.model.keys import (
     CLIENT_CREDENTIAL_HEADERS,
     Credential,
@@ -86,6 +86,9 @@ RATES = RateTable.from_dict(
     }
 )
 WORST_CASE = Decimal("0.006440")
+# Dropped-connection calls that fit under DROP_CAP.
+DROP_CALLS = 3
+DROP_CAP = Decimal("0.02")
 # A price at which one full-envelope call reserves exactly 0.20 USD.
 DEAR_RATES = RateTable.from_dict(
     {
@@ -764,31 +767,76 @@ def after_the_cap(arena: Arena) -> None:
 
 
 @scenario(
-    "mb-017", MB, "A call the provider refused is released, and an unpriced reply settles in full"
+    "mb-017", MB, "A call is released only if it never reached the provider; a sent call is charged"
 )
-def unbilled_and_unpriced(arena: Arena) -> None:
+def sent_calls_are_charged(arena: Arena) -> None:
     ctx = arena.start(STAFF)
-    first = _admitted(arena, _admit(arena, ctx), "a call is reserved")
-    if first is None:
-        return
-    arena.gate.release_model(ctx, first)
+
+    def spent_after(name: str, exchange: ModelExchange) -> Decimal:
+        base = _spent(arena, ctx)[0]
+        reservation = _admitted(arena, _admit(arena, ctx), f"{name}: a call is reserved")
+        if reservation is None:
+            return Decimal(-1)
+        charged = arena.gate.finish_model(ctx, reservation, exchange)
+        return charged if _spent(arena, ctx)[0] - base == charged else Decimal(-1)
+
+    def expect_charge(name: str, exchange: ModelExchange, wanted: Decimal) -> None:
+        got = spent_after(name, exchange)
+        arena.expect(f"{name}: charged {wanted}", got == wanted, f"charged {got}")
+
+    never = ModelExchange(request_sent=False)
+    expect_charge("a call that was never sent", never, Decimal(0))
     arena.expect(
-        "a refused call frees its money and its call",
+        "a call that was never sent frees its call too",
         _spent(arena, ctx) == (Decimal(0), 0),
         f"{_spent(arena, ctx)}",
     )
-    second = _admitted(arena, _admit(arena, ctx), "the run can call again")
-    if second is None:
-        return
-    arena.gate.settle_model(ctx, second, second.amount_usd)
-    arena.expect(
-        "an unpriced reply settles at the full reservation",
-        _spent(arena, ctx)[0] == WORST_CASE,
-        f"{_spent(arena, ctx)}",
+    expect_charge(
+        "a provider error with no output",
+        ModelExchange(request_sent=True, provider_error=True),
+        Decimal(0),
     )
-    finishers: dict[str, Callable[[], None]] = {
-        "settling twice": lambda: arena.gate.settle_model(ctx, second, Decimal(0)),
-        "releasing a settled call": lambda: arena.gate.release_model(ctx, second),
+    expect_charge(
+        "a provider error that produced output",
+        ModelExchange(request_sent=True, provider_error=True, produced_output=True),
+        WORST_CASE,
+    )
+    expect_charge(
+        "a complete priced reply",
+        ModelExchange(request_sent=True, produced_output=True, cost_usd=Decimal("0.001")),
+        Decimal("0.001"),
+    )
+    expect_charge(
+        "a complete reply that cannot be priced",
+        ModelExchange(request_sent=True, produced_output=True),
+        WORST_CASE,
+    )
+    expect_charge(
+        "a client that dropped the connection",
+        ModelExchange(request_sent=True, complete=False, produced_output=True),
+        WORST_CASE,
+    )
+    expect_charge(
+        "a dropped connection with a partial price",
+        ModelExchange(
+            request_sent=True, complete=False, produced_output=True, cost_usd=Decimal("0.000001")
+        ),
+        WORST_CASE,
+    )
+    expect_charge(
+        "a dropped connection before any reply",
+        ModelExchange(request_sent=True, complete=False),
+        WORST_CASE,
+    )
+
+    last = _admitted(arena, _admit(arena, ctx), "a call to finish twice")
+    if last is None:
+        return
+    arena.gate.finish_model(ctx, last, ModelExchange(request_sent=True))
+    finishers: dict[str, Callable[[], object]] = {
+        "settling twice": lambda: arena.gate.settle_model(ctx, last, Decimal(0)),
+        "finishing twice": lambda: arena.gate.finish_model(ctx, last, never),
+        "releasing a settled call": lambda: arena.gate.release_model(ctx, last),
     }
     for name, finish in finishers.items():
         try:
@@ -797,15 +845,49 @@ def unbilled_and_unpriced(arena: Arena) -> None:
         except SpendError:
             raised = True
         arena.expect(f"{name} is refused", raised)
-    other = arena.start(STAFF)
-    theirs = _admitted(arena, _admit(arena, other), "another run reserves")
-    try:
-        if theirs is not None:
-            arena.gate.release_model(ctx, theirs)
-        crossed = False
-    except ValueError:
-        crossed = True
-    arena.expect("a run cannot release another run's reservation", crossed)
+    theirs = _admitted(arena, _admit(arena, arena.start(STAFF)), "another run reserves")
+    if theirs is None:
+        return
+    foreign = theirs
+    moves: dict[str, Callable[[], object]] = {
+        "release": lambda: arena.gate.release_model(ctx, foreign),
+        "finish": lambda: arena.gate.finish_model(ctx, foreign, never),
+    }
+    for name, move in moves.items():
+        try:
+            move()
+            crossed = False
+        except ValueError:
+            crossed = True
+        arena.expect(f"a run cannot {name} another run's reservation", crossed)
+
+
+@scenario("mb-022", MB, "Dropping the connection again and again cannot get around the cap")
+def drop_and_repeat(arena: Arena) -> None:
+    ctx = arena.start(STAFF)
+    caps = Caps(max_usd=DROP_CAP)
+    dropped = ModelExchange(request_sent=True, complete=False)
+    granted = 0
+    for _ in range(40):
+        outcome = _admit(arena, ctx, caps=caps)
+        if not isinstance(outcome, Reservation):
+            _expect_cap(arena, outcome, "run_cap", name="the loop ends at the run cap")
+            break
+        granted += 1
+        arena.gate.finish_model(ctx, outcome, dropped)
+    arena.expect(
+        "only as many calls as the cap holds were sent", granted == DROP_CALLS, f"{granted}"
+    )
+    spent = _spent(arena, ctx)
+    arena.expect(
+        "every dropped call is on the ledger",
+        spent == (WORST_CASE * DROP_CALLS, DROP_CALLS),
+        f"{spent}",
+    )
+    arena.expect(
+        "the next call is refused",
+        isinstance(_admit(arena, ctx, caps=caps), CapReached),
+    )
 
 
 @scenario("mb-018", MB, "A reservation covers the worst case, and an unpriced model is denied")

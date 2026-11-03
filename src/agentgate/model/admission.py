@@ -123,6 +123,23 @@ def _integers(sources: list[dict[str, object]], names: tuple[str, ...]) -> list[
 
 
 @dataclass(frozen=True)
+class ModelExchange:
+    """How a model call ended, as the proxy saw it. It decides what the call is charged."""
+
+    # Whether any bytes of the request reached the provider. False only for a call that was
+    # refused or failed before it was sent (a rejection, a hook error, a connect error).
+    request_sent: bool
+    # The provider answered with a 4xx or 5xx.
+    provider_error: bool = False
+    # Whether the reply was relayed and read in full.
+    complete: bool = True
+    # Whether the provider reported any output tokens, or sent any of a stream.
+    produced_output: bool = False
+    # The priced cost of the reply, or None when it cannot be priced.
+    cost_usd: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class Caps:
     """Caps a process serving one run puts on top of the policy's. They can only tighten."""
 

@@ -103,7 +103,7 @@ from agentgate.audit.base import (
 from agentgate.audit.panoptes import storable_identifier
 from agentgate.clock import Clock
 from agentgate.context import RunContext
-from agentgate.model.admission import Caps, ModelCall
+from agentgate.model.admission import Caps, ModelCall, ModelExchange
 from agentgate.model.pricing import RateTable
 from agentgate.models import Action, Customer, Role, Tool, User, UserStatus
 from agentgate.policy.addresses import parse_address
@@ -628,12 +628,38 @@ class Gate:
         self._ledger.settle(reservation, actual_usd)
 
     def release_model(self, ctx: RunContext, reservation: Reservation) -> None:
-        """Give back the reservation of a model call that was not billed: the provider
-        answered with an error, or the client went away before it did. The money and the
-        call both return to the run, as for any release (SpendLedger.release)."""
+        """Give back the reservation of a call that never reached the provider. Money and
+        call both return to the run. A call that was sent is not released with this: whether
+        the provider billed it is not the caller's to guess (`finish_model`)."""
         if reservation.run_id != ctx.run_id:
             raise ValueError("reservation belongs to another run")
         self._ledger.release(reservation)
+
+    def finish_model(
+        self, ctx: RunContext, reservation: Reservation, exchange: ModelExchange
+    ) -> Decimal:
+        """End a model call's reservation by what happened to the call, and return the
+        amount charged (0 for a release).
+
+        A client that drops the connection, a stream that breaks and a reply that cannot be
+        priced do not make a call free: the provider may have billed all of it. So:
+
+        - the request never reached the provider: released;
+        - the provider answered 4xx or 5xx and produced no output: released;
+        - otherwise: settled at the priced cost when the reply is complete and priced, else
+          at the full reservation.
+        """
+        if reservation.run_id != ctx.run_id:
+            raise ValueError("reservation belongs to another run")
+        if not exchange.request_sent or (exchange.provider_error and not exchange.produced_output):
+            self._ledger.release(reservation)
+            return Decimal(0)
+        if exchange.complete and exchange.cost_usd is not None:
+            charge = exchange.cost_usd
+        else:
+            charge = reservation.amount_usd
+        self._ledger.settle(reservation, charge)
+        return charge
 
     def admit_model(
         self,
@@ -654,8 +680,7 @@ class Gate:
         denied unless the policy sets a fixed reserve. If the allow cannot be recorded the
         reservation is released and the call is denied.
 
-        The caller settles the reservation (`settle_model`) or releases it (`release_model`)
-        once the provider has answered.
+        The caller ends the reservation with `finish_model` once the exchange is over.
         """
         base = self._begin(ctx, None, None)
         run = self._check_run(ctx, base)

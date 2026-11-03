@@ -431,8 +431,56 @@ MUTATIONS = [
         replace=((SpendLedger, "release", lambda self, reservation: None),),
     ),
     Mutation(
+        "a dropped connection is released",
+        (*ids(17, 22),),
+        edits=(
+            (
+                Gate,
+                "finish_model",
+                (
+                    (
+                        "if not exchange.request_sent or (",
+                        "if not exchange.complete or not exchange.request_sent or (",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    Mutation(
+        "a provider error that produced output is released",
+        ids(17),
+        edits=(
+            (
+                Gate,
+                "finish_model",
+                (
+                    (
+                        "exchange.provider_error and not exchange.produced_output",
+                        "exchange.provider_error",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    Mutation(
+        "a partial price is charged for a dropped connection",
+        ids(17),
+        edits=(
+            (
+                Gate,
+                "finish_model",
+                (
+                    (
+                        "if exchange.complete and exchange.cost_usd is not None:",
+                        "if exchange.cost_usd is not None:",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    Mutation(
         "a refused model call is not released",
-        (*ids(17), "bn-020"),
+        ("bn-020",),
         replace=((Gate, "release_model", lambda self, ctx, reservation: None),),
     ),
     Mutation(
