@@ -400,9 +400,14 @@ MUTATIONS = [
         ),
     ),
     Mutation(
+        "ending a run records nothing",
+        ids(10),
+        edits=((TokenStore, "end_run", (("record(revoked)", "pass"),)),),
+    ),
+    Mutation(
         "ending a run revokes nothing",
         (*ids(10), "bn-020"),
-        replace=((TokenStore, "end_run", lambda self, run_id: 0),),
+        replace=((TokenStore, "end_run", lambda self, run_id, record=None: 0),),
     ),
     Mutation(
         "a token is stored as it is",

@@ -939,13 +939,7 @@ def _may_manage(user: User, run: RunContext | None) -> bool:
 
 
 def _record_token(world: World, user: User, action: OperatorAction, token: TokenRecord) -> None:
-    world.gate.record_operator_action(
-        action,
-        customer_id=user.customer_id,
-        actor=user,
-        target=token.token_id,
-        details={"run_id": token.run_id, "expires_at": token.expires_at.isoformat()},
-    )
+    world.gate.record_token_event(action, token, customer_id=user.customer_id, actor=user)
 
 
 def _token_line(record: TokenRecord, now: datetime) -> str:

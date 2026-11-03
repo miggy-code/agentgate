@@ -27,7 +27,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from agentgate.audit.base import AuditEvent, EventKind
+from agentgate.audit.base import AuditEvent, EventKind, OperatorAction
 from agentgate.context import RunContext
 from agentgate.gate import CapReached, Denied, Gate
 from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_model_call
@@ -645,7 +645,28 @@ def dead_tokens(arena: Arena) -> None:
     arena.advance(1)
     arena.expect("an expired token is refused", _token_refusal(tokens, short.token) == "expired")
 
-    arena.expect("ending the run revokes its tokens", tokens.end_run(ctx.run_id) == 3)
+    ended_count = tokens.end_run(
+        ctx.run_id,
+        record=lambda token: arena.gate.record_token_event(
+            OperatorAction.TOKEN_REVOKED, token, customer_id=ctx.customer_id, actor=None
+        ),
+    )
+    arena.expect("ending the run revokes its tokens", ended_count == 3, f"{ended_count}")
+    revocations = [
+        e
+        for e in arena.events(EventKind.OPERATOR_ACTION)
+        if e.reason == OperatorAction.TOKEN_REVOKED.value and e.details.get("run_id") == ctx.run_id
+    ]
+    arena.expect("each one is on the audit log", len(revocations) == 3, f"{len(revocations)}")
+    arena.expect(
+        "the log says the run ended and names no actor",
+        all(e.details.get("reason") == "run_ended" and e.user_id is None for e in revocations),
+    )
+    arena.expect(
+        "the log names the tokens",
+        {e.subject for e in revocations}
+        == {ended.record.token_id, kept.record.token_id, short.record.token_id},
+    )
     for name, token in {"an ended run's token": ended, "its other token": kept}.items():
         arena.expect(f"{name} is refused", _token_refusal(tokens, token.token) == "revoked")
     stored = tokens.get(ended.record.token_id)

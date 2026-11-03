@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agentgate.audit.base import MemorySink
+from agentgate.audit.base import EventKind, MemorySink, OperatorAction
 from agentgate.context import RunContext
 from agentgate.fixtures import load_fixtures
 from agentgate.gate import Gate
@@ -189,6 +189,53 @@ def test_end_run_revokes_that_runs_tokens_only(world: World, tokens: TokenStore)
     stored = tokens.get(first.record.token_id)
     assert stored is not None and stored.revoked_reason == "run_ended"
     assert tokens.end_run(ended.run_id) == 0
+
+
+def test_end_run_records_each_revocation_in_its_transaction(
+    world: World, tokens: TokenStore
+) -> None:
+    ctx = world.run(STAFF)
+    issued = [tokens.issue(ctx.run_id) for _ in range(3)]
+    tokens.revoke(issued[0].record.token_id)
+    seen: list[TokenRecord] = []
+    assert tokens.end_run(ctx.run_id, record=seen.append) == 2
+    assert {t.token_id for t in seen} == {i.record.token_id for i in issued[1:]}
+    assert all(t.revoked_reason == "run_ended" and t.revoked_at is not None for t in seen)
+
+
+def test_an_end_run_that_cannot_be_recorded_revokes_nothing(
+    world: World, tokens: TokenStore
+) -> None:
+    ctx = world.run(STAFF)
+    issued = [tokens.issue(ctx.run_id) for _ in range(3)]
+    calls = 0
+
+    def refuse_the_second(record: TokenRecord) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("audit down")
+
+    with pytest.raises(RuntimeError):
+        tokens.end_run(ctx.run_id, record=refuse_the_second)
+    assert all(tokens.resolve(i.token) == ctx for i in issued)
+
+
+def test_the_gate_records_a_run_ended_revocation_with_no_actor(
+    world: World, tokens: TokenStore
+) -> None:
+    ctx = world.run(STAFF)
+    issued = tokens.issue(ctx.run_id)
+    tokens.end_run(
+        ctx.run_id,
+        record=lambda t: world.gate.record_token_event(
+            OperatorAction.TOKEN_REVOKED, t, customer_id=ctx.customer_id, actor=None
+        ),
+    )
+    [event] = [e for e in world.events(EventKind.OPERATOR_ACTION) if e.reason == "token_revoked"]
+    assert event.subject == issued.record.token_id and event.user_id is None
+    assert event.details["reason"] == "run_ended" and event.details["run_id"] == ctx.run_id
+    assert event.details["actor"] == "system"
 
 
 # The run's user

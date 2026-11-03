@@ -198,15 +198,33 @@ class TokenStore:
                 record(revoked)
             return True
 
-    def end_run(self, run_id: str) -> int:
-        """Revoke every live token of a run, and return how many."""
+    def end_run(self, run_id: str, *, record: Callable[[TokenRecord], None] | None = None) -> int:
+        """Revoke every live token of a run, and return how many.
+
+        `record` runs inside the transaction once for each token revoked, with the token as
+        revoked, so a revocation that cannot be recorded is not made: if it raises, no token
+        of the run is revoked.
+        """
         with self._store.transaction():
-            cursor = self._store.connection.execute(
+            ids = [
+                row["token_id"]
+                for row in self._store.connection.execute(
+                    "SELECT token_id FROM run_tokens WHERE run_id = ? AND revoked_at IS NULL"
+                    " ORDER BY issued_at, token_id",
+                    (run_id,),
+                ).fetchall()
+            ]
+            self._store.connection.execute(
                 "UPDATE run_tokens SET revoked_at = ?, revoked_reason = ?"
                 " WHERE run_id = ? AND revoked_at IS NULL",
                 (self._clock.now().isoformat(), TokenReason.RUN_ENDED.value, run_id),
             )
-            return cursor.rowcount
+            if record is not None:
+                for token_id in ids:
+                    revoked = self.get(token_id)
+                    assert revoked is not None
+                    record(revoked)
+            return len(ids)
 
     def get(self, token_id: str) -> TokenRecord | None:
         with self._store.locked():

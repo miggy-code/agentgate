@@ -105,6 +105,7 @@ from agentgate.clock import Clock
 from agentgate.context import RunContext
 from agentgate.model.admission import Caps, ModelCall, ModelExchange
 from agentgate.model.pricing import RateTable
+from agentgate.model.tokens import TokenRecord
 from agentgate.models import Action, Customer, Role, Tool, User, UserStatus
 from agentgate.policy.addresses import parse_address
 from agentgate.policy.engine import DocumentFacts, ModelRequest, PolicyEngine, Reason, Request
@@ -829,6 +830,27 @@ class Gate:
             action.value,
             subject=target,
             details=recorded,
+        )
+
+    def record_token_event(
+        self,
+        action: OperatorAction,
+        token: TokenRecord,
+        *,
+        customer_id: str,
+        actor: User | None,
+    ) -> None:
+        """Record that a run token was issued (TOKEN_ISSUED) or revoked (TOKEN_REVOKED) as an
+        operator action. A revocation also records why: `operator`, or `run_ended` when the
+        run's gateway ended it, which has no actor. Raises if not recorded."""
+        details: dict[str, JsonValue] = {
+            "run_id": token.run_id,
+            "expires_at": token.expires_at.isoformat(),
+        }
+        if action is OperatorAction.TOKEN_REVOKED and token.revoked_reason is not None:
+            details["reason"] = token.revoked_reason
+        self.record_operator_action(
+            action, customer_id=customer_id, actor=actor, target=token.token_id, details=details
         )
 
     def release_stale(
