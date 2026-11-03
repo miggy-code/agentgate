@@ -656,3 +656,17 @@ def test_the_flags_of_an_exchange_are_required_and_must_be_booleans() -> None:
                 complete=True,
                 produced_output=False,
             )
+
+
+def test_a_provider_error_with_output_is_charged_in_full_whatever_its_price(world: World) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    exchange = ModelExchange(
+        request_sent=True,
+        provider_error=True,
+        complete=True,
+        produced_output=True,
+        cost_usd=Decimal(0),
+    )
+    assert exchange.cost_usd is None
+    assert world.gate.finish_model(ctx, reservation, exchange) == Decimal("0.019040")

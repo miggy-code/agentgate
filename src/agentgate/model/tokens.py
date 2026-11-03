@@ -129,12 +129,13 @@ class TokenStore:
         run_id: str,
         ttl: timedelta = DEFAULT_TTL,
         *,
-        record: Callable[[TokenRecord], None] | None = None,
+        record: Callable[[TokenRecord], None],
     ) -> IssuedToken:
         """A new token for a run the store holds. The run's user must be active.
 
-        `record` runs inside the transaction that stores the token, so a token whose
-        issue cannot be recorded does not exist: if it raises, nothing is stored.
+        `record` is required: it runs inside the transaction that stores the token, so a
+        token whose issue cannot be recorded does not exist (if it raises, nothing is
+        stored) and none is issued unrecorded.
         """
         if not timedelta(0) < ttl <= MAX_TTL:
             raise TokenError(f"lifetime must be above zero and at most {MAX_TTL.days} days")
@@ -168,8 +169,7 @@ class TokenStore:
                     issued.expires_at.isoformat(),
                 ),
             )
-            if record is not None:
-                record(issued)
+            record(issued)
         return IssuedToken(token, issued)
 
     def revoke(
@@ -177,12 +177,12 @@ class TokenStore:
         token_id: str,
         reason: TokenReason = TokenReason.OPERATOR,
         *,
-        record: Callable[[TokenRecord], None] | None = None,
+        record: Callable[[TokenRecord], None],
     ) -> bool:
         """Revoke a token by id. False if no live token had that id.
 
-        `record` runs inside the transaction with the revoked token, so a revocation that
-        cannot be recorded is not made.
+        `record` is required: it runs inside the transaction with the revoked token, so a
+        revocation that cannot be recorded is not made, and none is made unrecorded.
         """
         with self._store.transaction():
             cursor = self._store.connection.execute(
@@ -192,11 +192,10 @@ class TokenStore:
             )
             if cursor.rowcount == 0:
                 return False
-            if record is not None:
-                revoked = self.get(token_id)
-                if revoked is None:
-                    raise TokenError("a token disappeared while it was being revoked")
-                record(revoked)
+            revoked = self.get(token_id)
+            if revoked is None:
+                raise TokenError("a token disappeared while it was being revoked")
+            record(revoked)
             return True
 
     def end_run(self, run_id: str, *, record: Callable[[TokenRecord], None]) -> int:

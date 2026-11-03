@@ -3,6 +3,7 @@ token or the run's user is no longer good."""
 
 import os
 import stat
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from agentgate.model.tokens import (
     DEFAULT_TTL,
     MAX_LIVE_TOKENS_PER_RUN,
     MAX_TTL,
+    IssuedToken,
     TokenError,
     TokenReason,
     TokenRecord,
@@ -38,6 +40,26 @@ def tokens(world: World) -> TokenStore:
     return TokenStore(world.store, world.clock)
 
 
+def _issue(
+    tokens: TokenStore,
+    run_id: str,
+    ttl: timedelta = DEFAULT_TTL,
+    *,
+    record: Callable[[TokenRecord], None] | None = None,
+) -> IssuedToken:
+    return tokens.issue(run_id, ttl, record=record or (lambda _: None))
+
+
+def _revoke(
+    tokens: TokenStore,
+    token_id: str,
+    reason: TokenReason = TokenReason.OPERATOR,
+    *,
+    record: Callable[[TokenRecord], None] | None = None,
+) -> bool:
+    return tokens.revoke(token_id, reason, record=record or (lambda _: None))
+
+
 def _reason(tokens: TokenStore, token: str | None, **kwargs: str) -> TokenReason:
     with pytest.raises(TokenRejected) as rejected:
         tokens.resolve(token, **kwargs)
@@ -49,7 +71,7 @@ def _reason(tokens: TokenStore, token: str | None, **kwargs: str) -> TokenReason
 
 def test_a_token_resolves_to_its_run(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     assert issued.token.startswith("agt_")
     assert tokens.resolve(issued.token) == ctx
     assert tokens.resolve(issued.token, run_id=ctx.run_id) == ctx
@@ -57,7 +79,7 @@ def test_a_token_resolves_to_its_run(world: World, tokens: TokenStore) -> None:
 
 def test_tokens_are_random_and_distinct(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    first, second = tokens.issue(ctx.run_id), tokens.issue(ctx.run_id)
+    first, second = _issue(tokens, ctx.run_id), _issue(tokens, ctx.run_id)
     assert first.token != second.token and first.record.token_id != second.record.token_id
 
 
@@ -77,7 +99,7 @@ def test_only_a_hash_reaches_the_database_file(tmp_path: Path) -> None:
         user = store.get_user(STAFF)
         assert user is not None
         run = gate.start_run(user.customer_id, user.id)
-        issued = TokenStore(store, world.clock).issue(run.run_id)
+        issued = _issue(TokenStore(store, world.clock), run.run_id)
         store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     data = b"".join(p.read_bytes() for p in tmp_path.glob("store.db*"))
     assert issued.token.encode() not in data
@@ -86,7 +108,7 @@ def test_only_a_hash_reaches_the_database_file(tmp_path: Path) -> None:
 
 
 def test_the_stored_row_holds_the_hash_and_not_the_token(world: World, tokens: TokenStore) -> None:
-    issued = tokens.issue(world.run(STAFF).run_id)
+    issued = _issue(tokens, world.run(STAFF).run_id)
     rows = world.store.connection.execute("SELECT * FROM run_tokens").fetchall()
     values = [str(value) for row in rows for value in tuple(row)]
     assert token_hash(issued.token) in values
@@ -96,7 +118,7 @@ def test_the_stored_row_holds_the_hash_and_not_the_token(world: World, tokens: T
 
 def test_listing_never_returns_a_hash_or_a_token(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     [listed] = tokens.list_tokens(ctx.run_id)
     assert listed == issued.record
     assert issued.token not in repr(listed) and token_hash(issued.token) not in repr(listed)
@@ -115,7 +137,7 @@ def test_an_unknown_token_is_refused(tokens: TokenStore, token: str) -> None:
 
 
 def test_a_token_with_one_character_changed_is_refused(world: World, tokens: TokenStore) -> None:
-    issued = tokens.issue(world.run(STAFF).run_id)
+    issued = _issue(tokens, world.run(STAFF).run_id)
     last = "A" if issued.token[-1] != "A" else "B"
     assert _reason(tokens, issued.token[:-1] + last) is TokenReason.UNKNOWN
     assert _reason(tokens, issued.token + "x") is TokenReason.UNKNOWN
@@ -123,7 +145,7 @@ def test_a_token_with_one_character_changed_is_refused(world: World, tokens: Tok
 
 def test_a_token_expires(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id, timedelta(minutes=10))
+    issued = _issue(tokens, ctx.run_id, timedelta(minutes=10))
     world.clock.advance(timedelta(minutes=10) - timedelta(seconds=1))
     assert tokens.resolve(issued.token) == ctx
     world.clock.advance(timedelta(seconds=1))
@@ -132,23 +154,23 @@ def test_a_token_expires(world: World, tokens: TokenStore) -> None:
 
 def test_a_revoked_token_is_refused(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
-    assert tokens.revoke(issued.record.token_id) is True
+    issued = _issue(tokens, ctx.run_id)
+    assert _revoke(tokens, issued.record.token_id) is True
     assert _reason(tokens, issued.token) is TokenReason.REVOKED
-    assert tokens.revoke(issued.record.token_id) is False
+    assert _revoke(tokens, issued.record.token_id) is False
     stored = tokens.get(issued.record.token_id)
     assert stored is not None and stored.revoked_reason == "operator"
 
 
 def test_revoking_one_token_leaves_the_others(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    first, second = tokens.issue(ctx.run_id), tokens.issue(ctx.run_id)
-    tokens.revoke(first.record.token_id)
+    first, second = _issue(tokens, ctx.run_id), _issue(tokens, ctx.run_id)
+    _revoke(tokens, first.record.token_id)
     assert tokens.resolve(second.token) == ctx
 
 
 def test_an_unknown_token_id_revokes_nothing(tokens: TokenStore) -> None:
-    assert tokens.revoke("0123456789abcdef") is False
+    assert _revoke(tokens, "0123456789abcdef") is False
 
 
 # Bound to a run
@@ -156,7 +178,7 @@ def test_an_unknown_token_id_revokes_nothing(tokens: TokenStore) -> None:
 
 def test_a_token_from_another_run_is_refused(world: World, tokens: TokenStore) -> None:
     mine, theirs = world.run(STAFF), world.run(STAFF)
-    other = tokens.issue(theirs.run_id)
+    other = _issue(tokens, theirs.run_id)
     with pytest.raises(TokenRejected) as rejected:
         tokens.resolve(other.token, run_id=mine.run_id)
     assert rejected.value.reason is TokenReason.WRONG_RUN
@@ -166,7 +188,7 @@ def test_a_token_from_another_run_is_refused(world: World, tokens: TokenStore) -
 
 def test_a_token_from_another_users_run_is_refused(world: World, tokens: TokenStore) -> None:
     staff, owner = world.run(STAFF), world.run(OTHER)
-    assert _reason(tokens, tokens.issue(owner.run_id).token, run_id=staff.run_id) is (
+    assert _reason(tokens, _issue(tokens, owner.run_id).token, run_id=staff.run_id) is (
         TokenReason.WRONG_RUN
     )
 
@@ -174,14 +196,14 @@ def test_a_token_from_another_users_run_is_refused(world: World, tokens: TokenSt
 def test_a_token_cannot_be_issued_for_an_unknown_run(tokens: TokenStore) -> None:
     for run_id in ("no-such-run", "", "' OR 1=1 --"):
         with pytest.raises(TokenError, match="unknown run"):
-            tokens.issue(run_id)
+            _issue(tokens, run_id)
     assert tokens.list_tokens() == []
 
 
 def test_end_run_revokes_that_runs_tokens_only(world: World, tokens: TokenStore) -> None:
     ended, kept = world.run(STAFF), world.run(STAFF)
-    first, second = tokens.issue(ended.run_id), tokens.issue(ended.run_id)
-    survivor = tokens.issue(kept.run_id)
+    first, second = _issue(tokens, ended.run_id), _issue(tokens, ended.run_id)
+    survivor = _issue(tokens, kept.run_id)
     assert tokens.end_run(ended.run_id, record=lambda _: None) == 2
     assert _reason(tokens, first.token) is TokenReason.REVOKED
     assert _reason(tokens, second.token) is TokenReason.REVOKED
@@ -195,8 +217,8 @@ def test_end_run_records_each_revocation_in_its_transaction(
     world: World, tokens: TokenStore
 ) -> None:
     ctx = world.run(STAFF)
-    issued = [tokens.issue(ctx.run_id) for _ in range(3)]
-    tokens.revoke(issued[0].record.token_id)
+    issued = [_issue(tokens, ctx.run_id) for _ in range(3)]
+    _revoke(tokens, issued[0].record.token_id)
     seen: list[TokenRecord] = []
     assert tokens.end_run(ctx.run_id, record=seen.append) == 2
     assert {t.token_id for t in seen} == {i.record.token_id for i in issued[1:]}
@@ -207,7 +229,7 @@ def test_an_end_run_that_cannot_be_recorded_revokes_nothing(
     world: World, tokens: TokenStore
 ) -> None:
     ctx = world.run(STAFF)
-    issued = [tokens.issue(ctx.run_id) for _ in range(3)]
+    issued = [_issue(tokens, ctx.run_id) for _ in range(3)]
     calls = 0
 
     def refuse_the_second(record: TokenRecord) -> None:
@@ -225,7 +247,7 @@ def test_the_gate_records_a_run_ended_revocation_with_no_actor(
     world: World, tokens: TokenStore
 ) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     tokens.end_run(
         ctx.run_id,
         record=lambda t: world.gate.record_token_event(
@@ -245,7 +267,7 @@ def test_a_token_is_refused_once_its_runs_user_is_suspended(
     world: World, tokens: TokenStore
 ) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     world.set_user(STAFF, status="suspended")
     with pytest.raises(TokenRejected) as rejected:
         tokens.resolve(issued.token, run_id=ctx.run_id)
@@ -260,21 +282,21 @@ def test_no_token_is_issued_for_a_suspended_users_run(world: World, tokens: Toke
     ctx = world.run(STAFF)
     world.set_user(STAFF, status="suspended")
     with pytest.raises(TokenError, match="suspended"):
-        tokens.issue(ctx.run_id)
+        _issue(tokens, ctx.run_id)
 
 
 def test_a_token_is_refused_when_its_users_customer_changed(
     world: World, tokens: TokenStore
 ) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     world.set_user(STAFF, customer_id="juniper-row-apothecary")
     assert _reason(tokens, issued.token) is TokenReason.RUN_INVALID
 
 
 def test_a_token_is_refused_when_its_user_is_gone(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     world.store.connection.execute("PRAGMA foreign_keys = OFF")
     world.store.connection.execute("DELETE FROM users WHERE id = ?", (STAFF,))
     assert _reason(tokens, issued.token) is TokenReason.RUN_INVALID
@@ -282,7 +304,7 @@ def test_a_token_is_refused_when_its_user_is_gone(world: World, tokens: TokenSto
 
 def test_the_resolved_run_is_the_stored_one(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     resolved = tokens.resolve(issued.token)
     assert isinstance(resolved, RunContext) and resolved.customer_id == KC
     assert resolved.user_id == STAFF and resolved.role == ctx.role
@@ -296,33 +318,33 @@ def test_the_resolved_run_is_the_stored_one(world: World, tokens: TokenStore) ->
 )
 def test_a_bad_lifetime_is_refused(world: World, tokens: TokenStore, ttl: timedelta) -> None:
     with pytest.raises(TokenError, match="lifetime"):
-        tokens.issue(world.run(STAFF).run_id, ttl)
+        _issue(tokens, world.run(STAFF).run_id, ttl)
 
 
 def test_the_longest_lifetime_is_accepted(world: World, tokens: TokenStore) -> None:
-    issued = tokens.issue(world.run(STAFF).run_id, MAX_TTL)
+    issued = _issue(tokens, world.run(STAFF).run_id, MAX_TTL)
     assert issued.record.expires_at - issued.record.issued_at == MAX_TTL
-    default = tokens.issue(world.run(STAFF).run_id)
+    default = _issue(tokens, world.run(STAFF).run_id)
     assert default.record.expires_at - default.record.issued_at == DEFAULT_TTL
 
 
 def test_a_run_holds_a_bounded_number_of_live_tokens(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
-    issued = [tokens.issue(ctx.run_id) for _ in range(MAX_LIVE_TOKENS_PER_RUN)]
+    issued = [_issue(tokens, ctx.run_id) for _ in range(MAX_LIVE_TOKENS_PER_RUN)]
     with pytest.raises(TokenError, match="live tokens"):
-        tokens.issue(ctx.run_id)
+        _issue(tokens, ctx.run_id)
     # Another run is not affected, and revoking one frees a place.
-    tokens.issue(world.run(STAFF).run_id)
-    tokens.revoke(issued[0].record.token_id)
-    tokens.issue(ctx.run_id)
+    _issue(tokens, world.run(STAFF).run_id)
+    _revoke(tokens, issued[0].record.token_id)
+    _issue(tokens, ctx.run_id)
 
 
 def test_an_expired_token_does_not_count_toward_the_limit(world: World, tokens: TokenStore) -> None:
     ctx = world.run(STAFF)
     for _ in range(MAX_LIVE_TOKENS_PER_RUN):
-        tokens.issue(ctx.run_id, timedelta(minutes=1))
+        _issue(tokens, ctx.run_id, timedelta(minutes=1))
     world.clock.advance(timedelta(minutes=2))
-    tokens.issue(ctx.run_id)
+    _issue(tokens, ctx.run_id)
 
 
 # Recording
@@ -335,26 +357,26 @@ def test_an_issue_that_cannot_be_recorded_leaves_no_token(world: World, tokens: 
         raise RuntimeError("audit down")
 
     with pytest.raises(RuntimeError):
-        tokens.issue(ctx.run_id, record=refuse)
+        _issue(tokens, ctx.run_id, record=refuse)
     assert tokens.list_tokens() == []
 
 
 def test_a_revocation_that_cannot_be_recorded_is_not_made(world: World, tokens: TokenStore) -> None:
-    issued = tokens.issue(world.run(STAFF).run_id)
+    issued = _issue(tokens, world.run(STAFF).run_id)
 
     def refuse(record: TokenRecord) -> None:
         raise RuntimeError("audit down")
 
     with pytest.raises(RuntimeError):
-        tokens.revoke(issued.record.token_id, record=refuse)
+        _revoke(tokens, issued.record.token_id, record=refuse)
     assert tokens.resolve(issued.token) is not None
 
 
 def test_the_record_callback_sees_the_token_as_stored(world: World, tokens: TokenStore) -> None:
     seen: list[TokenRecord] = []
-    issued = tokens.issue(world.run(STAFF).run_id, record=seen.append)
+    issued = _issue(tokens, world.run(STAFF).run_id, record=seen.append)
     assert seen == [issued.record]
-    tokens.revoke(issued.record.token_id, record=seen.append)
+    _revoke(tokens, issued.record.token_id, record=seen.append)
     assert seen[1].revoked_at is not None and seen[1].token_id == issued.record.token_id
 
 
@@ -439,11 +461,20 @@ def test_a_token_that_vanishes_during_revocation_is_an_error_not_an_assert(
     world: World, tokens: TokenStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ctx = world.run(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(tokens, ctx.run_id)
     monkeypatch.setattr(TokenStore, "get", lambda self, token_id: None)
     with pytest.raises(TokenError, match="disappeared"):
-        tokens.revoke(issued.record.token_id, record=lambda _: None)
+        _revoke(tokens, issued.record.token_id, record=lambda _: None)
     with pytest.raises(TokenError, match="disappeared"):
         tokens.end_run(ctx.run_id, record=lambda _: None)
     monkeypatch.undo()
     assert tokens.resolve(issued.token) == ctx
+
+
+def test_neither_issue_nor_revoke_has_an_unrecorded_form(world: World, tokens: TokenStore) -> None:
+    ctx = world.run(STAFF)
+    with pytest.raises(TypeError):
+        tokens.issue(ctx.run_id)  # type: ignore[call-arg]
+    issued = _issue(tokens, ctx.run_id)
+    with pytest.raises(TypeError):
+        tokens.revoke(issued.record.token_id)  # type: ignore[call-arg]

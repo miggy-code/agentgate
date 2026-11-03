@@ -288,7 +288,8 @@ class ModelExchange:
     complete: bool
     # Whether the provider reported any output tokens, or sent any of a stream.
     produced_output: bool
-    # The priced cost of the reply, or None when it cannot be priced. A value that is not a
+    # The priced cost of the reply, or None when it cannot be priced. The cost of a provider
+    # error is always read as None (see below). A value that is not a
     # finite, non-negative Decimal (a float, NaN, infinity, a negative) is not a usable cost
     # and is read as None, so the call is charged its full reservation. It is not an error:
     # the call was already sent, and an exception here would leave the reservation open.
@@ -300,7 +301,9 @@ class ModelExchange:
                 raise TypeError(f"{name} must be a bool")
         cost = self.cost_usd
         usable = isinstance(cost, Decimal) and cost.is_finite() and cost >= 0
-        if cost is not None and not usable:
+        # A provider error is priced at zero by Panoptes ("an error reply is not billed"),
+        # but one that produced output may have been billed in part. Its cost is unknown.
+        if cost is not None and (not usable or self.provider_error):
             object.__setattr__(self, "cost_usd", None)
 
 

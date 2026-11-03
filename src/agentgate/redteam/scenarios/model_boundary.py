@@ -29,7 +29,7 @@ from pathlib import Path
 
 from agentgate.audit.base import AuditEvent, EventKind, OperatorAction
 from agentgate.context import RunContext
-from agentgate.gate import CapReached, Denied, Gate
+from agentgate.gate import UNKNOWN_CUSTOMER, CapReached, Denied, Gate
 from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_model_call
 from agentgate.model.keys import (
     CLIENT_CREDENTIAL_HEADERS,
@@ -41,8 +41,11 @@ from agentgate.model.keys import (
 )
 from agentgate.model.pricing import RateTable
 from agentgate.model.tokens import (
+    DEFAULT_TTL,
+    IssuedToken,
     TokenError,
     TokenReason,
+    TokenRecord,
     TokenRejected,
     TokenStore,
     presented_token,
@@ -203,6 +206,28 @@ def _model_events(arena: Arena, ctx: RunContext) -> list[AuditEvent]:
 
 def _tokens(arena: Arena) -> TokenStore:
     return TokenStore(arena.store, arena.clock)
+
+
+def _issue(
+    arena: Arena, tokens: TokenStore, run_id: str, ttl: timedelta = DEFAULT_TTL
+) -> IssuedToken:
+    """Issue a token and record it on the arena's audit log, as the proxy and the CLI do."""
+    return tokens.issue(
+        run_id, ttl, record=lambda token: _record_token(arena, tokens, token, issued=True)
+    )
+
+
+def _revoke(arena: Arena, tokens: TokenStore, token_id: str) -> bool:
+    return tokens.revoke(
+        token_id, record=lambda token: _record_token(arena, tokens, token, issued=False)
+    )
+
+
+def _record_token(arena: Arena, tokens: TokenStore, token: TokenRecord, *, issued: bool) -> None:
+    run = tokens.run(token.run_id)
+    customer_id = UNKNOWN_CUSTOMER if run is None else run.customer_id
+    action = OperatorAction.TOKEN_ISSUED if issued else OperatorAction.TOKEN_REVOKED
+    arena.gate.record_token_event(action, token, customer_id=customer_id, actor=None)
 
 
 def _token_refusal(tokens: TokenStore, token: str | None, **kwargs: str) -> str:
@@ -550,7 +575,7 @@ def roles_and_customers(arena: Arena) -> None:
 def suspended_user(arena: Arena) -> None:
     tokens = _tokens(arena)
     ctx = arena.start(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(arena, tokens, ctx.run_id)
     arena.expect(
         "the token resolves while the user is active",
         _token_refusal(tokens, issued.token) == "resolved",
@@ -564,7 +589,7 @@ def suspended_user(arena: Arena) -> None:
     )
     _refused(arena, ctx, "a model call of the suspended user is denied", "suspended_user")
     try:
-        tokens.issue(ctx.run_id)
+        _issue(arena, tokens, ctx.run_id)
         issued_again = True
     except TokenError:
         issued_again = False
@@ -585,7 +610,7 @@ def other_runs_tokens(arena: Arena) -> None:
         arena.start(OWNER),
         arena.start(JR_OWNER),
     )
-    own = tokens.issue(mine.run_id)
+    own = _issue(arena, tokens, mine.run_id)
     arena.expect(
         "a token resolves for its own run",
         _token_refusal(tokens, own.token, run_id=mine.run_id) == "resolved",
@@ -595,7 +620,7 @@ def other_runs_tokens(arena: Arena) -> None:
         "an owner's run": owner,
         "another customer's run": other_customer,
     }.items():
-        foreign = tokens.issue(other.run_id)
+        foreign = _issue(arena, tokens, other.run_id)
         got = _token_refusal(tokens, foreign.token, run_id=mine.run_id)
         arena.expect(f"a token of {name} is refused", got == "wrong_run", got)
 
@@ -612,7 +637,7 @@ def other_runs_tokens(arena: Arena) -> None:
         arena.expect(f"{name} is refused", got in {"unknown", "missing"}, got)
 
     try:
-        tokens.issue("no-such-run")
+        _issue(arena, tokens, "no-such-run")
         issued = True
     except TokenError:
         issued = False
@@ -633,18 +658,20 @@ def other_runs_tokens(arena: Arena) -> None:
 def dead_tokens(arena: Arena) -> None:
     tokens = _tokens(arena)
     ctx = arena.start(STAFF)
-    revoked = tokens.issue(ctx.run_id)
-    short = tokens.issue(ctx.run_id, timedelta(minutes=10))
-    ended = tokens.issue(ctx.run_id)
-    kept = tokens.issue(ctx.run_id)
+    revoked = _issue(arena, tokens, ctx.run_id)
+    short = _issue(arena, tokens, ctx.run_id, timedelta(minutes=10))
+    ended = _issue(arena, tokens, ctx.run_id)
+    kept = _issue(arena, tokens, ctx.run_id)
     arena.expect(
         "every token starts live",
         all(_token_refusal(tokens, t.token) == "resolved" for t in (revoked, short, ended, kept)),
     )
 
-    arena.expect("revoking a live token succeeds", tokens.revoke(revoked.record.token_id))
+    arena.expect("revoking a live token succeeds", _revoke(arena, tokens, revoked.record.token_id))
     arena.expect("a revoked token is refused", _token_refusal(tokens, revoked.token) == "revoked")
-    arena.expect("revoking it again does nothing", not tokens.revoke(revoked.record.token_id))
+    arena.expect(
+        "revoking it again does nothing", not _revoke(arena, tokens, revoked.record.token_id)
+    )
 
     arena.advance(9)
     arena.expect(
@@ -663,7 +690,9 @@ def dead_tokens(arena: Arena) -> None:
     revocations = [
         e
         for e in arena.events(EventKind.OPERATOR_ACTION)
-        if e.reason == OperatorAction.TOKEN_REVOKED.value and e.details.get("run_id") == ctx.run_id
+        if e.reason == OperatorAction.TOKEN_REVOKED.value
+        and e.details.get("run_id") == ctx.run_id
+        and e.details.get("reason") == "run_ended"
     ]
     arena.expect("each one is on the audit log", len(revocations) == 3, f"{len(revocations)}")
     arena.expect(
@@ -688,7 +717,7 @@ def dead_tokens(arena: Arena) -> None:
 def token_storage(arena: Arena) -> None:
     tokens = _tokens(arena)
     ctx = arena.start(STAFF)
-    issued = tokens.issue(ctx.run_id)
+    issued = _issue(arena, tokens, ctx.run_id)
     dump = "\n".join(arena.store.connection.iterdump())
     arena.expect("the store holds no copy of the token", issued.token not in dump)
     arena.expect("it holds the token's hash", "run_tokens" in dump and len(dump) > 0)
@@ -967,6 +996,17 @@ def sent_calls_are_charged(arena: Arena) -> None:
     expect_charge(
         "a provider error that produced output",
         ModelExchange(request_sent=True, provider_error=True, complete=True, produced_output=True),
+        WORST_CASE,
+    )
+    expect_charge(
+        "a provider error with output that Panoptes priced at zero",
+        ModelExchange(
+            request_sent=True,
+            provider_error=True,
+            complete=True,
+            produced_output=True,
+            cost_usd=Decimal(0),
+        ),
         WORST_CASE,
     )
     expect_charge(
@@ -1354,7 +1394,7 @@ def model_work(arena: Arena) -> None:
     runs = [arena.start(user) for user in (OWNER, MANAGER, STAFF)]
     read_cost = arena.engines[KC].bundle.tools["docs.read"].cost_usd
     for ctx in runs:
-        issued = tokens.issue(ctx.run_id)
+        issued = _issue(arena, tokens, ctx.run_id)
         arena.expect(
             f"{ctx.user_id}'s token resolves",
             _token_refusal(tokens, issued.token, run_id=ctx.run_id) == "resolved",

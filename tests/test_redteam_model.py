@@ -568,6 +568,17 @@ MUTATIONS = [
         crashes=("SpendError",),
     ),
     Mutation(
+        "a provider error keeps its zero price",
+        ids(17),
+        edits=(
+            (
+                ModelExchange,
+                "__post_init__",
+                (("not usable or self.provider_error", "not usable"),),
+            ),
+        ),
+    ),
+    Mutation(
         "a provider error that produced output is released",
         ids(17),
         edits=(
