@@ -696,6 +696,10 @@ def key_never_shown(arena: Arena) -> None:
                 0o600,
             ),
             "a file with an unknown provider": (json.dumps({"mistral": secret}), 0o600),
+            "a file with its keys and providers swapped": (
+                json.dumps({secret: "openai_compatible"}),
+                0o600,
+            ),
             "a key with a space in it": (json.dumps({"openai_compatible": secret + " x"}), 0o600),
             "a key that looks like a token": (
                 json.dumps({"openai_compatible": "agt_" + secret}),

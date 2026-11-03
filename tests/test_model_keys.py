@@ -110,8 +110,10 @@ def test_an_oversized_file_is_refused(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("content", "message"),
     [
-        ({"mistral": "abc"}, "unknown providers"),
-        ({"openai": OPENAI_KEY, "mistral": "abc"}, "unknown providers"),
+        ({"mistral": "abc"}, "1 unknown provider names"),
+        ({"openai": OPENAI_KEY, "mistral": "abc"}, "1 unknown provider names"),
+        ({OPENAI_KEY: "openai"}, "1 unknown provider names"),
+        ({OPENAI_KEY: "openai", ANTHROPIC_KEY: "anthropic"}, "2 unknown provider names"),
         (["openai"], "object"),
         ("null", "object"),
         ('{"openai": "' + OPENAI_KEY + '", "openai": "' + ANTHROPIC_KEY + '"}', "not valid JSON"),

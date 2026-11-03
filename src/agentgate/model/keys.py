@@ -181,9 +181,12 @@ def _parse_keys(content: bytes, path: Path) -> dict[ModelProvider, str]:
     if not isinstance(data, dict):
         raise KeyConfigError(f"keys file {path} must hold an object of provider to key")
     keys: dict[ModelProvider, str] = {}
-    unknown = sorted(str(name) for name in data if name not in {p.value for p in ModelProvider})
+    known = {p.value for p in ModelProvider}
+    unknown = [name for name in data if name not in known]
     if unknown:
-        raise KeyConfigError(f"keys file {path} names unknown providers: {unknown}")
+        # Only a count: a file with its keys and providers swapped has a key where a name
+        # should be, and the name would print it.
+        raise KeyConfigError(f"keys file {path} has {len(unknown)} unknown provider names")
     for provider in ModelProvider:
         if provider.value in data:
             keys[provider] = validate_key(provider, data[provider.value])

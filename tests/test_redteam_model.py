@@ -141,6 +141,19 @@ def _chained_parse(content: bytes, path: Path) -> Any:
     return REAL_PARSE_KEYS(content, path)
 
 
+def _naming_parse(content: bytes, path: Path) -> Any:
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return REAL_PARSE_KEYS(content, path)
+    known = {p.value for p in keys_module.ModelProvider}
+    unknown = sorted(str(name) for name in data) if isinstance(data, dict) else []
+    unknown = [name for name in unknown if name not in known]
+    if unknown:
+        raise KeyConfigError(f"keys file {path} names unknown providers: {unknown}")
+    return REAL_PARSE_KEYS(content, path)
+
+
 def _show_keys(self: ProviderKeys) -> str:
     return f"ProviderKeys({self._keys})"
 
@@ -417,6 +430,11 @@ MUTATIONS = [
                 ),
             ),
         ),
+    ),
+    Mutation(
+        "an unknown provider name is printed",
+        ids(12),
+        replace=((keys_module, "_parse_keys", _naming_parse),),
     ),
     Mutation(
         "a parse error is chained to the key error",
