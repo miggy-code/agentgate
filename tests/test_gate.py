@@ -1317,13 +1317,13 @@ class Audited:
         conn = sqlite3.connect(self.path)
         try:
             found = conn.execute(
-                "SELECT action, user_info, context FROM events ORDER BY rowid"
+                "SELECT action, user_info, attributes FROM events ORDER BY rowid"
             ).fetchall()
         finally:
             conn.close()
         rows = []
-        for action, user, context in found:
-            fields = json.loads(context)["agentgate"]
+        for action, user, attributes in found:
+            fields = json.loads(attributes)
             fields["target"] = json.loads(action).get("target")
             fields["panoptes_user"] = (json.loads(user) or {}).get("id") if user else None
             rows.append(fields)

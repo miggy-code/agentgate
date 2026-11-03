@@ -14,9 +14,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
+import agentgate.audit.panoptes as panoptes_module
 import agentgate.gateway
 from agentgate.audit.base import MemorySink
-from agentgate.audit.panoptes import PanoptesSink
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.clock import FixedClock
 from agentgate.gate import Denied, Executed, Gate
@@ -471,7 +471,7 @@ def test_a_database_error_in_audit_verify_is_one_error_line(
     tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _ok(_cli(tmp, "users", "list", "--as", "kc-owner-dale"))
-    monkeypatch.setattr(PanoptesSink, "verify", _raise_locked)
+    monkeypatch.setattr(panoptes_module, "_verified", _raise_locked)
     result = runner.invoke(app, ["audit", "verify", "--db", str(_audit(tmp))])
     assert result.exit_code == 1
     assert isinstance(result.exception, SystemExit)

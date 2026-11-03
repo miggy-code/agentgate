@@ -136,13 +136,13 @@ def _tamper(path: Path, sql: str, *params: object) -> int:
 def _stored_fields(path: Path) -> list[dict[str, JsonValue]]:
     conn = sqlite3.connect(path)
     try:
-        rows = conn.execute("SELECT context FROM events ORDER BY rowid").fetchall()
+        rows = conn.execute("SELECT attributes FROM events ORDER BY rowid").fetchall()
     finally:
         conn.close()
     fields: list[dict[str, JsonValue]] = []
-    for (context,) in rows:
-        loaded = json.loads(context)
-        fields.append(loaded.get("agentgate", {}) if isinstance(loaded, dict) else {})
+    for (attributes,) in rows:
+        loaded = json.loads(attributes) if attributes else {}
+        fields.append(loaded if isinstance(loaded, dict) else {})
     return fields
 
 
@@ -374,8 +374,8 @@ def panoptes_edit_detected(arena: Arena) -> None:
         return
     edits = (
         ("deny rewritten as success", "outcome", "$.status", "success"),
-        ("reason rewritten", "context", "$.agentgate.reason", "matched_allow"),
-        ("user rewritten", "context", "$.agentgate.user_id", "kc-owner-dale"),
+        ("reason rewritten", "attributes", "$.reason", "matched_allow"),
+        ("user rewritten", "attributes", "$.user_id", "kc-owner-dale"),
     )
     for name, column, json_path, value in edits:
         with _panoptes_copy(arena) as (sink, path):
@@ -653,10 +653,10 @@ def _email() -> dict[str, JsonValue]:
 def _rows(path: Path) -> list[dict[str, JsonValue]]:
     conn = sqlite3.connect(path)
     try:
-        found = conn.execute("SELECT action, user_info, context FROM events ORDER BY rowid")
+        found = conn.execute("SELECT action, user_info, attributes FROM events ORDER BY rowid")
         rows: list[dict[str, JsonValue]] = []
-        for action, user, context in found.fetchall():
-            fields = json.loads(context).get("agentgate", {})
+        for action, user, attributes in found.fetchall():
+            fields = json.loads(attributes) if attributes else {}
             fields["target"] = json.loads(action).get("target")
             fields["stored_user"] = json.loads(user).get("id") if user else None
             rows.append(fields)

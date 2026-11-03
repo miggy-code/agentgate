@@ -1301,6 +1301,10 @@ def forged_correlation(arena: Arena) -> None:
         f"{len(plain)} recorded as written",
     )
     arena.expect(
+        "only a plain id is stored as the event's correlation id",
+        all(e.correlation_id in (None, other.run_id) for e in events),
+    )
+    arena.expect(
         "every event is about the real run",
         all(e.run_id == ctx.run_id and e.user_id == STAFF for e in events),
     )

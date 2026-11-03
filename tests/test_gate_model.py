@@ -713,3 +713,58 @@ def test_a_reservation_another_gate_made_is_not_finished_here(world: World) -> N
     )
     with pytest.raises(ValueError, match="admit_model"):
         other.finish_model(ctx, reservation, sent)
+
+
+def test_a_model_decision_carries_the_exchange_and_correlation_ids(world: World) -> None:
+    ctx = world.run(STAFF)
+    reserved(admit(world, ctx, call=call(exchange_id="exch-1", correlation_id="trial-7")))
+    admit(world, ctx, call=call(exchange_id="exch-2", correlation_id="trial-7", model="other"))
+    events = [e for e in world.events() if e.details.get("source") == "model"]
+    assert [(e.exchange_id, e.correlation_id) for e in events] == [("exch-1", "trial-7")] * 1 + [
+        ("exch-2", "trial-7")
+    ]
+    assert all(e.details["asserted_correlation_id"] == "trial-7" for e in events)
+
+
+def test_a_correlation_id_the_proxy_made_is_not_an_assertion(world: World) -> None:
+    ctx = world.run(STAFF)
+    reserved(
+        admit(
+            world,
+            ctx,
+            call=call(exchange_id="exch-1", correlation_id="exch-1", correlation_source="proxy"),
+        )
+    )
+    event = last_decision(world)
+    assert event.correlation_id == "exch-1" and event.exchange_id == "exch-1"
+    assert "asserted_correlation_id" not in event.details
+
+
+@pytest.mark.parametrize("hostile", ["x" * 500, "a\nb", "sk-live-0123456789abcdef0123456789"])
+def test_an_unsafe_correlation_or_exchange_id_is_not_stored_on_the_event(
+    world: World, hostile: str
+) -> None:
+    ctx = world.run(STAFF)
+    reserved(admit(world, ctx, call=call(exchange_id=hostile, correlation_id=hostile)))
+    event = last_decision(world)
+    assert event.exchange_id is None and event.correlation_id is None
+    assert hostile not in json.dumps(event.model_dump(mode="json"))
+
+
+def test_the_ids_reach_the_durable_log(world: World, tmp_path: Path) -> None:
+    from agentgate.audit.panoptes import PanoptesSink, read_events
+
+    path = tmp_path / "audit.db"
+    sink = PanoptesSink(path)
+    try:
+        gate = world.gate_with(sink=sink)
+        ctx = gate.start_run(KC, STAFF)
+        gate.admit_model(
+            ctx, call(exchange_id="exch-9", correlation_id="trial-9"), rates=RATE_TABLE
+        )
+    finally:
+        sink.close()
+    stored = [e for e in read_events(path) if e.exchange_id is not None]
+    assert [(e.exchange_id, e.correlation_id, e.kind) for e in stored] == [
+        ("exch-9", "trial-9", EventKind.ALLOW)
+    ]

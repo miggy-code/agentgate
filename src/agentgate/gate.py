@@ -268,6 +268,9 @@ class _Call:
     # The tool name the caller asked for, as given, when it differs from `tool` or may be
     # unknown; None when the tool came from the gate's own records.
     asked_tool: str | None = None
+    # For a model request through the proxy: the ids that join its events to the exchange.
+    exchange_id: str | None = None
+    correlation_id: str | None = None
 
     def latency_us(self) -> int:
         return (time.perf_counter_ns() - self.started_ns) // 1000
@@ -698,7 +701,11 @@ class Gate:
         run = self._check_run(ctx, base)
         if isinstance(run, Denied):
             return run
-        asked = _bind(base, run)
+        asked = replace(
+            _bind(base, run),
+            exchange_id=_plain_id(call.exchange_id),
+            correlation_id=_plain_id(call.correlation_id),
+        )
         values = _model_values(self, call)
         if not call.valid:
             return self._deny(asked, GateReason.MODEL_REQUEST_INVALID, details=values)
@@ -1640,6 +1647,8 @@ class Gate:
             policy_version=policy_version or call.policy_version,
             latency_us=latency_us,
             details=details or {},
+            exchange_id=call.exchange_id,
+            correlation_id=call.correlation_id,
             references=self._references(call, subject, unknown_subject),
         )
         try:
@@ -1894,12 +1903,19 @@ def _model_values(gate: Gate, call: ModelCall) -> dict[str, JsonValue]:
         if call.server_features:
             values["server_features"] = list(call.server_features)
     asserted = call.correlation_id
-    if asserted is not None:
-        if _EFFECT_REF.fullmatch(asserted) and storable_identifier(asserted):
+    if asserted is not None and call.correlation_source == "client":
+        if _plain_id(asserted) is not None:
             values["asserted_correlation_id"] = asserted
         else:
             values["asserted_correlation_ref"] = gate.audit_reference(asserted)
     return values
+
+
+def _plain_id(value: str | None) -> str | None:
+    """value if it may be recorded as written: a plain id shape the audit log accepts."""
+    if value is not None and _EFFECT_REF.fullmatch(value) and storable_identifier(value):
+        return value
+    return None
 
 
 def _model_reason(reason: str) -> str:

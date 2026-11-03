@@ -7,6 +7,7 @@ import pytest
 from panoptes.db import AuditDB, EventConflictError
 from panoptes.schema import (
     ALLOWED_OUTCOME_STATUSES,
+    IdentifierRewriteError,
     ValidationError,
     normalize_event,
     validate_event,
@@ -76,43 +77,51 @@ def test_full_mapping() -> None:
     assert to_panoptes_event(event) == {
         "event_id": event.event_id,
         "timestamp": "2026-10-22T12:00:00+00:00",
-        "event_type": "decision_point",
+        "event_type": "agentgate.deny",
         "agent": {"type": "agentgate", "session_id": "run-1", "run_id": "run-1"},
-        "user": {"id": "ana", "auth_method": "cli"},
+        "user": {"id": "ana"},
         "action": {
             "tool_name": "docs.read",
             "parameters": {"action": "read", "subject": "doc-1"},
             "target": "doc-1",
         },
         "outcome": {"status": "blocked", "summary": "deny: label_too_high"},
-        "context": {
-            "schema_version": 4,
-            "agentgate": {
-                "kind": "deny",
-                "customer_id": "acme",
-                "user_id": "ana",
-                "role": "staff",
-                "run_id": "run-1",
-                "tool": "docs.read",
-                "reason": "label_too_high",
-                "rule_ids": ["read-internal", "staff-docs"],
-                "policy_version": "sha256:0123456789abcdef",
-                "latency_us": 42,
-                "details": {"label": "internal"},
-                "references": {},
-            },
+        "context": {"schema_version": 5},
+        "attributes": {
+            "kind": "deny",
+            "customer_id": "acme",
+            "user_id": "ana",
+            "role": "staff",
+            "run_id": "run-1",
+            "tool": "docs.read",
+            "reason": "label_too_high",
+            "rule_ids": ["read-internal", "staff-docs"],
+            "policy_version": "sha256:0123456789abcdef",
+            "latency_us": 42,
+            "details": {"label": "internal"},
+            "references": {},
         },
     }
+
+
+def test_a_model_decision_carries_its_exchange_and_correlation_id() -> None:
+    event = _event(exchange_id="exch-1", correlation_id="trial-7")
+    mapped = to_panoptes_event(event)
+    assert mapped["correlation_id"] == "trial-7"
+    assert mapped["attributes"]["exchange_id"] == "exch-1"
+    assert "correlation_id" not in to_panoptes_event(_event())
+    assert "exchange_id" not in to_panoptes_event(_event())["attributes"]
 
 
 def test_event_without_user_run_or_tool() -> None:
     event = _event(EventKind.CAP_HIT, user_id=None, role=None, run_id=None, tool=None)
     mapped = to_panoptes_event(event)
     assert "user" not in mapped
-    assert mapped["agent"] == {"type": "agentgate", "session_id": "no-run", "run_id": "no-run"}
+    # No run id is invented, and a user is never filled in.
+    assert mapped["agent"] == {"type": "agentgate", "session_id": "customer:acme"}
     assert mapped["action"]["tool_name"] == "cap_hit"
-    assert mapped["context"]["agentgate"]["user_id"] is None
-    assert mapped["context"]["agentgate"]["run_id"] is None
+    assert mapped["attributes"]["user_id"] is None
+    assert mapped["attributes"]["run_id"] is None
 
 
 def test_panoptes_normalization_keeps_ids_intact() -> None:
@@ -125,15 +134,38 @@ def test_panoptes_normalization_keeps_ids_intact() -> None:
         assert normalized["action"]["target"] == "prod-runbook"
         assert normalized["action"]["parameters"] == mapped["action"]["parameters"]
         assert normalized["action"]["tool_name"] == mapped["action"]["tool_name"]
-        assert normalized["context"]["agentgate"] == mapped["context"]["agentgate"]
+        assert normalized["attributes"] == mapped["attributes"]
         assert normalized["user"] == mapped["user"]
         assert normalized["agent"]["run_id"] == "run-1"
 
 
-def test_id_panoptes_would_redact_is_refused() -> None:
+def test_id_panoptes_would_redact_is_refused(sink: PanoptesSink) -> None:
     # Panoptes would store this subject as "[REDACTED API KEY]"; an altered id is no record.
-    with pytest.raises(ValidationError, match="subject"):
-        to_panoptes_event(_event(subject="sk-proj-fakefakefakefakefakefake"))
+    # Strict ingest refuses it instead, and stores nothing.
+    with pytest.raises(AuditRejected) as raised:
+        sink.record(_event(subject="sk-proj-fakefakefakefakefakefake"))
+    assert isinstance(raised.value.__cause__, IdentifierRewriteError)
+    assert sink.count() == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"customer_id": "sk-proj-fakefakefakefakefakefake"},
+        {"user_id": "sk-proj-fakefakefakefakefakefake"},
+        {"run_id": "sk-proj-fakefakefakefakefakefake"},
+        {"tool": "sk-proj-fakefakefakefakefakefake"},
+        {"reason": "sk-proj-fakefakefakefakefakefake"},
+        {"policy_version": "sk-proj-fakefakefakefakefakefake"},
+        {"rule_ids": ("ok", "sk-proj-fakefakefakefakefakefake")},
+        {"exchange_id": "sk-proj-fakefakefakefakefakefake"},
+        {"correlation_id": "sk-proj-fakefakefakefakefakefake"},
+    ],
+)
+def test_no_identifier_is_stored_rewritten(sink: PanoptesSink, overrides: dict[str, Any]) -> None:
+    with pytest.raises(AuditRejected):
+        sink.record(_event(**overrides))
+    assert sink.count() == 0
 
 
 def _ref(char: str) -> str:
@@ -159,13 +191,13 @@ def test_referenced_fields_are_mapped_as_their_references() -> None:
     mapped = to_panoptes_event(event)
     validate_event(mapped)
     assert mapped["agent"] == {"type": "agentgate", "session_id": _ref("c"), "run_id": _ref("c")}
-    assert mapped["user"] == {"id": _ref("b"), "auth_method": "cli"}
+    assert mapped["user"] == {"id": _ref("b")}
     assert mapped["action"] == {
         "tool_name": _ref("d"),
         "parameters": {"action": "read", "subject": _ref("e")},
         "target": _ref("e"),
     }
-    fields = mapped["context"]["agentgate"]
+    fields = mapped["attributes"]
     assert (fields["customer_id"], fields["user_id"], fields["run_id"], fields["tool"]) == (
         _ref("a"),
         _ref("b"),
@@ -188,7 +220,7 @@ def test_a_reference_fills_a_field_the_event_left_empty() -> None:
     # A tool name too odd to keep on the event at all is still named by its reference.
     event = _event(tool=None, references={"tool": Reference(ref=_ref("f"), why="unknown")})
     assert event.recorded().tool == _ref("f")
-    assert to_panoptes_event(event)["context"]["agentgate"]["tool"] == _ref("f")
+    assert to_panoptes_event(event)["attributes"]["tool"] == _ref("f")
     plain = _event()
     assert plain.recorded() is plain
 
@@ -235,7 +267,7 @@ def test_referenced_event_round_trips(sink: PanoptesSink, tmp_path: Path) -> Non
     finally:
         db.close()
     assert row["action"]["target"] == _ref("9")
-    assert row["context"]["agentgate"]["references"] == {"subject": "unknown"}
+    assert row["attributes"]["references"] == {"subject": "unknown"}
     sink.close()
     assert b"sk-fake-aaaa" not in (tmp_path / "audit.db").read_bytes()
 
@@ -260,8 +292,8 @@ def test_round_trip_of_every_kind(sink: PanoptesSink, tmp_path: Path) -> None:
     assert len(stored) == len(events)
     for event in events:
         row = stored[event.event_id]
-        fields = row["context"]["agentgate"]
-        assert row["event_type"] == "decision_point"
+        fields = row["attributes"]
+        assert row["event_type"] == f"agentgate.{event.kind.value}"
         assert row["agent"]["type"] == "agentgate"
         assert fields["kind"] == event.kind.value
         assert fields["customer_id"] == event.customer_id
@@ -274,7 +306,8 @@ def test_round_trip_of_every_kind(sink: PanoptesSink, tmp_path: Path) -> None:
         assert fields["policy_version"] == event.policy_version
         assert fields["latency_us"] == event.latency_us
         assert fields["details"] == event.details
-        assert row["agent"]["run_id"] == (event.run_id or "no-run")
+        assert row["agent"]["run_id"] == event.run_id
+        assert row["agent"]["session_id"] == (event.run_id or f"customer:{event.customer_id}")
         assert row["action"]["target"] == event.subject
         assert row["outcome"]["summary"] == f"{event.kind.value}: {event.reason}"
         if event.user_id is not None:
@@ -301,7 +334,7 @@ def test_rejected_event_raises_and_stores_nothing(sink: PanoptesSink) -> None:
 
 
 def test_storage_failure_propagates(sink: PanoptesSink, monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken(event: dict[str, Any]) -> str:
+    def broken(event: dict[str, Any], **kwargs: Any) -> str:
         raise sqlite3.OperationalError("disk I/O error")
 
     monkeypatch.setattr(sink._db, "insert_event", broken)

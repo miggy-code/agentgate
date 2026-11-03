@@ -156,8 +156,14 @@ class ModelCall:
     # The completions asked for, or None when the request leaves the default of one.
     n: int | None
     request_bytes: int
-    # What the client said it is. Recorded as asserted, never relied on.
+    # The correlation id the exchange carries, and where it came from: "client" when the
+    # client sent it, which makes it an assertion, recorded as such and never relied on;
+    # "proxy" when the proxy made it (it is then the exchange id).
     correlation_id: str | None = None
+    # The proxy's id for this exchange, the key that joins this decision to the exchange it
+    # observed.
+    exchange_id: str | None = None
+    correlation_source: str = "client"
     # False when the body could not be read as a request (see parse_model_call).
     valid: bool = True
     # How many top-level fields the provider's list does not name. Their names are the
