@@ -1,7 +1,7 @@
 # Red-team scenarios
 
 Every scenario in the suite, by category. The list, titles and check counts come from the JSON report of
-`uv run agentgate redteam` at commit `c093353`: 173 scenarios, 2019 checks, all passed.
+`uv run agentgate redteam` at commit `ec526fb`: 173 scenarios, 2025 checks, all passed.
 
 Each scenario runs in a fresh in-memory world over the fixtures and policies in this repository: two fictional
 companies (Kettle Creek Heating & Air and Juniper Row Apothecary) with synthetic data. Scenarios about state that
@@ -228,7 +228,7 @@ A run's request to a model, and the keys, tokens and spend behind the model gate
 | mb-014 | Concurrent model calls cannot jointly pass the run's cap | 4 |
 | mb-015 | Caps passed to the gate tighten the policy and never widen it | 9 |
 | mb-016 | After the cap every model call is refused and nothing more is reserved | 6 |
-| mb-017 | A call is released only if it never reached the provider; a sent call is charged | 24 |
+| mb-017 | A call is released only if it never reached the provider; a sent call is charged | 30 |
 | mb-018 | A reservation covers the worst case, and an unpriced model is denied | 12 |
 | mb-019 | A forged correlation id is recorded as asserted, never trusted | 11 |
 | mb-020 | A model call whose allow cannot be recorded is not admitted | 6 |
@@ -237,7 +237,6 @@ A run's request to a model, and the keys, tokens and spend behind the model gate
 | mb-023 | A body field the parser does not read is denied, not ignored | 35 |
 | mb-024 | Server-side state, tools and cache writes are denied unless allowed | 30 |
 | mb-025 | A tiny fixed reserve cannot lower the worst case the table gives | 5 |
-| mb-021 | Reservations left by a killed proxy are released when the store next opens | 5 |
 
 ## benign_control
 
