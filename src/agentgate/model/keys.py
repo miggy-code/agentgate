@@ -18,7 +18,6 @@ import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote_plus
 
 from agentgate._json import no_duplicate_keys
 from agentgate.policy.schema import ModelProvider
@@ -40,8 +39,6 @@ CLIENT_CREDENTIAL_HEADERS = frozenset(
 )
 # The headers a client may present its token in, whichever SDK it uses.
 PRESENTED_CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-goog-api-key", "api-key")
-# Query parameters that carry a credential (Gemini takes its key as ?key=).
-CLIENT_CREDENTIAL_QUERY_PARAMS = frozenset({"key", "api_key", "apikey", "access_token"})
 
 
 class KeyConfigError(ValueError):
@@ -196,28 +193,6 @@ def _parse_keys(content: bytes, path: Path) -> dict[ModelProvider, str]:
 # Client credentials
 
 
-def strip_query_credentials(path: str) -> tuple[str, list[str]]:
-    """path without its credential query parameters, and the values removed.
-
-    Other parameters keep their encoding and order. Names are compared decoded and case
-    folded, so `%6Bey=` and `KEY=` are removed like `key=`.
-    """
-    base, question, query = path.partition("?")
-    if not question:
-        return path, []
-    query, hash_sep, fragment = query.partition("#")
-    kept: list[str] = []
-    removed: list[str] = []
-    for part in query.split("&"):
-        name, _, value = part.partition("=")
-        if unquote_plus(name).casefold() in CLIENT_CREDENTIAL_QUERY_PARAMS:
-            removed.append(unquote_plus(value))
-        else:
-            kept.append(part)
-    rebuilt = base + ("?" + "&".join(kept) if kept else "")
-    return rebuilt + (hash_sep + fragment if hash_sep else ""), removed
-
-
 def with_provider_credential(
     headers: Iterable[tuple[str, str]], credential: Credential
 ) -> list[tuple[str, str]]:
@@ -232,15 +207,14 @@ def with_provider_credential(
     return [*kept, (credential.name, credential.value)]
 
 
-def prepare_upstream_request(
-    keys: ProviderKeys,
-    provider: ModelProvider,
-    path: str,
-    headers: Iterable[tuple[str, str]],
-) -> tuple[str, list[tuple[str, str]]]:
-    """The path and headers to send to a provider: the client's credentials removed from both
-    and the provider's own added. This is the one function the proxy's hook calls to build an
-    upstream request, so what it returns is exactly what the provider can see of the
-    client's credentials."""
-    clean_path, _ = strip_query_credentials(path)
-    return clean_path, with_provider_credential(headers, keys.credential(provider))
+def upstream_headers(
+    keys: ProviderKeys, provider: ModelProvider, headers: Iterable[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """The headers to send to a provider: every client credential removed and the provider's
+    own added. The proxy's hook assigns the result to the exchange's outbound headers.
+
+    The query string is not handled here. Panoptes removes credential query parameters
+    when the hook calls `exchange.drop_query_credentials()`, and shows the removed values
+    as `exchange.query_credentials`, which is where a token presented as `?key=` is read.
+    """
+    return with_provider_credential(headers, keys.credential(provider))

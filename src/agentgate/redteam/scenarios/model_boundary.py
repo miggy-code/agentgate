@@ -37,7 +37,7 @@ from agentgate.model.keys import (
     KeyConfigError,
     ProviderKeys,
     load_provider_keys,
-    prepare_upstream_request,
+    upstream_headers,
 )
 from agentgate.model.pricing import RateTable
 from agentgate.model.tokens import (
@@ -813,8 +813,9 @@ def key_never_shown(arena: Arena) -> None:
     "mb-013", MB, "A client's own credentials are stripped and the provider's is the only one sent"
 )
 def client_credentials(arena: Arena) -> None:
-    """Runs `prepare_upstream_request`, the one function the proxy's hook calls to build what
-    the provider sees. That the proxy forwards exactly its result is tested with the proxy."""
+    """Runs `upstream_headers`, the function the proxy's hook calls to build the headers the
+    provider sees. That the proxy forwards exactly its result, and that the query string is
+    cleaned too, is tested over real HTTP by the proxy scenarios."""
     keys = ProviderKeys(FAKE_KEYS)
     sent = [
         ("Authorization", "Bearer client-secret-1"),
@@ -828,37 +829,22 @@ def client_credentials(arena: Arena) -> None:
         ("x-trace", "1"),
     ]
     for provider in (PROVIDER, ModelProvider.ANTHROPIC, ModelProvider.GEMINI):
-        for path, kept in {
-            "/v1/chat?key=client-secret": "/v1/chat",
-            "/v1/chat?KEY=client-secret&x=1": "/v1/chat?x=1",
-            "/v1/chat?%6Bey=client-secret": "/v1/chat",
-            "/v1/chat?k%65y=client-secret&x=1": "/v1/chat?x=1",
-            "/v1/chat?api_key=client-secret&access_token=client-secret": "/v1/chat",
-            "/v1/chat?x=1": "/v1/chat?x=1",
-        }.items():
-            upstream_path, outgoing = prepare_upstream_request(keys, provider, path, sent)
-            arena.expect(
-                f"{provider.value}: {path} goes upstream as {kept}",
-                upstream_path == kept,
-                upstream_path,
-            )
-            sent_credentials = [
-                value for name, value in outgoing if name.lower() in CLIENT_CREDENTIAL_HEADERS
-            ]
-            arena.expect(
-                f"{provider.value}: nothing of the client's goes upstream for {path}",
-                "client-secret" not in repr(outgoing) + upstream_path,
-            )
-            expected = keys.credential(provider)
-            arena.expect(
-                f"{provider.value}: the provider's credential is the only one for {path}",
-                sent_credentials == [expected.value]
-                and [n for n, _ in outgoing if n.lower() in CLIENT_CREDENTIAL_HEADERS]
-                == [expected.name],
-            )
-            arena.expect(
-                f"{provider.value}: other headers are kept for {path}", ("x-trace", "1") in outgoing
-            )
+        outgoing = upstream_headers(keys, provider, sent)
+        sent_credentials = [
+            value for name, value in outgoing if name.lower() in CLIENT_CREDENTIAL_HEADERS
+        ]
+        expected = keys.credential(provider)
+        arena.expect(
+            f"{provider.value}: nothing of the client's goes upstream",
+            "client-secret" not in repr(outgoing),
+        )
+        arena.expect(
+            f"{provider.value}: the provider's credential is the only one",
+            sent_credentials == [expected.value]
+            and [n for n, _ in outgoing if n.lower() in CLIENT_CREDENTIAL_HEADERS]
+            == [expected.name],
+        )
+        arena.expect(f"{provider.value}: other headers are kept", ("x-trace", "1") in outgoing)
     stolen = Credential("authorization", "Bearer x")
     arena.expect("a credential does not print its value", "Bearer x" not in repr(stolen))
 

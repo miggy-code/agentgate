@@ -483,43 +483,6 @@ MUTATIONS = [
         ids(13),
         replace=((keys_module, "CLIENT_CREDENTIAL_HEADERS", _headers_without("cookie")),),
     ),
-    Mutation(
-        "a client's key query parameter is forwarded",
-        ids(13),
-        replace=((keys_module, "CLIENT_CREDENTIAL_QUERY_PARAMS", frozenset()),),
-    ),
-    Mutation(
-        "query parameter names are compared case-sensitively",
-        ids(13),
-        replace=(
-            (
-                keys_module,
-                "strip_query_credentials",
-                mutant(
-                    keys_module,
-                    "strip_query_credentials",
-                    (("unquote_plus(name).casefold()", "unquote_plus(name)"),),
-                    {},
-                ),
-            ),
-        ),
-    ),
-    Mutation(
-        "query parameter names are not decoded",
-        ids(13),
-        replace=(
-            (
-                keys_module,
-                "strip_query_credentials",
-                mutant(
-                    keys_module,
-                    "strip_query_credentials",
-                    (("unquote_plus(name).casefold()", "name.casefold()"),),
-                    {},
-                ),
-            ),
-        ),
-    ),
     # Spend
     Mutation(
         "the ledger ignores limits",
