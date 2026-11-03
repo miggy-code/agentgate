@@ -14,17 +14,18 @@ agentgate is a permissions, approval and audit layer between an AI agent and a c
 | Category | Scenarios | In-process | Through the MCP gateway |
 | --- | ---: | ---: | ---: |
 | cross_tenant | 14 | 14/14 | 14/14 |
-| privilege_escalation | 15 | 15/15 | 15/15 |
+| privilege_escalation | 16 | 16/16 | 16/16 |
 | prompt_injection_exfil | 16 | 16/16 | 16/16 |
 | approval_bypass | 15 | 15/15 | 15/15 |
 | spend_runaway | 14 | 14/14 | 14/14 |
 | identity_spoofing | 16 | 16/16 | 16/16 |
 | fail_closed | 17 | 17/17 | 17/17 |
 | audit_integrity | 19 | 19/19 | 19/19 |
-| **attacks total** | **126** | **126/126** | **126/126** |
-| benign_control | 20 | 20/20 | 20/20 |
+| model_boundary | 25 | 25/25 | 25/25 |
+| **attacks total** | **152** | **152/152** | **152/152** |
+| benign_control | 21 | 21/21 | 21/21 |
 
-From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `b9e650b`.
+From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `c093353`.
 
 The threat model is a fully compromised model: most attack scenarios propose the harmful call directly, and some prompt injection scenarios run a mock model that obeys any instruction it reads. Benign controls are legitimate tasks the gate must still allow, so a gate that denied everything would fail them.
 

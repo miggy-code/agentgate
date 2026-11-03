@@ -258,15 +258,15 @@ A policy's version is a content hash of the validated bundle (policy and tools),
 ```console
 $ uv run agentgate policy lint
 juniper-row-apothecary  sha256:091571d97a0826e8  15 rules  5 tools  git f5b8eba
-kettle-creek-hvac  sha256:62b5288d503e04ae  14 rules  5 tools  1 models  git f5b8eba
+kettle-creek-hvac  sha256:0505f513f2ee6853  14 rules  5 tools  1 models  git 329c4d3
 
 $ uv run agentgate policy test
 juniper-row-apothecary  sha256:091571d97a0826e8  60/60 passed
-kettle-creek-hvac  sha256:62b5288d503e04ae  78/78 passed
+kettle-creek-hvac  sha256:0505f513f2ee6853  78/78 passed
 total  138/138 passed
 ```
 
-Both outputs are from commit `d248714`. The version covers the `models:` section too, and a policy without one keeps the version it had before the section existed.
+Both outputs are from commit `c093353`. The version covers the `models:` section too, and a policy without one keeps the version it had before the section existed.
 
 ## Model gateway
 
@@ -351,17 +351,18 @@ The same suite through the MCP gateway, with every agent-side tool call sent thr
 | Category | Scenarios | Passed | Pass rate |
 | --- | ---: | ---: | ---: |
 | cross_tenant | 14 | 14 | 14/14 (100%) |
-| privilege_escalation | 15 | 15 | 15/15 (100%) |
+| privilege_escalation | 16 | 16 | 16/16 (100%) |
 | prompt_injection_exfil | 16 | 16 | 16/16 (100%) |
 | approval_bypass | 15 | 15 | 15/15 (100%) |
 | spend_runaway | 14 | 14 | 14/14 (100%) |
 | identity_spoofing | 16 | 16 | 16/16 (100%) |
 | fail_closed | 17 | 17 | 17/17 (100%) |
 | audit_integrity | 19 | 19 | 19/19 (100%) |
-| **attacks total** | 126 | 126 | 126/126 (100%) |
-| benign_control | 20 | 20 | 20/20 (100%) |
+| model_boundary | 25 | 25 | 25/25 (100%) |
+| **attacks total** | 152 | 152 | 152/152 (100%) |
+| benign_control | 21 | 21 | 21/21 (100%) |
 
-Produced by `uv run agentgate redteam --transport mcp` at commit `b9e650b`: 146 scenarios, 1552 checks, baseline check 0 problems, calls over MCP: 1361, direct: 58. A call goes to the gate directly only when MCP cannot express it: 29 use a forged run context (an MCP client cannot pass a context at all), 23 use an action the tool does not have (over MCP the action comes from the gateway's own tool list), and 6 belong to a run whose customer has no policy (the gateway will not launch for it). 13 of the 126 attack scenarios make no MCP call: id-005, id-006, id-007, fc-002, fc-003 and pe-014 send only such direct calls; id-001, xt-013, sr-003, sr-006 and sr-007 test only run starts and model spend, which stay in-process because a gateway's identity is bound at launch and it never sees model calls; and fc-016 and fc-017 make no tool call at all, since they test how the store file is opened. Every benign_control scenario makes at least one MCP call. The suite's sessions use the MCP SDK's in-memory transport, one gateway per run; the stdio launch is covered by a test (see [Integration](#integration)).
+Produced by `uv run agentgate redteam --transport mcp` at commit `c093353`: 173 scenarios, 2019 checks, baseline check 0 problems, calls over MCP: 1359, direct: 58. A call goes to the gate directly only when MCP cannot express it: 29 use a forged run context (an MCP client cannot pass a context at all), 23 use an action the tool does not have (over MCP the action comes from the gateway's own tool list), and 6 belong to a run whose customer has no policy (the gateway will not launch for it). 38 of the 152 attack scenarios make no MCP call. 25 are the model_boundary scenarios, which call the gate, the token store and the key helpers directly, because the model gateway is not carried over MCP. The other 13: id-005, id-006, id-007, fc-002, fc-003 and pe-014 send only such direct calls; id-001, xt-013, sr-003, sr-006 and sr-007 test only run starts and model spend, which stay in-process because a gateway's identity is bound at launch and it never sees model calls; and fc-016 and fc-017 make no tool call at all, since they test how the store file is opened. Every benign_control scenario makes at least one MCP call. The suite's sessions use the MCP SDK's in-memory transport, one gateway per run; the stdio launch is covered by a test (see [Integration](#integration)).
 
 ## Project layout
 

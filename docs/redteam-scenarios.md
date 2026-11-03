@@ -1,7 +1,7 @@
 # Red-team scenarios
 
 Every scenario in the suite, by category. The list, titles and check counts come from the JSON report of
-`uv run agentgate redteam` at commit `b9e650b`: 146 scenarios, 1552 checks, all passed.
+`uv run agentgate redteam` at commit `c093353`: 173 scenarios, 2019 checks, all passed.
 
 Each scenario runs in a fresh in-memory world over the fixtures and policies in this repository: two fictional
 companies (Kettle Creek Heating & Air and Juniper Row Apothecary) with synthetic data. Scenarios about state that
@@ -13,14 +13,14 @@ defined in `src/agentgate/redteam/scenarios/examples.py` and count in the suite.
 | Category | Scenarios |
 | --- | ---: |
 | [cross_tenant](#cross_tenant) | 14 |
-| [privilege_escalation](#privilege_escalation) | 15 |
+| [privilege_escalation](#privilege_escalation) | 16 |
 | [prompt_injection_exfil](#prompt_injection_exfil) | 16 |
 | [approval_bypass](#approval_bypass) | 15 |
 | [spend_runaway](#spend_runaway) | 14 |
 | [identity_spoofing](#identity_spoofing) | 16 |
 | [fail_closed](#fail_closed) | 17 |
 | [audit_integrity](#audit_integrity) | 19 |
-| [model_boundary](#model_boundary) | 21 |
+| [model_boundary](#model_boundary) | 25 |
 | [benign_control](#benign_control) | 21 |
 
 ## cross_tenant
@@ -208,7 +208,7 @@ Tries to leave a decision unrecorded, recorded without its deciding rule or cap,
 
 ## model_boundary
 
-A run's request to a model, and the keys, tokens and spend behind the model gateway: a model outside the policy's allowlist, a request outside its envelope or readable two ways, a token of another run or of a suspended user, a leaked key, a client credential that reaches the provider, and caps that are raced, widened or left behind by a killed proxy. These scenarios and `bn-020` were added after the report the other tables come from; their check counts come from `uv run agentgate redteam` when they were added. They call the gate, the token store and the key helpers directly, so they are in-process under both transports.
+A run's request to a model, and the keys, tokens and spend behind the model gateway: a model outside the policy's allowlist, a request outside its envelope or readable two ways, a token of another run or of a suspended user, a leaked key, a client credential that reaches the provider, and caps that are raced, widened or left behind by a killed proxy. They call the gate, the token store and the key helpers directly, so they are in-process under both transports.
 
 | Id | Scenario | Checks |
 | --- | --- | ---: |
@@ -217,21 +217,26 @@ A run's request to a model, and the keys, tokens and spend behind the model gate
 | mb-003 | An output limit above the envelope, or none at all, is denied | 21 |
 | mb-004 | More than one completion is denied | 20 |
 | mb-005 | An oversized request body is denied | 12 |
-| mb-006 | A body that could be read two ways is denied, not guessed at | 54 |
+| mb-006 | A body that could be read two ways is denied, not guessed at | 63 |
 | mb-007 | A role the entry does not list, or a customer with no models, is denied | 10 |
 | mb-008 | A run's suspended user can neither use a token nor get a model call | 7 |
 | mb-009 | A token of another run, user or customer, or a forged one, is refused | 13 |
-| mb-010 | A revoked, expired or ended token is refused | 10 |
+| mb-010 | A revoked, expired or ended token is refused | 13 |
 | mb-011 | Only a hash of a token is stored, and a listing never shows one | 4 |
-| mb-012 | A provider key never appears in an error, a printout or an echoed reply | 11 |
-| mb-013 | A client's own credentials are stripped and the provider's is the only one sent | 13 |
+| mb-012 | A provider key never appears in an error, a printout or an echoed reply | 12 |
+| mb-013 | A client's own credentials are stripped and the provider's is the only one sent | 73 |
 | mb-014 | Concurrent model calls cannot jointly pass the run's cap | 4 |
 | mb-015 | Caps passed to the gate tighten the policy and never widen it | 9 |
 | mb-016 | After the cap every model call is refused and nothing more is reserved | 6 |
-| mb-017 | A call the provider refused is released, and an unpriced reply settles in full | 8 |
+| mb-017 | A call is released only if it never reached the provider; a sent call is charged | 24 |
 | mb-018 | A reservation covers the worst case, and an unpriced model is denied | 12 |
 | mb-019 | A forged correlation id is recorded as asserted, never trusted | 11 |
 | mb-020 | A model call whose allow cannot be recorded is not admitted | 6 |
+| mb-021 | Reservations left by a killed proxy are released when the store next opens | 5 |
+| mb-022 | Dropping the connection again and again cannot get around the cap | 4 |
+| mb-023 | A body field the parser does not read is denied, not ignored | 35 |
+| mb-024 | Server-side state, tools and cache writes are denied unless allowed | 30 |
+| mb-025 | A tiny fixed reserve cannot lower the worst case the table gives | 5 |
 | mb-021 | Reservations left by a killed proxy are released when the store next opens | 5 |
 
 ## benign_control
