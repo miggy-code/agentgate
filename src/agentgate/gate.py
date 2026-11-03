@@ -192,6 +192,11 @@ class GateReason(StrEnum):
     MODEL_UNKNOWN_FIELD = "model_unknown_field"
     # The policy reserves a computed worst case and the rate table cannot give one.
     MODEL_UNPRICED = "model_unpriced"
+    # A model request whose token was refused (unknown, revoked, expired, for another run).
+    TOKEN_REFUSED = "token_refused"
+    # How a model call's reservation ended, on its EXECUTED event.
+    MODEL_SETTLED = "model_settled"
+    MODEL_RELEASED = "model_released"
     TOOL_ERROR = "tool_error"
     RETRIEVAL_FILTER = "retrieval_filter"
     RETRIEVAL_INVARIANT = "retrieval_invariant"
@@ -662,7 +667,10 @@ class Gate:
             raise ValueError("reservation belongs to another run")
         if reservation.id not in self._gateway_reservations:
             raise ValueError("not a reservation admit_model made, or already finished")
-        if not exchange.request_sent or (exchange.provider_error and not exchange.produced_output):
+        released = not exchange.request_sent or (
+            exchange.provider_error and not exchange.produced_output
+        )
+        if released:
             self._ledger.release(reservation)
             charge = Decimal(0)
         else:
@@ -672,7 +680,67 @@ class Gate:
                 charge = reservation.amount_usd
             self._ledger.settle(reservation, charge)
         self._gateway_reservations.discard(reservation.id)
+        # The money is settled first. If the event cannot be recorded the error propagates,
+        # and the charge stands.
+        self._record_model_end(reservation, exchange, charge, settled=not released)
         return charge
+
+    def _record_model_end(
+        self, reservation: Reservation, exchange: ModelExchange, charge: Decimal, *, settled: bool
+    ) -> None:
+        with self._store.locked():
+            row = self._store.connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (reservation.run_id,)
+            ).fetchone()
+        if row is None:
+            return
+        engine = self._engines.get(row["customer_id"])
+        call = _Call(
+            time.perf_counter_ns(),
+            row["customer_id"],
+            user_id=row["user_id"],
+            role=Role(row["role"]),
+            run_id=row["run_id"],
+            policy_version=None if engine is None else engine.version,
+            exchange_id=_plain_id(exchange.exchange_id),
+        )
+        self._emit(
+            call,
+            EventKind.EXECUTED,
+            GateReason.MODEL_SETTLED if settled else GateReason.MODEL_RELEASED,
+            details={
+                "source": "model",
+                "reservation_id": reservation.id,
+                "charged_usd": str(charge),
+                "reserved_usd": str(reservation.amount_usd),
+                "request_sent": exchange.request_sent,
+                "provider_error": exchange.provider_error,
+                "complete": exchange.complete,
+                "produced_output": exchange.produced_output,
+                "priced": exchange.cost_usd is not None,
+            },
+        )
+
+    def refuse_token(
+        self, run: RunContext, token_reason: str, *, exchange_id: str | None = None
+    ) -> Denied:
+        """Record, on the run a refused token belongs to, that a model request presented it.
+
+        For a token that named a run (revoked, expired, for another run, its user suspended),
+        so the refusal is on that run's record. The run and user are checked as for any call;
+        a suspended user's refusal is recorded as that. `token_reason` is a model.tokens
+        TokenReason value, recorded in details.
+        """
+        base = self._begin(run, None, None)
+        checked = self._check_run(run, base)
+        if isinstance(checked, Denied):
+            return checked
+        asked = replace(_bind(base, checked), exchange_id=_plain_id(exchange_id))
+        return self._deny(
+            asked,
+            GateReason.TOKEN_REFUSED,
+            details={"source": "model", "token_reason": token_reason},
+        )
 
     def admit_model(
         self,

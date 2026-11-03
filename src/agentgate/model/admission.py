@@ -307,6 +307,8 @@ class ModelExchange:
     # and is read as None, so the call is charged its full reservation. It is not an error:
     # the call was already sent, and an exception here would leave the reservation open.
     cost_usd: Decimal | None = None
+    # The proxy's id for the exchange, recorded on the event that ends the call.
+    exchange_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("request_sent", "provider_error", "complete", "produced_output"):

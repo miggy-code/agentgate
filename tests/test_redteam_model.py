@@ -536,8 +536,8 @@ MUTATIONS = [
                 "finish_model",
                 (
                     (
-                        "if not exchange.request_sent or (",
-                        "if not exchange.complete or not exchange.request_sent or (",
+                        "released = not exchange.request_sent or (",
+                        "released = not exchange.complete or not exchange.request_sent or (",
                     ),
                 ),
             ),
@@ -599,7 +599,7 @@ MUTATIONS = [
             (
                 Gate,
                 "finish_model",
-                (("(exchange.provider_error and not exchange.produced_output)", "False"),),
+                (("exchange.provider_error and not exchange.produced_output", "False"),),
             ),
         ),
     ),
