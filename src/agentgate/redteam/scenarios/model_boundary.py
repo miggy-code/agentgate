@@ -942,7 +942,9 @@ def sent_calls_are_charged(arena: Arena) -> None:
         got = spent_after(name, exchange)
         arena.expect(f"{name}: charged {wanted}", got == wanted, f"charged {got}")
 
-    never = ModelExchange(request_sent=False)
+    never = ModelExchange(
+        request_sent=False, provider_error=False, complete=True, produced_output=False
+    )
     expect_charge("a call that was never sent", never, Decimal(0))
     arena.expect(
         "a call that was never sent frees its call too",
@@ -951,46 +953,84 @@ def sent_calls_are_charged(arena: Arena) -> None:
     )
     expect_charge(
         "a provider error with no output",
-        ModelExchange(request_sent=True, provider_error=True),
+        ModelExchange(request_sent=True, provider_error=True, complete=True, produced_output=False),
         Decimal(0),
     )
     expect_charge(
         "a provider error that produced output",
-        ModelExchange(request_sent=True, provider_error=True, produced_output=True),
+        ModelExchange(request_sent=True, provider_error=True, complete=True, produced_output=True),
         WORST_CASE,
     )
     expect_charge(
         "a complete priced reply",
-        ModelExchange(request_sent=True, produced_output=True, cost_usd=Decimal("0.001")),
+        ModelExchange(
+            request_sent=True,
+            provider_error=False,
+            complete=True,
+            produced_output=True,
+            cost_usd=Decimal("0.001"),
+        ),
         Decimal("0.001"),
     )
     expect_charge(
         "a complete reply that cannot be priced",
-        ModelExchange(request_sent=True, produced_output=True),
+        ModelExchange(request_sent=True, provider_error=False, complete=True, produced_output=True),
         WORST_CASE,
     )
     expect_charge(
         "a client that dropped the connection",
-        ModelExchange(request_sent=True, complete=False, produced_output=True),
+        ModelExchange(
+            request_sent=True, provider_error=False, complete=False, produced_output=True
+        ),
         WORST_CASE,
     )
     expect_charge(
         "a dropped connection with a partial price",
         ModelExchange(
-            request_sent=True, complete=False, produced_output=True, cost_usd=Decimal("0.000001")
+            request_sent=True,
+            provider_error=False,
+            complete=False,
+            produced_output=True,
+            cost_usd=Decimal("0.000001"),
         ),
         WORST_CASE,
     )
     expect_charge(
         "a dropped connection before any reply",
-        ModelExchange(request_sent=True, complete=False),
+        ModelExchange(
+            request_sent=True, provider_error=False, complete=False, produced_output=False
+        ),
         WORST_CASE,
     )
+
+    for name, cost in {
+        "a negative cost": Decimal("-1"),
+        "a NaN cost": Decimal("NaN"),
+        "an infinite cost": Decimal("Infinity"),
+        "a float cost": 0.001,
+    }.items():
+        expect_charge(
+            f"a reply with {name}",
+            ModelExchange(
+                request_sent=True,
+                provider_error=False,
+                complete=True,
+                produced_output=True,
+                cost_usd=cost,  # type: ignore[arg-type]
+            ),
+            WORST_CASE,
+        )
 
     last = _admitted(arena, _admit(arena, ctx), "a call to finish twice")
     if last is None:
         return
-    arena.gate.finish_model(ctx, last, ModelExchange(request_sent=True))
+    arena.gate.finish_model(
+        ctx,
+        last,
+        ModelExchange(
+            request_sent=True, provider_error=False, complete=True, produced_output=False
+        ),
+    )
     finishers: dict[str, Callable[[], object]] = {
         "settling twice": lambda: arena.gate.settle_model(ctx, last, Decimal(0)),
         "finishing twice": lambda: arena.gate.finish_model(ctx, last, never),
@@ -1024,7 +1064,9 @@ def sent_calls_are_charged(arena: Arena) -> None:
 def drop_and_repeat(arena: Arena) -> None:
     ctx = arena.start(STAFF)
     caps = Caps(max_usd=DROP_CAP)
-    dropped = ModelExchange(request_sent=True, complete=False)
+    dropped = ModelExchange(
+        request_sent=True, provider_error=False, complete=False, produced_output=False
+    )
     granted = 0
     for _ in range(40):
         outcome = _admit(arena, ctx, caps=caps)

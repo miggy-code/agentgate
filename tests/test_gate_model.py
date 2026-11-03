@@ -142,14 +142,66 @@ def test_a_provider_error_is_not_billed(world: World) -> None:
 @pytest.mark.parametrize(
     ("exchange", "charged"),
     [
-        (ModelExchange(request_sent=False), "0"),
-        (ModelExchange(request_sent=False, complete=False, cost_usd=Decimal("0.001")), "0"),
-        (ModelExchange(request_sent=True, provider_error=True), "0"),
-        (ModelExchange(request_sent=True, provider_error=True, produced_output=True), "0.019040"),
-        (ModelExchange(request_sent=True, cost_usd=Decimal("0.001")), "0.001"),
-        (ModelExchange(request_sent=True), "0.019040"),
-        (ModelExchange(request_sent=True, complete=False), "0.019040"),
-        (ModelExchange(request_sent=True, complete=False, cost_usd=Decimal("0.001")), "0.019040"),
+        (
+            ModelExchange(
+                request_sent=False, provider_error=False, complete=True, produced_output=False
+            ),
+            "0",
+        ),
+        (
+            ModelExchange(
+                request_sent=False,
+                provider_error=False,
+                complete=False,
+                produced_output=False,
+                cost_usd=Decimal("0.001"),
+            ),
+            "0",
+        ),
+        (
+            ModelExchange(
+                request_sent=True, provider_error=True, complete=True, produced_output=False
+            ),
+            "0",
+        ),
+        (
+            ModelExchange(
+                request_sent=True, provider_error=True, complete=True, produced_output=True
+            ),
+            "0.019040",
+        ),
+        (
+            ModelExchange(
+                request_sent=True,
+                provider_error=False,
+                complete=True,
+                produced_output=False,
+                cost_usd=Decimal("0.001"),
+            ),
+            "0.001",
+        ),
+        (
+            ModelExchange(
+                request_sent=True, provider_error=False, complete=True, produced_output=False
+            ),
+            "0.019040",
+        ),
+        (
+            ModelExchange(
+                request_sent=True, provider_error=False, complete=False, produced_output=False
+            ),
+            "0.019040",
+        ),
+        (
+            ModelExchange(
+                request_sent=True,
+                provider_error=False,
+                complete=False,
+                produced_output=False,
+                cost_usd=Decimal("0.001"),
+            ),
+            "0.019040",
+        ),
     ],
 )
 def test_finish_model_charges_by_what_happened_to_the_call(
@@ -166,11 +218,29 @@ def test_finish_model_charges_by_what_happened_to_the_call(
 def test_a_finished_call_cannot_be_finished_again(world: World) -> None:
     ctx = world.run(STAFF)
     reservation = reserved(admit(world, ctx))
-    world.gate.finish_model(ctx, reservation, ModelExchange(request_sent=True))
+    world.gate.finish_model(
+        ctx,
+        reservation,
+        ModelExchange(
+            request_sent=True, provider_error=False, complete=True, produced_output=False
+        ),
+    )
     with pytest.raises(SpendError):
-        world.gate.finish_model(ctx, reservation, ModelExchange(request_sent=False))
+        world.gate.finish_model(
+            ctx,
+            reservation,
+            ModelExchange(
+                request_sent=False, provider_error=False, complete=True, produced_output=False
+            ),
+        )
     with pytest.raises(ValueError):
-        world.gate.finish_model(world.run(STAFF), reservation, ModelExchange(request_sent=True))
+        world.gate.finish_model(
+            world.run(STAFF),
+            reservation,
+            ModelExchange(
+                request_sent=True, provider_error=False, complete=True, produced_output=False
+            ),
+        )
 
 
 def test_a_reservation_of_another_run_cannot_be_settled_or_released(world: World) -> None:
@@ -535,3 +605,48 @@ def test_the_gate_denies_a_request_with_no_limit_even_if_the_engine_allowed_it(
     ctx = world.run(STAFF)
     assert denied(admit(world, ctx, call=call(max_tokens=None))) == "model_max_tokens_required"
     assert spent(world, ctx) == 0
+
+
+@pytest.mark.parametrize(
+    "cost",
+    [Decimal("-1"), Decimal("-0.000001"), Decimal("NaN"), Decimal("Infinity"), 0.001, 1, "0.001"],
+)
+def test_a_cost_that_is_not_usable_is_charged_as_the_full_reservation(
+    world: World, cost: Any
+) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    exchange = ModelExchange(
+        request_sent=True, provider_error=False, complete=True, produced_output=True, cost_usd=cost
+    )
+    assert exchange.cost_usd is None
+    assert world.gate.finish_model(ctx, reservation, exchange) == Decimal("0.019040")
+    assert spent(world, ctx) == Decimal("0.019040")
+
+
+def test_a_zero_cost_is_a_usable_cost(world: World) -> None:
+    ctx = world.run(STAFF)
+    reservation = reserved(admit(world, ctx))
+    exchange = ModelExchange(
+        request_sent=True,
+        provider_error=False,
+        complete=True,
+        produced_output=True,
+        cost_usd=Decimal(0),
+    )
+    assert world.gate.finish_model(ctx, reservation, exchange) == 0
+
+
+def test_the_flags_of_an_exchange_are_required_and_must_be_booleans() -> None:
+    with pytest.raises(TypeError):
+        ModelExchange(request_sent=True)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        ModelExchange(provider_error=False, complete=True, produced_output=False)  # type: ignore[call-arg]
+    for bad in (1, 0, None, "yes"):
+        with pytest.raises(TypeError):
+            ModelExchange(
+                request_sent=bad,  # type: ignore[arg-type]
+                provider_error=False,
+                complete=True,
+                produced_output=False,
+            )

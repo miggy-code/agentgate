@@ -21,7 +21,7 @@ import agentgate.model.keys as keys_module
 import agentgate.model.tokens as tokens_module
 import agentgate.redteam.scenarios.model_boundary as scenarios_module
 from agentgate.gate import Gate
-from agentgate.model.admission import Caps
+from agentgate.model.admission import Caps, ModelExchange
 from agentgate.model.keys import KeyConfigError, ProviderKeys
 from agentgate.model.pricing import RateTable
 from agentgate.model.tokens import TokenStore
@@ -560,6 +560,12 @@ MUTATIONS = [
                 ),
             ),
         ),
+    ),
+    Mutation(
+        "an unusable cost is passed to the ledger",
+        ids(17),
+        replace=((ModelExchange, "__post_init__", lambda self: None),),
+        crashes=("SpendError",),
     ),
     Mutation(
         "a provider error that produced output is released",

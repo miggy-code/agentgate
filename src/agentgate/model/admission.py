@@ -272,19 +272,36 @@ def _integers(sources: list[dict[str, object]], names: tuple[str, ...]) -> list[
 
 @dataclass(frozen=True)
 class ModelExchange:
-    """How a model call ended, as the proxy saw it. It decides what the call is charged."""
+    """How a model call ended, as the proxy saw it. It decides what the call is charged.
+
+    The four flags have no defaults. A default would be a guess about a call the proxy did
+    not look at, and every guess here favours the client: a truncated stream read as complete
+    is charged at its price, and a 5xx that produced output read as empty is released.
+    """
 
     # Whether any bytes of the request reached the provider. False only for a call that was
     # refused or failed before it was sent (a rejection, a hook error, a connect error).
     request_sent: bool
     # The provider answered with a 4xx or 5xx.
-    provider_error: bool = False
+    provider_error: bool
     # Whether the reply was relayed and read in full.
-    complete: bool = True
+    complete: bool
     # Whether the provider reported any output tokens, or sent any of a stream.
-    produced_output: bool = False
-    # The priced cost of the reply, or None when it cannot be priced.
+    produced_output: bool
+    # The priced cost of the reply, or None when it cannot be priced. A value that is not a
+    # finite, non-negative Decimal (a float, NaN, infinity, a negative) is not a usable cost
+    # and is read as None, so the call is charged its full reservation. It is not an error:
+    # the call was already sent, and an exception here would leave the reservation open.
     cost_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("request_sent", "provider_error", "complete", "produced_output"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+        cost = self.cost_usd
+        usable = isinstance(cost, Decimal) and cost.is_finite() and cost >= 0
+        if cost is not None and not usable:
+            object.__setattr__(self, "cost_usd", None)
 
 
 @dataclass(frozen=True)

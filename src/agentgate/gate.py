@@ -649,8 +649,8 @@ class Gate:
 
         - the request never reached the provider: released;
         - the provider answered 4xx or 5xx and produced no output: released;
-        - otherwise: settled at the priced cost when the reply is complete and priced, else
-          at the full reservation.
+        - otherwise: settled at the priced cost when the reply is complete and the cost is a
+          usable one (see ModelExchange), else at the full reservation.
         """
         if reservation.run_id != ctx.run_id:
             raise ValueError("reservation belongs to another run")
