@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentgate"
+name = "panoptes-agentgate"
 version = "0.0.1"
 description = "Permissions, approval and audit layer between an AI agent and a company's tools and documents."
 readme = "README.md"

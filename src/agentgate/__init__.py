@@ -2,4 +2,4 @@
 
 from importlib.metadata import version
 
-__version__ = version("agentgate")
+__version__ = version("panoptes-agentgate")

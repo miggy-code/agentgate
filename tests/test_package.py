@@ -4,4 +4,4 @@ import agentgate
 
 
 def test_version_matches_installed_metadata() -> None:
-    assert agentgate.__version__ == version("agentgate")
+    assert agentgate.__version__ == version("panoptes-agentgate")

@@ -1,6 +1,10 @@
-# agentgate
+# Panoptes Agentgate
 
-agentgate is a permissions, approval and audit layer between an AI agent and a company's tools and documents. The model only proposes tool calls. For each one, agentgate decides what the run may read, write, spend and send, based on the customer the run belongs to and the person who asked. Anything no rule allows is denied, and every decision is written to a hash-chained audit log before anything runs.
+`panoptes-agentgate` is a permissions, approval and audit layer between an AI agent and a company's tools and documents. The import and CLI are both `agentgate`. The model only proposes tool calls. For each one, agentgate decides what the run may read, write, spend and send, based on the customer the run belongs to and the person who asked. Anything no rule allows is denied, and every decision is written to a hash-chained audit log before anything runs.
+
+```bash
+pip install panoptes-agentgate
+```
 
 - **Deny by default.** Per-customer YAML policies with roles, document labels, recipient lists and spend bands. Any matching deny wins.
 - **Permission-aware retrieval.** Search filters to the documents the run may read, then ranks only those, so forbidden documents never shift results.
