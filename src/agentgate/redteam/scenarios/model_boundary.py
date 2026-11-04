@@ -784,7 +784,9 @@ def key_never_shown(arena: Arena) -> None:
             arena.expect(
                 f"{name} is refused without the key",
                 message != "loaded" and secret not in message and not chained,
-                "shown or chained" if secret in message or chained else message[:30],
+                "shown or chained"
+                if secret in message or chained
+                else message.replace(str(path), "<keys-file>")[:30],
             )
         shown_key = FAKE_KEYS[ModelProvider.ANTHROPIC]
         try:
