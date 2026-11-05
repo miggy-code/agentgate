@@ -199,3 +199,98 @@ def test_spend_show_reports_a_runs_model_spend(tmp_path: Path) -> None:
     assert "not found" in _error(
         _cli(tmp_path, "spend", "show", "--as", "jr-owner-marisol", "--run", run)
     )
+
+
+def test_serve_writes_a_ready_file_with_the_caps_in_effect(tmp_path: Path) -> None:
+    """A models-only experiment from init-experiment, served with --ready-file: the file
+    appears complete and private once listening, states the tightened caps, and the proxy
+    admits the listed model. It is removed on stop."""
+    executable = shutil.which("agentgate", path=str(Path(sys.executable).parent))
+    assert executable is not None
+    lab = tmp_path / "lab"
+    init = runner.invoke(
+        app,
+        [
+            "init-experiment", str(lab), "--model", "openai_compatible:deepseek-flash",
+            "--max-usd", "0.50", "--max-calls", "40", "--day-usd", "5",
+        ],
+    )  # fmt: skip
+    assert init.exit_code == 0, init.output
+    rates, keys = _files(tmp_path)
+    token_file, ready_file = tmp_path / "token", tmp_path / "ready.json"
+    provider = Provider()
+    command = [
+        executable, "model-proxy", "serve", "--as", "lab-runner",
+        "--upstream", f"openai_compatible={provider.origin}",
+        "--rate-table", str(rates), "--keys-file", str(keys),
+        "--token-file", str(token_file), "--ready-file", str(ready_file),
+        "--max-usd", "0.25", "--max-calls", "100",
+        "--db", str(_db(tmp_path)), "--audit-db", str(_audit(tmp_path)),
+        "--policies", str(lab / "policies"), "--fixtures", str(lab / "fixtures"),
+    ]  # fmt: skip
+    log = tmp_path / "stderr.txt"
+    with log.open("w") as errlog:
+        server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errlog, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready_file.exists():
+            assert server.poll() is None, log.read_text()
+            assert time.monotonic() < deadline, log.read_text()
+            time.sleep(0.05)
+        assert stat.S_IMODE(os.stat(ready_file).st_mode) == 0o600
+        ready = json.loads(ready_file.read_text())
+        port = _wait_for_port(log, server)  # the stderr line is kept
+        run_line = next(line for line in log.read_text().splitlines() if "model proxy:" in line)
+        assert ready == {
+            "url": f"http://127.0.0.1:{port}",
+            "host": "127.0.0.1",
+            "port": port,
+            "pid": server.pid,
+            "run_id": ready["run_id"],
+            "user": "lab-runner",
+            "customer": "lab",
+            # --max-usd tightens the policy's 0.50; --max-calls cannot raise its 40.
+            "max_usd": "0.25",
+            "max_calls": 40,
+            "per_customer_day_usd": "5",
+            "token_file": str(token_file),
+        }
+        assert f"run {ready['run_id']} for lab-runner" in run_line
+        token = token_file.read_text().strip()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(BODY),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        assert response.status == 200, response.read()
+        response.read()
+        conn.close()
+    finally:
+        server.send_signal(signal.SIGTERM)
+        server.wait(timeout=30)
+        provider.close()
+    assert server.returncode == 0, log.read_text()
+    assert not ready_file.exists() and not token_file.exists()
+    assert not list(tmp_path.glob(".ready.json.*"))
+
+
+def test_serve_refuses_an_existing_ready_file_before_starting(tmp_path: Path) -> None:
+    rates, keys = _files(tmp_path)
+    ready_file = tmp_path / "ready.json"
+    ready_file.write_text("stale")
+    result = runner.invoke(
+        app,
+        [
+            "model-proxy", "serve", "--as", STAFF,
+            "--upstream", "openai_compatible=http://127.0.0.1:9",
+            "--rate-table", str(rates), "--keys-file", str(keys),
+            "--token-file", str(tmp_path / "token"), "--ready-file", str(ready_file),
+            *_paths(tmp_path),
+        ],
+    )  # fmt: skip
+    assert result.exit_code == 1 and "already exists" in result.stderr
+    assert ready_file.read_text() == "stale" and not (tmp_path / "token").exists()
+    assert not _db(tmp_path).exists()

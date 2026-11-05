@@ -186,9 +186,12 @@ class Policy(_Model):
     labels: tuple[Label, ...] = Field(min_length=1)
     default: Literal["deny"]
     spend: SpendLimits
-    approvals: ApprovalSettings
+    # Required once any rule can allow a tool call: an allowed call can still escalate to
+    # approval (risk, customer-facing, recipient clearance), which needs approvers and a TTL.
+    approvals: ApprovalSettings | None = None
     lists: dict[ListName, frozenset[ListEntry]] = {}
-    rules: tuple[Rule, ...] = Field(min_length=1)
+    # No rules means every tool call is denied (default: deny), as for a models-only policy.
+    rules: tuple[Rule, ...] = ()
     # Absent means every model request is denied.
     models: ModelPolicy | None = None
 
@@ -201,6 +204,10 @@ class Policy(_Model):
 
     @model_validator(mode="after")
     def _references_resolve(self) -> "Policy":
+        if not self.rules and self.models is None:
+            raise ValueError("policy allows nothing: add rules or a models section")
+        if self.approvals is None and any(rule.effect is not Effect.DENY for rule in self.rules):
+            raise ValueError("approvals: required when a rule allows or requires approval")
         seen: set[str] = set()
         for rule in self.rules:
             if rule.id in seen:
@@ -215,6 +222,16 @@ class Policy(_Model):
             if listed is not None and listed not in self.lists:
                 raise ValueError(f"rule {rule.id!r}: unknown list {listed!r}")
         return self
+
+    def approval_settings(self) -> ApprovalSettings:
+        """The approvals block, for a call that reached an approval path.
+
+        Validation guarantees one whenever a rule can allow a call, so None here means a
+        policy built around validation; refusing is the fail-closed answer.
+        """
+        if self.approvals is None:
+            raise PolicyError(f"customer {self.customer!r}: policy has no approvals block")
+        return self.approvals
 
     def label_rank(self, label: str) -> int | None:
         """Position of label in the sensitivity order, or None if the policy does not know it."""
@@ -270,12 +287,15 @@ def _message(msg: str) -> str:
 
 
 def load_bundle(directory: Path) -> PolicyBundle:
-    """Load and cross-check policy.yaml and tools.yaml from one customer directory."""
+    """Load and cross-check policy.yaml and tools.yaml from one customer directory.
+
+    tools.yaml may be left out when the policy has no rules (a models-only policy): with no
+    tools registered, every tool call is denied.
+    """
     policy_path = directory / "policy.yaml"
     tools_path = directory / "tools.yaml"
-    for path in (policy_path, tools_path):
-        if not path.is_file():
-            raise PolicyError(f"{path}: missing {path.name}")
+    if not policy_path.is_file():
+        raise PolicyError(f"{policy_path}: missing {policy_path.name}")
 
     policy = _validate(
         Policy, parse_yaml(policy_path.read_text(), policy_path, PolicyError), policy_path
@@ -286,6 +306,10 @@ def load_bundle(directory: Path) -> PolicyBundle:
             f" {directory.name!r}"
         )
 
+    if not tools_path.is_file():
+        if policy.rules:
+            raise PolicyError(f"{tools_path}: missing {tools_path.name} (the policy has rules)")
+        return PolicyBundle(policy=policy, tools={})
     raw_tools = parse_yaml(tools_path.read_text(), tools_path, PolicyError)
     if not isinstance(raw_tools, list) or not raw_tools:
         raise PolicyError(f"{tools_path}: expected a non-empty list of tools")

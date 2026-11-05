@@ -491,7 +491,7 @@ class Gate:
                     risk_score=risk,
                     rule_ids=verdict.rule_ids,
                     policy_version=verdict.policy_version,
-                    ttl=timedelta(minutes=run.policy.approvals.ttl_minutes),
+                    ttl=timedelta(minutes=run.policy.approval_settings().ttl_minutes),
                     record=record_request,
                 )
             except BaseException:
@@ -1108,6 +1108,11 @@ class Gate:
                 # The queue would look it up in SQLite, which cannot bind it.
                 raise ApprovalError(ApprovalErrorReason.NOT_FOUND, "approval not found")
             settings = engine.bundle.policy.approvals
+            if settings is None:
+                # A models-only policy names no approvers.
+                raise ApprovalError(
+                    ApprovalErrorReason.APPROVER_NOT_ALLOWED, "approver's policy has no approvals"
+                )
             # The decision commits only if its event is recorded; a sink error propagates
             # and leaves the approval as it was.
             decide = self._approvals.approve if approve else self._approvals.reject
@@ -1370,7 +1375,7 @@ class Gate:
             return GateReason.ESCALATED_CUSTOMER_FACING
         if self._uncleared_recipient(run, prepared.facts.recipients):
             return GateReason.ESCALATED_RECIPIENT_CLEARANCE
-        if self._risk(run, prepared) >= run.policy.approvals.risk_threshold:
+        if self._risk(run, prepared) >= run.policy.approval_settings().risk_threshold:
             return GateReason.ESCALATED_RISK
         return None
 
