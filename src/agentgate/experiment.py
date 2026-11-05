@@ -8,6 +8,7 @@ Every file is validated with the loaders' own models before anything is written.
 
 import contextlib
 import os
+import stat
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -133,30 +134,44 @@ def write_experiment(
     existing = [str(path) for path in files if path.exists() or path.is_symlink()]
     if existing:
         raise ExperimentError(f"already exists: {', '.join(existing)}")
-    created: list[Path] = []
+    created: list[tuple[Path, tuple[int, int]]] = []
     try:
         for path, data in files.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            _create(path, yaml.safe_dump(data, sort_keys=False))
-            created.append(path)
+            created.append((path, _create(path, yaml.safe_dump(data, sort_keys=False))))
     except FileExistsError as exc:
         # Something appeared after the check above: undo only what this call created,
-        # never touch the newcomer.
-        for path in created:
-            with contextlib.suppress(OSError):
-                path.unlink()
+        # never touch the newcomer, nor a file that replaced one of ours meanwhile.
+        for path, identity in created:
+            unlink_if_same(path, identity)
         raise ExperimentError(f"already exists: {exc.filename}") from None
     return ExperimentFiles(fixtures=fixtures, policies=policies, customer=customer, user=user)
 
 
-def _create(path: Path, text: str) -> None:
-    """Create path exclusively and never through a symlink.
+def _create(path: Path, text: str) -> tuple[int, int]:
+    """Create path exclusively and never through a symlink; return its (device, inode).
 
     No existing file is ever truncated or redirected."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
+        info = os.fstat(handle.fileno())
+    return info.st_dev, info.st_ino
+
+
+def unlink_if_same(path: Path, identity: tuple[int, int]) -> bool:
+    """Remove path only if it is still the file identified by (device, inode).
+
+    A file that replaced it, or a symlink, is left alone. POSIX has no unlink-by-identity,
+    so a replacement in the instant between the check and the unlink is still possible;
+    this narrows that window to a few microseconds instead of the whole run."""
+    with contextlib.suppress(OSError):
+        info = os.lstat(path)
+        if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == identity:
+            path.unlink()
+            return True
+    return False
 
 
 def _check(model: type[BaseModel], data: object) -> None:

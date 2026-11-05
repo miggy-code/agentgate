@@ -56,6 +56,7 @@ from agentgate.experiment import (
     DEFAULT_USER,
     ExperimentError,
     ExperimentModel,
+    unlink_if_same,
     write_experiment,
 )
 from agentgate.fixtures import FixtureError
@@ -1528,6 +1529,7 @@ def model_proxy_serve(
         except (OSError, RateTableError) as exc:
             _fail(f"cannot start: {exc}")
         run_id = proxy.run.run_id
+        ready_identity: tuple[int, int] | None = None
         try:
             # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
             # Installed before the ready file exists, so a SIGTERM sent the moment a harness
@@ -1544,18 +1546,20 @@ def model_proxy_serve(
             if ready_file is not None:
                 try:
                     info = _ready_info(proxy, as_user, host, bound, token_file)
-                    _write_ready_file(ready_file, info)
+                    ready_identity = _write_ready_file(ready_file, info)
                 except OSError as exc:
                     _fail(f"cannot write {ready_file}: {exc.strerror}")
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
         finally:
+            # A second SIGTERM must not interrupt the cleanup the first one started.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
             try:
                 proxy.stop()
             finally:
-                if ready_file is not None:
-                    _remove_own_ready_file(ready_file, run_id)
+                if ready_file is not None and ready_identity is not None:
+                    _remove_own_ready_file(ready_file, run_id, ready_identity)
 
 
 def _ready_info(
@@ -1583,22 +1587,26 @@ def _plain_decimal(value: Decimal) -> str:
     return "0" if value.is_zero() else format(value.normalize(), "f")
 
 
-def _remove_own_ready_file(path: Path, run_id: str) -> None:
-    """Remove path only if it is this process's ready file for this run.
+def _remove_own_ready_file(path: Path, run_id: str, identity: tuple[int, int]) -> None:
+    """Remove path only if it is still the file this process wrote for this run.
 
-    Never another process's replacement. A ready file can still outlive the process (SIGKILL,
-    a crash): consumers must treat it as a hint and check that pid is alive and url answers
-    before relying on it."""
+    The file must be the same inode that was published and still name this pid and run, so
+    another process's replacement is left alone (see `unlink_if_same` for the remaining
+    microsecond window). A ready file can still outlive the process (SIGKILL, a crash):
+    consumers must treat it as a hint and check that pid is alive and url answers before
+    relying on it."""
     with contextlib.suppress(OSError, ValueError):
         if path.is_symlink():
             return
         info = json.loads(path.read_text(encoding="utf-8"))
         if info.get("pid") == os.getpid() and info.get("run_id") == run_id:
-            path.unlink()
+            unlink_if_same(path, identity)
 
 
-def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> None:
-    """Publish info at path atomically: a reader that sees the file sees all of it.
+def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> tuple[int, int]:
+    """Publish info at path atomically and return the published file's (device, inode).
+
+    A reader that sees the file sees all of it.
 
     The JSON goes to a private temporary file beside path, which is then hard-linked into
     place. A link never replaces an existing file, so path is still created exclusively.
@@ -1606,7 +1614,9 @@ def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     write_private_file(temporary, json.dumps(info, indent=2) + "\n")
     try:
+        published = os.lstat(temporary)
         os.link(temporary, path)
+        return published.st_dev, published.st_ino
     finally:
         with contextlib.suppress(OSError):
             temporary.unlink()
@@ -1643,8 +1653,11 @@ def init_experiment(
         bool,
         typer.Option(
             "--allow-server-features",
-            help="Let requests carry provider-side features (prompt-cache writes, "
-            "non-function tool types). Off by default; some agent CLIs need it.",
+            help="Let requests carry provider-side features: prompt-cache writes, "
+            "provider-run tools and provider-side state (background runs, stored "
+            "conversations). Work the provider does on its side can cost more than the "
+            "reservation computed from the request text (see docs/limits.md). Off by "
+            "default; some agent CLIs need it.",
         ),
     ] = False,
 ) -> None:

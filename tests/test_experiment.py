@@ -220,11 +220,11 @@ def test_init_experiment_never_follows_a_symlink_or_truncates_a_late_arrival(
     late = tmp_path / "policies" / "lab" / "policy.yaml"
     real_create = experiment._create
 
-    def create(path: Path, text: str) -> None:
+    def create(path: Path, text: str) -> tuple[int, int]:
         if path == late:  # simulate a racing process planting a symlink between check and create
             path.parent.mkdir(parents=True, exist_ok=True)
             path.symlink_to(victim)
-        real_create(path, text)
+        return real_create(path, text)
 
     monkeypatch.setattr(experiment, "_create", create)
     result = _init(tmp_path)
@@ -232,6 +232,33 @@ def test_init_experiment_never_follows_a_symlink_or_truncates_a_late_arrival(
     assert victim.read_text() == "keep me" and late.is_symlink()
     assert not (tmp_path / "fixtures" / "lab" / "customer.yaml").exists()
     assert not (tmp_path / "fixtures" / "lab" / "users.yaml").exists()
+
+
+def test_init_experiment_rollback_spares_a_file_that_replaced_one_of_ours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier file is replaced by another process, then a later file appears: the
+    rollback removes only files that are still the ones this call created."""
+    from agentgate import experiment
+
+    customer = tmp_path / "fixtures" / "lab" / "customer.yaml"
+    users = tmp_path / "fixtures" / "lab" / "users.yaml"
+    late = tmp_path / "policies" / "lab" / "policy.yaml"
+    real_create = experiment._create
+
+    def create(path: Path, text: str) -> tuple[int, int]:
+        if path == late:
+            customer.unlink()
+            customer.write_text("someone else's")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("late arrival")
+        return real_create(path, text)
+
+    monkeypatch.setattr(experiment, "_create", create)
+    result = _init(tmp_path)
+    assert result.exit_code == 1 and "already exists" in result.stderr
+    assert customer.read_text() == "someone else's" and late.read_text() == "late arrival"
+    assert not users.exists()
 
 
 def test_init_experiment_server_features_are_opt_in(tmp_path: Path) -> None:
