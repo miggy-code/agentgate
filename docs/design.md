@@ -138,7 +138,7 @@ The process starts the run and issues its one token at startup (printed once, or
 }
 ```
 
-`max_usd` and `max_calls` are the caps the proxy enforces: the policy's `per_run_usd` and `max_calls_per_run`, lowered by `--max-usd` and `--max-calls` and never raised, computed the way each admission computes them. Amounts are decimal strings, as in the policy. The file is removed on shutdown, with the token file.
+`max_usd` and `max_calls` are the caps the proxy enforces: the policy's `per_run_usd` and `max_calls_per_run`, lowered by `--max-usd` and `--max-calls` and never raised, computed the way each admission computes them. Amounts are decimal strings, as in the policy. The file is removed on shutdown, with the token file. The SIGTERM handler is installed before the file is published, and removal runs even if shutdown itself fails. Only a file that still names this process's `pid` and `run_id` is removed, so a replacement written by another process is left alone. A process that is SIGKILLed or whose machine crashes cannot remove its file, so treat it as a hint: check that `pid` is alive and `url` answers before relying on it.
 
 `agentgate gateway serve --model-proxy --upstream ... --rate-table ... --token-file ...` starts the same proxy inside the MCP gateway's run: one run id, so a model call and a tool call reserve against the same per-run USD cap, per-day cap and call count. The token goes to `--token-file` only, since stdout is the MCP stream. `--max-usd` and `--max-calls` tighten the run's caps for model calls and can never raise the policy's.
 
@@ -287,7 +287,7 @@ models:
 
 The tool gate still denies by default: with no `tools.yaml` every tool call is `unknown_tool`, and with one but no rules every call is `default_deny`. A customer without `approvals` has no approvers, so `approvals approve` and `reject` refuse its users (`approver_not_allowed`).
 
-`agentgate init-experiment DIR --model PROVIDER:NAME [--model ...] --max-usd USD --max-calls N` writes exactly this: `DIR/fixtures/lab/` with one active owner, `lab-runner`, and `DIR/policies/lab/policy.yaml`. `--day-usd` sets the day cap (default: `--max-usd`), `--max-output-tokens` and `--max-request-bytes` the envelope of every entry (default 8000 and 4000000), `--customer` and `--user` the ids. Everything is validated before anything is written, and an existing file is never overwritten. Serve it with `model-proxy serve --as lab-runner --policies DIR/policies --fixtures DIR/fixtures ...`.
+`agentgate init-experiment DIR --model PROVIDER:NAME [--model ...] --max-usd USD --max-calls N` writes exactly this: `DIR/fixtures/lab/` with one active owner, `lab-runner`, and `DIR/policies/lab/policy.yaml`. `--day-usd` sets the day cap (default: `--max-usd`), `--max-output-tokens` and `--max-request-bytes` the envelope of every entry (default 8000 and 4000000), `--customer` and `--user` the ids. `--allow-server-features` sets `allow_server_features: true` on every entry, for agents whose requests carry provider-side features such as prompt-cache writes or non-function tool types; it is off by default. Everything is validated before anything is written. Each file is created exclusively and never through a symlink, so an existing file is never overwritten, even one that appears while the command runs; if one does, the files already written by this call are removed again. Serve it with `model-proxy serve --as lab-runner --policies DIR/policies --fixtures DIR/fixtures ...`.
 
 ### tools.yaml
 

@@ -1519,7 +1519,6 @@ def model_proxy_serve(
         ttl_minutes=ttl_minutes,
         token_file=token_file,
     )
-    ready_written = False
     with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
         proxy = ModelProxy(world, as_user, config)
         try:
@@ -1528,7 +1527,12 @@ def model_proxy_serve(
             _fail(str(exc))
         except (OSError, RateTableError) as exc:
             _fail(f"cannot start: {exc}")
+        run_id = proxy.run.run_id
         try:
+            # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
+            # Installed before the ready file exists, so a SIGTERM sent the moment a harness
+            # sees it still cleans it up.
+            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
             typer.echo(
                 f"model proxy: run {proxy.run.run_id} for {as_user}, http://{host}:{bound}",
                 err=True,
@@ -1543,17 +1547,15 @@ def model_proxy_serve(
                     _write_ready_file(ready_file, info)
                 except OSError as exc:
                     _fail(f"cannot write {ready_file}: {exc.strerror}")
-                ready_written = True
-            # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
-            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
         finally:
-            proxy.stop()
-            if ready_written and ready_file is not None:
-                with contextlib.suppress(OSError):
-                    ready_file.unlink()
+            try:
+                proxy.stop()
+            finally:
+                if ready_file is not None:
+                    _remove_own_ready_file(ready_file, run_id)
 
 
 def _ready_info(
@@ -1579,6 +1581,20 @@ def _ready_info(
 
 def _plain_decimal(value: Decimal) -> str:
     return "0" if value.is_zero() else format(value.normalize(), "f")
+
+
+def _remove_own_ready_file(path: Path, run_id: str) -> None:
+    """Remove path only if it is this process's ready file for this run.
+
+    Never another process's replacement. A ready file can still outlive the process (SIGKILL,
+    a crash): consumers must treat it as a hint and check that pid is alive and url answers
+    before relying on it."""
+    with contextlib.suppress(OSError, ValueError):
+        if path.is_symlink():
+            return
+        info = json.loads(path.read_text(encoding="utf-8"))
+        if info.get("pid") == os.getpid() and info.get("run_id") == run_id:
+            path.unlink()
 
 
 def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> None:
@@ -1623,6 +1639,14 @@ def init_experiment(
     ] = DEFAULT_MAX_REQUEST_BYTES,
     customer: Annotated[str, typer.Option("--customer", help="Customer id.")] = DEFAULT_CUSTOMER,
     user: Annotated[str, typer.Option("--user", help="The one user's id.")] = DEFAULT_USER,
+    allow_server_features: Annotated[
+        bool,
+        typer.Option(
+            "--allow-server-features",
+            help="Let requests carry provider-side features (prompt-cache writes, "
+            "non-function tool types). Off by default; some agent CLIs need it.",
+        ),
+    ] = False,
 ) -> None:
     """Write a one-user customer and a models-only policy for an experiment.
 
@@ -1646,6 +1670,7 @@ def init_experiment(
             max_request_bytes=max_request_bytes,
             customer=customer,
             user=user,
+            allow_server_features=allow_server_features,
         )
     except ExperimentError as exc:
         _fail(str(exc))

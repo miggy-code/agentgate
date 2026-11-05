@@ -294,3 +294,84 @@ def test_serve_refuses_an_existing_ready_file_before_starting(tmp_path: Path) ->
     assert result.exit_code == 1 and "already exists" in result.stderr
     assert ready_file.read_text() == "stale" and not (tmp_path / "token").exists()
     assert not _db(tmp_path).exists()
+
+
+def test_ready_file_cleanup_removes_only_this_process_file(tmp_path: Path) -> None:
+    from agentgate.cli import _remove_own_ready_file
+
+    mine, theirs, link = tmp_path / "mine.json", tmp_path / "theirs.json", tmp_path / "link.json"
+    mine.write_text(json.dumps({"pid": os.getpid(), "run_id": "r1"}))
+    theirs.write_text(json.dumps({"pid": os.getpid() + 1, "run_id": "r1"}))
+    link.symlink_to(mine)
+    _remove_own_ready_file(link, "r1")
+    _remove_own_ready_file(theirs, "r1")
+    _remove_own_ready_file(mine, "other-run")
+    assert link.is_symlink() and theirs.exists() and mine.exists()
+    _remove_own_ready_file(mine, "r1")
+    assert not mine.exists()
+
+
+def test_ready_file_caps_are_the_caps_admission_enforces(tmp_path: Path) -> None:
+    """The ready file reports max_calls 1 (tightened from the policy's 40).
+
+    The second call is refused."""
+    executable = shutil.which("agentgate", path=str(Path(sys.executable).parent))
+    assert executable is not None
+    lab = tmp_path / "lab"
+    init = runner.invoke(
+        app,
+        [
+            "init-experiment",
+            str(lab),
+            "--model",
+            "openai_compatible:deepseek-flash",
+            "--max-usd",
+            "0.50",
+            "--max-calls",
+            "40",
+        ],
+    )
+    assert init.exit_code == 0, init.output
+    rates, keys = _files(tmp_path)
+    token_file, ready_file = tmp_path / "token", tmp_path / "ready.json"
+    provider = Provider()
+    command = [
+        executable, "model-proxy", "serve", "--as", "lab-runner",
+        "--upstream", f"openai_compatible={provider.origin}",
+        "--rate-table", str(rates), "--keys-file", str(keys),
+        "--token-file", str(token_file), "--ready-file", str(ready_file), "--max-calls", "1",
+        "--db", str(_db(tmp_path)), "--audit-db", str(_audit(tmp_path)),
+        "--policies", str(lab / "policies"), "--fixtures", str(lab / "fixtures"),
+    ]  # fmt: skip
+    log = tmp_path / "stderr.txt"
+    with log.open("w") as errlog:
+        server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errlog, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready_file.exists():
+            assert server.poll() is None, log.read_text()
+            assert time.monotonic() < deadline, log.read_text()
+            time.sleep(0.05)
+        ready = json.loads(ready_file.read_text())
+        assert ready["max_calls"] == 1
+        token = token_file.read_text().strip()
+        statuses = []
+        for _ in range(2):
+            conn = http.client.HTTPConnection("127.0.0.1", ready["port"], timeout=30)
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(BODY),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            statuses.append(response.status)
+            response.read()
+            conn.close()
+        assert statuses[0] == 200 and statuses[1] in (402, 403, 429), statuses
+    finally:
+        server.send_signal(signal.SIGTERM)
+        server.wait(timeout=30)
+        provider.close()
+    assert server.returncode == 0, log.read_text()
+    assert not ready_file.exists()

@@ -206,3 +206,40 @@ def test_init_experiment_rejects_bad_input_and_writes_nothing(
     result = _init(tmp_path, *extra)
     assert result.exit_code == 1 and message in result.stderr, result.output
     assert not (tmp_path / "policies").exists() and not (tmp_path / "fixtures").exists()
+
+
+def test_init_experiment_never_follows_a_symlink_or_truncates_a_late_arrival(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file or symlink that appears after the existence check is neither truncated nor followed,
+    and the files this call already created are removed again."""
+    from agentgate import experiment
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    late = tmp_path / "policies" / "lab" / "policy.yaml"
+    real_create = experiment._create
+
+    def create(path: Path, text: str) -> None:
+        if path == late:  # simulate a racing process planting a symlink between check and create
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(victim)
+        real_create(path, text)
+
+    monkeypatch.setattr(experiment, "_create", create)
+    result = _init(tmp_path)
+    assert result.exit_code == 1 and "already exists" in result.stderr
+    assert victim.read_text() == "keep me" and late.is_symlink()
+    assert not (tmp_path / "fixtures" / "lab" / "customer.yaml").exists()
+    assert not (tmp_path / "fixtures" / "lab" / "users.yaml").exists()
+
+
+def test_init_experiment_server_features_are_opt_in(tmp_path: Path) -> None:
+    assert _init(tmp_path / "off").exit_code == 0
+    assert _init(tmp_path / "on", "--allow-server-features").exit_code == 0
+    off = yaml.safe_load((tmp_path / "off" / "policies" / "lab" / "policy.yaml").read_text())
+    on = yaml.safe_load((tmp_path / "on" / "policies" / "lab" / "policy.yaml").read_text())
+    assert "allow_server_features" not in off["models"]["allow"][0]
+    assert on["models"]["allow"][0]["allow_server_features"] is True
+    bundle = load_bundle(tmp_path / "on" / "policies" / "lab")
+    assert bundle.policy.models is not None and bundle.policy.models.allow[0].allow_server_features
