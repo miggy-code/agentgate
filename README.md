@@ -171,6 +171,19 @@ uv run agentgate model-proxy serve --as kc-staff-nadine \
 
 The proxy is [Panoptes](https://github.com/miggy-code/Panoptes)' reverse proxy with agentgate deciding in its hooks. The agent points its SDK at the proxy and sends the run's token where it would send a provider key. Each request must be a POST to a generation endpoint, carry a live token and fit the policy's `models:` entry; its worst case is reserved against the run's caps, the provider's key replaces whatever credential the client sent, and the reservation is settled from what the provider reports. `gateway serve --model-proxy` does this inside the MCP gateway's run, so tool and model calls share one set of caps. `agentgate doctor model-proxy` checks the setup without serving. See [docs/design.md](docs/design.md#the-model-proxy).
 
+### As the spend gate for an experiment
+
+```bash
+uv run agentgate init-experiment trial --model openai_compatible:deepseek-chat \
+  --max-usd 0.50 --max-calls 40
+uv run agentgate model-proxy serve --as lab-runner \
+  --policies trial/policies --fixtures trial/fixtures \
+  --upstream openai_compatible=https://api.deepseek.com --rate-table rates.json \
+  --token-file trial/run.token --ready-file trial/ready.json --port 0
+```
+
+`init-experiment` writes a one-user customer and a models-only policy: no `tools.yaml`, rules or approvals, so every tool call is denied and only the listed models are allowed, under the caps. `--ready-file` appears once the proxy is listening, as a 0600 JSON file with its `url`, `port`, `run_id`, `user` and the caps it enforces (`max_usd`, `max_calls`), so a harness can read the effective caps back instead of parsing stderr. See [docs/design.md](docs/design.md#models-only-policies).
+
 ## Limits
 
 The main ones (the full list is in [docs/limits.md](docs/limits.md)):

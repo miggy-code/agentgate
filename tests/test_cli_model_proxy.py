@@ -199,3 +199,208 @@ def test_spend_show_reports_a_runs_model_spend(tmp_path: Path) -> None:
     assert "not found" in _error(
         _cli(tmp_path, "spend", "show", "--as", "jr-owner-marisol", "--run", run)
     )
+
+
+def test_serve_writes_a_ready_file_with_the_caps_in_effect(tmp_path: Path) -> None:
+    """A models-only experiment from init-experiment, served with --ready-file: the file
+    appears complete and private once listening, states the tightened caps, and the proxy
+    admits the listed model. It is removed on stop."""
+    executable = shutil.which("agentgate", path=str(Path(sys.executable).parent))
+    assert executable is not None
+    lab = tmp_path / "lab"
+    init = runner.invoke(
+        app,
+        [
+            "init-experiment", str(lab), "--model", "openai_compatible:deepseek-flash",
+            "--max-usd", "0.50", "--max-calls", "40", "--day-usd", "5",
+        ],
+    )  # fmt: skip
+    assert init.exit_code == 0, init.output
+    rates, keys = _files(tmp_path)
+    token_file, ready_file = tmp_path / "token", tmp_path / "ready.json"
+    provider = Provider()
+    command = [
+        executable, "model-proxy", "serve", "--as", "lab-runner",
+        "--upstream", f"openai_compatible={provider.origin}",
+        "--rate-table", str(rates), "--keys-file", str(keys),
+        "--token-file", str(token_file), "--ready-file", str(ready_file),
+        "--max-usd", "0.25", "--max-calls", "100",
+        "--db", str(_db(tmp_path)), "--audit-db", str(_audit(tmp_path)),
+        "--policies", str(lab / "policies"), "--fixtures", str(lab / "fixtures"),
+    ]  # fmt: skip
+    log = tmp_path / "stderr.txt"
+    with log.open("w") as errlog:
+        server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errlog, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready_file.exists():
+            assert server.poll() is None, log.read_text()
+            assert time.monotonic() < deadline, log.read_text()
+            time.sleep(0.05)
+        assert stat.S_IMODE(os.stat(ready_file).st_mode) == 0o600
+        ready = json.loads(ready_file.read_text())
+        port = _wait_for_port(log, server)  # the stderr line is kept
+        run_line = next(line for line in log.read_text().splitlines() if "model proxy:" in line)
+        assert ready == {
+            "url": f"http://127.0.0.1:{port}",
+            "host": "127.0.0.1",
+            "port": port,
+            "pid": server.pid,
+            "run_id": ready["run_id"],
+            "user": "lab-runner",
+            "customer": "lab",
+            # --max-usd tightens the policy's 0.50; --max-calls cannot raise its 40.
+            "max_usd": "0.25",
+            "max_calls": 40,
+            "per_customer_day_usd": "5",
+            "token_file": str(token_file),
+        }
+        assert f"run {ready['run_id']} for lab-runner" in run_line
+        token = token_file.read_text().strip()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(BODY),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        assert response.status == 200, response.read()
+        response.read()
+        conn.close()
+    finally:
+        server.send_signal(signal.SIGTERM)
+        server.wait(timeout=30)
+        provider.close()
+    assert server.returncode == 0, log.read_text()
+    assert not ready_file.exists() and not token_file.exists()
+    assert not list(tmp_path.glob(".ready.json.*"))
+
+
+def test_serve_refuses_an_existing_ready_file_before_starting(tmp_path: Path) -> None:
+    rates, keys = _files(tmp_path)
+    ready_file = tmp_path / "ready.json"
+    ready_file.write_text("stale")
+    result = runner.invoke(
+        app,
+        [
+            "model-proxy", "serve", "--as", STAFF,
+            "--upstream", "openai_compatible=http://127.0.0.1:9",
+            "--rate-table", str(rates), "--keys-file", str(keys),
+            "--token-file", str(tmp_path / "token"), "--ready-file", str(ready_file),
+            *_paths(tmp_path),
+        ],
+    )  # fmt: skip
+    assert result.exit_code == 1 and "already exists" in result.stderr
+    assert ready_file.read_text() == "stale" and not (tmp_path / "token").exists()
+    assert not _db(tmp_path).exists()
+
+
+def test_ready_file_cleanup_removes_only_this_process_file(tmp_path: Path) -> None:
+    from agentgate.cli import _remove_own_ready_file
+
+    def identity(path: Path) -> int:
+        fd = os.open(path, os.O_RDONLY)
+        opened.append(fd)
+        return fd
+
+    opened: list[int] = []
+
+    mine, theirs, link = tmp_path / "mine.json", tmp_path / "theirs.json", tmp_path / "link.json"
+    mine.write_text(json.dumps({"pid": os.getpid(), "run_id": "r1"}))
+    theirs.write_text(json.dumps({"pid": os.getpid() + 1, "run_id": "r1"}))
+    link.symlink_to(mine)
+    _remove_own_ready_file(link, "r1", identity(mine))
+    _remove_own_ready_file(theirs, "r1", identity(theirs))
+    _remove_own_ready_file(mine, "other-run", identity(mine))
+    assert link.is_symlink() and theirs.exists() and mine.exists()
+    _remove_own_ready_file(mine, "r1", identity(mine))
+    assert not mine.exists()
+    for fd in opened:
+        os.close(fd)
+
+
+def test_ready_file_cleanup_spares_a_replacement_with_the_same_contents(tmp_path: Path) -> None:
+    """Another process replaced the ready file with one that even names this pid and run:
+    a different inode, so it is left alone."""
+    from agentgate.cli import _remove_own_ready_file, _write_ready_file
+
+    ready = tmp_path / "ready.json"
+    info = {"pid": os.getpid(), "run_id": "r1"}
+    published = _write_ready_file(ready, info)
+    ready.unlink()
+    ready.write_text(json.dumps(info))  # on Linux this can reuse a freed inode number
+    _remove_own_ready_file(ready, "r1", published)
+    os.close(published)
+    assert ready.exists()
+    ready.unlink()
+    second = _write_ready_file(ready, info)
+    _remove_own_ready_file(ready, "r1", second)
+    os.close(second)
+    assert not ready.exists()
+
+
+def test_ready_file_caps_are_the_caps_admission_enforces(tmp_path: Path) -> None:
+    """The ready file reports max_calls 1 (tightened from the policy's 40).
+
+    The second call is refused."""
+    executable = shutil.which("agentgate", path=str(Path(sys.executable).parent))
+    assert executable is not None
+    lab = tmp_path / "lab"
+    init = runner.invoke(
+        app,
+        [
+            "init-experiment",
+            str(lab),
+            "--model",
+            "openai_compatible:deepseek-flash",
+            "--max-usd",
+            "0.50",
+            "--max-calls",
+            "40",
+        ],
+    )
+    assert init.exit_code == 0, init.output
+    rates, keys = _files(tmp_path)
+    token_file, ready_file = tmp_path / "token", tmp_path / "ready.json"
+    provider = Provider()
+    command = [
+        executable, "model-proxy", "serve", "--as", "lab-runner",
+        "--upstream", f"openai_compatible={provider.origin}",
+        "--rate-table", str(rates), "--keys-file", str(keys),
+        "--token-file", str(token_file), "--ready-file", str(ready_file), "--max-calls", "1",
+        "--db", str(_db(tmp_path)), "--audit-db", str(_audit(tmp_path)),
+        "--policies", str(lab / "policies"), "--fixtures", str(lab / "fixtures"),
+    ]  # fmt: skip
+    log = tmp_path / "stderr.txt"
+    with log.open("w") as errlog:
+        server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errlog, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready_file.exists():
+            assert server.poll() is None, log.read_text()
+            assert time.monotonic() < deadline, log.read_text()
+            time.sleep(0.05)
+        ready = json.loads(ready_file.read_text())
+        assert ready["max_calls"] == 1
+        token = token_file.read_text().strip()
+        statuses = []
+        for _ in range(2):
+            conn = http.client.HTTPConnection("127.0.0.1", ready["port"], timeout=30)
+            conn.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(BODY),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            statuses.append(response.status)
+            response.read()
+            conn.close()
+        assert statuses[0] == 200 and statuses[1] in (402, 403, 429), statuses
+    finally:
+        server.send_signal(signal.SIGTERM)
+        server.wait(timeout=30)
+        provider.close()
+    assert server.returncode == 0, log.read_text()
+    assert not ready_file.exists()

@@ -120,11 +120,31 @@ An example MCP client configuration, in the `mcpServers` format many clients use
 
 The process starts the run and issues its one token at startup (printed once, or written 0600 to `--token-file`), sweeps reservations older than the lease every minute, and on shutdown stops accepting, lets in-flight exchanges finish and settle, then ends the run and revokes its token. At startup it refuses to serve unless the policy lists a model for each upstream, each upstream has a provider key, and the reservation's rate table (`RateTable`) and the settlement's (Panoptes' `PricingTable`) read one file to the same version, source and rates for every policy model. `agentgate doctor model-proxy` runs those checks without serving.
 
+`--ready-file PATH` tells a harness the proxy is up without parsing stderr (the `model proxy: run <id> for <user>, http://...` line is still printed). Once the port is listening, and after the token file is written, the process creates PATH as a new 0600 file (it refuses to start if PATH exists) and publishes it atomically, so a reader that sees the file sees all of it:
+
+```json
+{
+  "url": "http://127.0.0.1:53017",
+  "host": "127.0.0.1",
+  "port": 53017,
+  "pid": 41230,
+  "run_id": "6f1c2a8e-...",
+  "user": "lab-runner",
+  "customer": "lab",
+  "max_usd": "0.25",
+  "max_calls": 40,
+  "per_customer_day_usd": "5",
+  "token_file": "/path/to/run.token"
+}
+```
+
+`max_usd` and `max_calls` are the caps the proxy enforces: the policy's `per_run_usd` and `max_calls_per_run`, lowered by `--max-usd` and `--max-calls` and never raised, computed the way each admission computes them. Amounts are decimal strings, as in the policy. The file is removed on shutdown, with the token file. The SIGTERM handler is installed before the file is published, and removal runs even if shutdown itself fails. Only a file that still names this process's `pid` and `run_id` is removed, so a replacement written by another process is left alone. A process that is SIGKILLed or whose machine crashes cannot remove its file, so treat it as a hint: check that `pid` is alive and `url` answers before relying on it.
+
 `agentgate gateway serve --model-proxy --upstream ... --rate-table ... --token-file ...` starts the same proxy inside the MCP gateway's run: one run id, so a model call and a tool call reserve against the same per-run USD cap, per-day cap and call count. The token goes to `--token-file` only, since stdout is the MCP stream. `--max-usd` and `--max-calls` tighten the run's caps for model calls and can never raise the policy's.
 
 ## Policy format
 
-Each customer has a folder under `policies/` with three files: `policy.yaml` (rules, caps, approvals, lists), `tools.yaml` (the tools the customer has) and `tests.yaml` (expected decisions). A trimmed excerpt of `policies/kettle-creek-hvac/policy.yaml`:
+Each customer has a folder under `policies/` with up to three files: `policy.yaml` (rules, caps, approvals, lists, models), `tools.yaml` (the tools the customer has) and `tests.yaml` (expected decisions). `rules`, `approvals`, `lists` and `models` are each optional, within limits: a policy must have rules or a `models:` section (one with neither allows nothing and is rejected), `approvals` is required once any rule is `allow` or `require_approval` (an allowed call can still escalate to approval), and `tools.yaml` is required once there are rules. See [Models-only policies](#models-only-policies). A trimmed excerpt of `policies/kettle-creek-hvac/policy.yaml`:
 
 ```yaml
 # Access policy for Kettle Creek Heating & Air. Deny by default: anything no rule allows is denied.
@@ -240,6 +260,34 @@ models:
 - A request that declares no `max_tokens` is denied even when `reserve` is a fixed amount: the output limit is part of the envelope, and without it the entry's cap is not checked.
 - `reserve` is what one model call holds against the spend caps before it is sent. `computed` prices the worst case from the request and the rate table; a fixed USD string such as `"0.02"` is what a model the rate table does not price reserves, and a floor under the computed amount for one it does (the larger is reserved), so a tiny fixed value cannot lower the worst case.
 - A `tests.yaml` case for a model call gives `model: {provider, name, max_tokens, n, request_bytes}` in place of `tool` and `action`, and may state the decision's `reason` as well as `rules` (the entry id).
+
+### Models-only policies
+
+An experiment that only needs "this user may call this model under these caps" can leave out `tools.yaml`, `rules` and `approvals`:
+
+```yaml
+apiVersion: agentgate/v1
+customer: lab
+labels: [public]
+default: deny
+spend:
+  per_run_usd: "0.50"
+  per_customer_day_usd: "5"
+  max_calls_per_run: 40
+models:
+  allow:
+    - id: deepseek-flash
+      provider: openai_compatible
+      model: deepseek-flash
+      roles: [owner]
+      max_output_tokens: 8000
+      max_request_bytes: 4000000
+  reserve: computed
+```
+
+The tool gate still denies by default: with no `tools.yaml` every tool call is `unknown_tool`, and with one but no rules every call is `default_deny`. A customer without `approvals` has no approvers, so `approvals approve` and `reject` refuse its users (`approver_not_allowed`).
+
+`agentgate init-experiment DIR --model PROVIDER:NAME [--model ...] --max-usd USD --max-calls N` writes exactly this: `DIR/fixtures/lab/` with one active owner, `lab-runner`, and `DIR/policies/lab/policy.yaml`. `--day-usd` sets the day cap (default: `--max-usd`), `--max-output-tokens` and `--max-request-bytes` the envelope of every entry (default 8000 and 4000000), `--customer` and `--user` the ids. `--allow-server-features` sets `allow_server_features: true` on every entry, for agents whose requests carry provider-side features such as prompt-cache writes or non-function tool types; it is off by default. Everything is validated before anything is written. Each file is created exclusively and never through a symlink, so an existing file is never overwritten, even one that appears while the command runs; if one does, the files already written by this call are removed again, except any that another process replaced meanwhile (checked by inode). `--allow-server-features` also lets provider-run tools and provider-side state (background runs, stored conversations) through, and work the provider does on its side can cost more than the reservation computed from the request (see `docs/limits.md`). Serve it with `model-proxy serve --as lab-runner --policies DIR/policies --fixtures DIR/fixtures ...`.
 
 ### tools.yaml
 
@@ -405,8 +453,9 @@ Produced by `uv run agentgate redteam --transport mcp` at commit `ec526fb`: 173 
 | `src/agentgate/fixtures.py` | fixture loading, and the sync applied on every open |
 | `src/agentgate/gateway/` | MCP gateway: one run per process, every tool call through the gate |
 | `src/agentgate/redteam/` | scenario registry, leak detector, file worlds, baseline check, reports, benchmark, MCP transport |
+| `src/agentgate/experiment.py` | `init-experiment`: a one-user customer and a models-only policy |
 | `src/agentgate/demo.py`, `cli.py` | `make demo` and the `agentgate` CLI |
-| `policies/` | one folder per customer: `policy.yaml`, `tools.yaml`, `tests.yaml` |
+| `policies/` | one folder per customer: `policy.yaml`, `tools.yaml`, `tests.yaml` (`tools.yaml` optional for a models-only policy) |
 | `fixtures/` | the synthetic customers, users and documents |
 | `redteam/baseline.json` | scenarios that must exist and pass |
 | `tests/` | pytest suite, including mutation tests for the red-team scenarios |

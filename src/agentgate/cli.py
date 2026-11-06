@@ -14,7 +14,9 @@ reservations and tightens a store file other users could read; when any of that 
 something it says so on stderr, after the demo-identity note, and never on stdout.
 """
 
+import contextlib
 import json
+import os
 import shlex
 import signal
 import sqlite3
@@ -47,6 +49,16 @@ from agentgate.audit.base import (
 from agentgate.audit.panoptes import read_events, verify_log
 from agentgate.context import RunContext
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
+from agentgate.experiment import (
+    DEFAULT_CUSTOMER,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_USER,
+    ExperimentError,
+    ExperimentModel,
+    unlink_if_same,
+    write_experiment,
+)
 from agentgate.fixtures import FixtureError
 from agentgate.gate import GateReason, IdentityError, store_audit_reference
 from agentgate.model.admission import Caps
@@ -59,6 +71,7 @@ from agentgate.model.tokens import (
     TokenError,
     TokenRecord,
     TokenStore,
+    write_private_file,
     write_token_file,
 )
 from agentgate.models import Role, User, UserStatus
@@ -100,7 +113,7 @@ from agentgate.world import (
 )
 
 if TYPE_CHECKING:
-    from agentgate.model.proxy import ProxyConfig
+    from agentgate.model.proxy import ModelProxy, ProxyConfig
 
 app = typer.Typer(
     help="Permissions, approval and audit layer between an AI agent and a company's tools.",
@@ -613,7 +626,10 @@ def _approver(world: World, user_id: str) -> User:
     engine = world.engines.get(user.customer_id)
     if engine is None:
         _fail(f"customer {user.customer_id!r} has no policy")
-    if user.role not in engine.bundle.policy.approvals.approver_roles:
+    settings = engine.bundle.policy.approvals
+    if settings is None:
+        _fail(f"customer {user.customer_id!r} has no approvals in its policy")
+    if user.role not in settings.approver_roles:
         _fail(f"role {user.role.value!r} may not review approvals")
     return user
 
@@ -1464,6 +1480,14 @@ def model_proxy_serve(
         int | None,
         typer.Option("--max-calls", min=1, help="Cap the run's calls below the policy's."),
     ] = None,
+    ready_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--ready-file",
+            help="Once listening, write a new JSON file (mode 0600) with the url, port, run id, "
+            "user and the caps in effect. Removed on stop.",
+        ),
+    ] = None,
     db: DbOption = DEFAULT_DB,
     audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
     policies: PoliciesOption = DEFAULT_POLICIES,
@@ -1475,8 +1499,15 @@ def model_proxy_serve(
     decides each request against the policy's models section, reserves its worst-case cost,
     swaps in the provider's key, and settles what the provider reports. Everything, the
     gate's decisions and Panoptes' observation of each exchange, goes to one audit chain.
-    Stopping drains in-flight exchanges, then ends the run and revokes its token."""
+    Stopping drains in-flight exchanges, then ends the run and revokes its token.
+
+    --ready-file tells a harness the proxy is up without parsing stderr: it appears, complete,
+    only once the port is listening (and the token file is written), and states the caps the
+    proxy enforces, the policy's tightened by --max-usd and --max-calls."""
     from agentgate.model.proxy import ModelProxy, ProxySetupError
+
+    if ready_file is not None and (ready_file.exists() or ready_file.is_symlink()):
+        _fail(f"--ready-file {ready_file} already exists")
 
     config = _proxy_config(
         upstream,
@@ -1497,7 +1528,13 @@ def model_proxy_serve(
             _fail(str(exc))
         except (OSError, RateTableError) as exc:
             _fail(f"cannot start: {exc}")
+        run_id = proxy.run.run_id
+        ready_fd: int | None = None
         try:
+            # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
+            # Installed before the ready file exists, so a SIGTERM sent the moment a harness
+            # sees it still cleans it up.
+            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
             typer.echo(
                 f"model proxy: run {proxy.run.run_id} for {as_user}, http://{host}:{bound}",
                 err=True,
@@ -1506,13 +1543,161 @@ def model_proxy_serve(
                 typer.echo(proxy.token)
             else:
                 typer.echo(f"token written to {token_file}", err=True)
-            # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
-            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+            if ready_file is not None:
+                try:
+                    info = _ready_info(proxy, as_user, host, bound, token_file)
+                    ready_fd = _write_ready_file(ready_file, info)
+                except OSError as exc:
+                    _fail(f"cannot write {ready_file}: {exc.strerror}")
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
         finally:
-            proxy.stop()
+            # A second SIGTERM must not interrupt the cleanup the first one started.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                proxy.stop()
+            finally:
+                if ready_file is not None and ready_fd is not None:
+                    try:
+                        _remove_own_ready_file(ready_file, run_id, ready_fd)
+                    finally:
+                        os.close(ready_fd)
+
+
+def _ready_info(
+    proxy: "ModelProxy", user_id: str, host: str, port: int, token_file: Path | None
+) -> dict[str, JsonValue]:
+    """What --ready-file states: where the proxy listens, for which run, under which caps."""
+    limits = proxy.limits()
+    return {
+        "url": f"http://{host}:{port}",
+        "host": host,
+        "port": port,
+        "pid": os.getpid(),
+        "run_id": proxy.run.run_id,
+        "user": user_id,
+        "customer": proxy.run.customer_id,
+        # Amounts are decimal strings, as in the policy, so no float rounding creeps in.
+        "max_usd": _plain_decimal(limits.per_run_usd),
+        "max_calls": limits.max_calls_per_run,
+        "per_customer_day_usd": _plain_decimal(limits.per_customer_day_usd),
+        "token_file": None if token_file is None else str(token_file),
+    }
+
+
+def _plain_decimal(value: Decimal) -> str:
+    return "0" if value.is_zero() else format(value.normalize(), "f")
+
+
+def _remove_own_ready_file(path: Path, run_id: str, fd: int) -> None:
+    """Remove path only if it is still the file this process wrote for this run.
+
+    The file must be the one still open as fd since publishing and name this pid and run, so
+    another process's replacement is left alone (see `unlink_if_same` for the remaining
+    microsecond window). A ready file can still outlive the process (SIGKILL, a crash):
+    consumers must treat it as a hint and check that pid is alive and url answers before
+    relying on it."""
+    with contextlib.suppress(OSError, ValueError):
+        if path.is_symlink():
+            return
+        info = json.loads(path.read_text(encoding="utf-8"))
+        if info.get("pid") == os.getpid() and info.get("run_id") == run_id:
+            unlink_if_same(path, fd)
+
+
+def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> int:
+    """Publish info at path atomically and return a read-only descriptor of it.
+
+    A reader that sees the file sees all of it. The caller keeps the descriptor open until
+    cleanup, so the published inode cannot be reused by a replacement, and closes it.
+
+    The JSON goes to a private temporary file beside path, which is then hard-linked into
+    place. A link never replaces an existing file, so path is still created exclusively.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    write_private_file(temporary, json.dumps(info, indent=2) + "\n")
+    try:
+        fd = os.open(temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.link(temporary, path)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+@app.command("init-experiment")
+def init_experiment(
+    directory: Annotated[Path, typer.Argument(help="Writes fixtures/ and policies/ here.")],
+    model: Annotated[
+        list[str],
+        typer.Option(
+            "--model",
+            metavar="PROVIDER:NAME",
+            help="A model the user may call, e.g. openai_compatible:deepseek-chat. Repeatable.",
+        ),
+    ],
+    max_usd: Annotated[str, typer.Option("--max-usd", help="The run's spend cap (USD).")],
+    max_calls: Annotated[
+        int, typer.Option("--max-calls", min=1, max=10_000, help="The run's call cap.")
+    ],
+    day_usd: Annotated[
+        str | None,
+        typer.Option("--day-usd", help="The customer's daily spend cap (default: --max-usd)."),
+    ] = None,
+    max_output_tokens: Annotated[
+        int, typer.Option("--max-output-tokens", min=1, help="Per-request output token cap.")
+    ] = DEFAULT_MAX_OUTPUT_TOKENS,
+    max_request_bytes: Annotated[
+        int, typer.Option("--max-request-bytes", min=1, help="Per-request body size cap.")
+    ] = DEFAULT_MAX_REQUEST_BYTES,
+    customer: Annotated[str, typer.Option("--customer", help="Customer id.")] = DEFAULT_CUSTOMER,
+    user: Annotated[str, typer.Option("--user", help="The one user's id.")] = DEFAULT_USER,
+    allow_server_features: Annotated[
+        bool,
+        typer.Option(
+            "--allow-server-features",
+            help="Let requests carry provider-side features: prompt-cache writes, "
+            "provider-run tools and provider-side state (background runs, stored "
+            "conversations). Work the provider does on its side can cost more than the "
+            "reservation computed from the request text (see docs/limits.md). Off by "
+            "default; some agent CLIs need it.",
+        ),
+    ] = False,
+) -> None:
+    """Write a one-user customer and a models-only policy for an experiment.
+
+    The policy has only spend and models sections: the user may call the listed models under
+    the caps, every other model and every tool call is denied. Existing files are never
+    overwritten. Then serve it with `model-proxy serve --as <user> --policies <dir>/policies
+    --fixtures <dir>/fixtures ...`."""
+    try:
+        usd = Decimal(max_usd)
+        day = None if day_usd is None else Decimal(day_usd)
+    except ArithmeticError:
+        _fail("invalid amount: --max-usd and --day-usd are decimal USD amounts")
+    try:
+        written = write_experiment(
+            directory,
+            [ExperimentModel.parse(item) for item in model],
+            max_usd=usd,
+            max_calls=max_calls,
+            day_usd=day,
+            max_output_tokens=max_output_tokens,
+            max_request_bytes=max_request_bytes,
+            customer=customer,
+            user=user,
+            allow_server_features=allow_server_features,
+        )
+    except ExperimentError as exc:
+        _fail(str(exc))
+    typer.echo(f"fixtures {written.fixtures}")
+    typer.echo(f"policies {written.policies}")
+    typer.echo(f"user {written.user}")
 
 
 @doctor_app.command("model-proxy")

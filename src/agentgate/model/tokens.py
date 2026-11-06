@@ -372,7 +372,12 @@ def write_token_file(path: Path, token: str) -> None:
     creation, so there is no moment when another user could read it and a planted link
     cannot redirect it. An existing file is an error rather than overwritten.
     """
+    write_private_file(path, token + "\n")
+
+
+def write_private_file(path: Path, text: str) -> None:
+    """Write text to a new file readable by its owner only (see write_token_file)."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(token + "\n")
+        handle.write(text)

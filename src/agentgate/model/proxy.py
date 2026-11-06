@@ -50,7 +50,7 @@ from agentgate.model.tokens import (
     write_token_file,
 )
 from agentgate.models import User
-from agentgate.policy.schema import ModelProvider
+from agentgate.policy.schema import ModelProvider, SpendLimits
 from agentgate.spend import Reservation
 from agentgate.world import DEFAULT_RESERVATION_LEASE, World
 
@@ -311,6 +311,13 @@ class ModelProxy:
         if self._run is None:
             raise RuntimeError("the proxy has not started")
         return self._run
+
+    def limits(self) -> SpendLimits:
+        """The run's caps in effect: the policy's spend section, tightened by the config's
+        caps exactly as each admission tightens it. The day cap is the policy's alone."""
+        spend = self._world.engines[self.run.customer_id].bundle.policy.spend
+        caps = self._config.caps
+        return spend if caps is None else caps.tighten(spend)
 
     def validate(self) -> tuple[RateTable, PricingTable, AuditDB, User]:
         """Everything that must hold before the proxy serves, or ProxySetupError: one

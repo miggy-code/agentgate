@@ -626,7 +626,7 @@ def _expiry(demo: _Demo) -> list[Check]:
         return [("email waits for approval", False)]
     name = demo.names.approval(approval_id)
     approved = demo.decide(approval_id, "kc-mgr-terrence")
-    ttl = demo.world.engines[KC].bundle.policy.approvals.ttl_minutes
+    ttl = demo.world.engines[KC].bundle.policy.approval_settings().ttl_minutes
     demo.clock.advance(timedelta(minutes=ttl + 1))
     demo.say(
         f"clock: advanced {ttl + 1} minutes to {_time(demo.clock.now())}"
