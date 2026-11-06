@@ -1529,7 +1529,7 @@ def model_proxy_serve(
         except (OSError, RateTableError) as exc:
             _fail(f"cannot start: {exc}")
         run_id = proxy.run.run_id
-        ready_identity: tuple[int, int] | None = None
+        ready_fd: int | None = None
         try:
             # A supervisor stops a service with SIGTERM: end the run as for an interrupt.
             # Installed before the ready file exists, so a SIGTERM sent the moment a harness
@@ -1546,7 +1546,7 @@ def model_proxy_serve(
             if ready_file is not None:
                 try:
                     info = _ready_info(proxy, as_user, host, bound, token_file)
-                    ready_identity = _write_ready_file(ready_file, info)
+                    ready_fd = _write_ready_file(ready_file, info)
                 except OSError as exc:
                     _fail(f"cannot write {ready_file}: {exc.strerror}")
             threading.Event().wait()
@@ -1558,8 +1558,11 @@ def model_proxy_serve(
             try:
                 proxy.stop()
             finally:
-                if ready_file is not None and ready_identity is not None:
-                    _remove_own_ready_file(ready_file, run_id, ready_identity)
+                if ready_file is not None and ready_fd is not None:
+                    try:
+                        _remove_own_ready_file(ready_file, run_id, ready_fd)
+                    finally:
+                        os.close(ready_fd)
 
 
 def _ready_info(
@@ -1587,10 +1590,10 @@ def _plain_decimal(value: Decimal) -> str:
     return "0" if value.is_zero() else format(value.normalize(), "f")
 
 
-def _remove_own_ready_file(path: Path, run_id: str, identity: tuple[int, int]) -> None:
+def _remove_own_ready_file(path: Path, run_id: str, fd: int) -> None:
     """Remove path only if it is still the file this process wrote for this run.
 
-    The file must be the same inode that was published and still name this pid and run, so
+    The file must be the one still open as fd since publishing and name this pid and run, so
     another process's replacement is left alone (see `unlink_if_same` for the remaining
     microsecond window). A ready file can still outlive the process (SIGKILL, a crash):
     consumers must treat it as a hint and check that pid is alive and url answers before
@@ -1600,13 +1603,14 @@ def _remove_own_ready_file(path: Path, run_id: str, identity: tuple[int, int]) -
             return
         info = json.loads(path.read_text(encoding="utf-8"))
         if info.get("pid") == os.getpid() and info.get("run_id") == run_id:
-            unlink_if_same(path, identity)
+            unlink_if_same(path, fd)
 
 
-def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> tuple[int, int]:
-    """Publish info at path atomically and return the published file's (device, inode).
+def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> int:
+    """Publish info at path atomically and return a read-only descriptor of it.
 
-    A reader that sees the file sees all of it.
+    A reader that sees the file sees all of it. The caller keeps the descriptor open until
+    cleanup, so the published inode cannot be reused by a replacement, and closes it.
 
     The JSON goes to a private temporary file beside path, which is then hard-linked into
     place. A link never replaces an existing file, so path is still created exclusively.
@@ -1614,9 +1618,13 @@ def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> tuple[int, int]
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     write_private_file(temporary, json.dumps(info, indent=2) + "\n")
     try:
-        published = os.lstat(temporary)
-        os.link(temporary, path)
-        return published.st_dev, published.st_ino
+        fd = os.open(temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.link(temporary, path)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
     finally:
         with contextlib.suppress(OSError):
             temporary.unlink()

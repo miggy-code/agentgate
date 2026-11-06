@@ -220,7 +220,7 @@ def test_init_experiment_never_follows_a_symlink_or_truncates_a_late_arrival(
     late = tmp_path / "policies" / "lab" / "policy.yaml"
     real_create = experiment._create
 
-    def create(path: Path, text: str) -> tuple[int, int]:
+    def create(path: Path, text: str) -> int:
         if path == late:  # simulate a racing process planting a symlink between check and create
             path.parent.mkdir(parents=True, exist_ok=True)
             path.symlink_to(victim)
@@ -246,7 +246,7 @@ def test_init_experiment_rollback_spares_a_file_that_replaced_one_of_ours(
     late = tmp_path / "policies" / "lab" / "policy.yaml"
     real_create = experiment._create
 
-    def create(path: Path, text: str) -> tuple[int, int]:
+    def create(path: Path, text: str) -> int:
         if path == late:
             customer.unlink()
             customer.write_text("someone else's")

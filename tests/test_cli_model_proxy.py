@@ -299,9 +299,12 @@ def test_serve_refuses_an_existing_ready_file_before_starting(tmp_path: Path) ->
 def test_ready_file_cleanup_removes_only_this_process_file(tmp_path: Path) -> None:
     from agentgate.cli import _remove_own_ready_file
 
-    def identity(path: Path) -> tuple[int, int]:
-        info = os.lstat(path)
-        return info.st_dev, info.st_ino
+    def identity(path: Path) -> int:
+        fd = os.open(path, os.O_RDONLY)
+        opened.append(fd)
+        return fd
+
+    opened: list[int] = []
 
     mine, theirs, link = tmp_path / "mine.json", tmp_path / "theirs.json", tmp_path / "link.json"
     mine.write_text(json.dumps({"pid": os.getpid(), "run_id": "r1"}))
@@ -313,6 +316,8 @@ def test_ready_file_cleanup_removes_only_this_process_file(tmp_path: Path) -> No
     assert link.is_symlink() and theirs.exists() and mine.exists()
     _remove_own_ready_file(mine, "r1", identity(mine))
     assert not mine.exists()
+    for fd in opened:
+        os.close(fd)
 
 
 def test_ready_file_cleanup_spares_a_replacement_with_the_same_contents(tmp_path: Path) -> None:
@@ -324,11 +329,14 @@ def test_ready_file_cleanup_spares_a_replacement_with_the_same_contents(tmp_path
     info = {"pid": os.getpid(), "run_id": "r1"}
     published = _write_ready_file(ready, info)
     ready.unlink()
-    ready.write_text(json.dumps(info))
+    ready.write_text(json.dumps(info))  # on Linux this can reuse a freed inode number
     _remove_own_ready_file(ready, "r1", published)
+    os.close(published)
     assert ready.exists()
     ready.unlink()
-    _remove_own_ready_file(ready, "r1", _write_ready_file(ready, info))
+    second = _write_ready_file(ready, info)
+    _remove_own_ready_file(ready, "r1", second)
+    os.close(second)
     assert not ready.exists()
 
 

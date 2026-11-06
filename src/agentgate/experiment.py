@@ -134,7 +134,9 @@ def write_experiment(
     existing = [str(path) for path in files if path.exists() or path.is_symlink()]
     if existing:
         raise ExperimentError(f"already exists: {', '.join(existing)}")
-    created: list[tuple[Path, tuple[int, int]]] = []
+    # Each created file stays open until the end: an open file's inode cannot be reused, so
+    # the identity check in a rollback cannot mistake a replacement for ours.
+    created: list[tuple[Path, int]] = []
     try:
         for path, data in files.items():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,33 +144,42 @@ def write_experiment(
     except FileExistsError as exc:
         # Something appeared after the check above: undo only what this call created,
         # never touch the newcomer, nor a file that replaced one of ours meanwhile.
-        for path, identity in created:
-            unlink_if_same(path, identity)
+        for path, fd in created:
+            unlink_if_same(path, fd)
         raise ExperimentError(f"already exists: {exc.filename}") from None
+    finally:
+        for _, fd in created:
+            os.close(fd)
     return ExperimentFiles(fixtures=fixtures, policies=policies, customer=customer, user=user)
 
 
-def _create(path: Path, text: str) -> tuple[int, int]:
-    """Create path exclusively and never through a symlink; return its (device, inode).
+def _create(path: Path, text: str) -> int:
+    """Create path exclusively and never through a symlink; return it still open.
 
-    No existing file is ever truncated or redirected."""
+    No existing file is ever truncated or redirected. The caller closes the descriptor."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        info = os.fstat(handle.fileno())
-    return info.st_dev, info.st_ino
+    try:
+        data = text.encode("utf-8")
+        while data:
+            data = data[os.write(fd, data) :]
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
-def unlink_if_same(path: Path, identity: tuple[int, int]) -> bool:
-    """Remove path only if it is still the file identified by (device, inode).
+def unlink_if_same(path: Path, fd: int) -> bool:
+    """Remove path only if it is still the file open as fd.
 
-    A file that replaced it, or a symlink, is left alone. POSIX has no unlink-by-identity,
-    so a replacement in the instant between the check and the unlink is still possible;
-    this narrows that window to a few microseconds instead of the whole run."""
+    The caller must hold fd open from creation until this call: an open file's inode cannot
+    be freed, so a file that replaced it always has a different (device, inode). A file that
+    replaced it, or a symlink, is left alone. POSIX has no unlink-by-identity, so a
+    replacement in the instant between the check and the unlink is still possible; this
+    narrows that window to a few microseconds instead of the whole run."""
     with contextlib.suppress(OSError):
-        info = os.lstat(path)
-        if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == identity:
+        ours, info = os.fstat(fd), os.lstat(path)
+        if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == (ours.st_dev, ours.st_ino):
             path.unlink()
             return True
     return False
