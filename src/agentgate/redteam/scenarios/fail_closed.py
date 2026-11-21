@@ -522,9 +522,13 @@ def retrieval_invariant_broken(arena: Arena) -> None:
     real = index._permitted
 
     def permit_everything(
-        engine: PolicyEngine, ctx: RunContext, tool: str, run_max_label: str | None
+        engine: PolicyEngine,
+        ctx: RunContext,
+        principals: frozenset[str],
+        tool: str,
+        run_max_label: str | None,
     ) -> object:
-        found = real(engine, ctx, tool, run_max_label)
+        found = real(engine, ctx, principals, tool, run_max_label)
         every = tuple(sorted(doc.id for doc in arena.store.list_documents(ctx.customer_id)))
         return replace(found, permitted_ids=every)
 

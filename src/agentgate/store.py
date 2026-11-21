@@ -44,6 +44,9 @@ from typing import Self
 
 from agentgate.models import Customer, Document, User
 
+# documents.acl is a JSON list of principals, or NULL for a document without a source ACL.
+# No SQL comments inside the statements: SQLite keeps the CREATE text and rewrites it on
+# ALTER TABLE, and a comment there breaks that rewrite.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS customers (
     id TEXT PRIMARY KEY,
@@ -59,7 +62,8 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT NOT NULL UNIQUE,
     role TEXT NOT NULL,
     status TEXT NOT NULL,
-    suspended_by_operator INTEGER NOT NULL DEFAULT 0 CHECK (suspended_by_operator IN (0, 1))
+    suspended_by_operator INTEGER NOT NULL DEFAULT 0 CHECK (suspended_by_operator IN (0, 1)),
+    memberships TEXT NOT NULL DEFAULT '[]'
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS users_customer_id ON users(customer_id);
@@ -71,7 +75,8 @@ CREATE TABLE IF NOT EXISTS documents (
     label TEXT NOT NULL,
     tags TEXT NOT NULL,
     assigned_user_ids TEXT NOT NULL,
-    body TEXT NOT NULL
+    body TEXT NOT NULL,
+    acl TEXT
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS documents_customer_id ON documents(customer_id);
@@ -220,8 +225,8 @@ class Store:
     def add_user(self, user: User) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO users (id, customer_id, name, email, role, status)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (id, customer_id, name, email, role, status, memberships)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     user.id,
                     user.customer_id,
@@ -229,6 +234,7 @@ class Store:
                     user.email,
                     user.role.value,
                     user.status.value,
+                    _sorted_json(user.memberships),
                 ),
             )
 
@@ -236,8 +242,8 @@ class Store:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO documents"
-                " (id, customer_id, title, label, tags, assigned_user_ids, body)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " (id, customer_id, title, label, tags, assigned_user_ids, body, acl)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     document.id,
                     document.customer_id,
@@ -246,6 +252,7 @@ class Store:
                     _sorted_json(document.tags),
                     _sorted_json(document.assigned_user_ids),
                     document.body,
+                    _acl_json(document.acl),
                 ),
             )
 
@@ -260,17 +267,18 @@ class Store:
                 raise StoreError(f"unknown customer {customer.id!r}")
 
     def update_user(self, user: User) -> None:
-        """Replace a stored user's name, email, role and status. The customer cannot change,
-        and the operator suspension flag is left as it is."""
+        """Replace a stored user's name, email, role, status and memberships. The customer
+        cannot change, and the operator suspension flag is left as it is."""
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE users SET name = ?, email = ?, role = ?, status = ?"
+                "UPDATE users SET name = ?, email = ?, role = ?, status = ?, memberships = ?"
                 " WHERE id = ? AND customer_id = ?",
                 (
                     user.name,
                     user.email,
                     user.role.value,
                     user.status.value,
+                    _sorted_json(user.memberships),
                     user.id,
                     user.customer_id,
                 ),
@@ -279,18 +287,19 @@ class Store:
                 raise StoreError(f"unknown user {user.id!r} in customer {user.customer_id!r}")
 
     def update_document(self, document: Document) -> None:
-        """Replace a stored document's title, label, tags, assignment and body. The customer
-        cannot change."""
+        """Replace a stored document's title, label, tags, assignment, body and ACL. The
+        customer cannot change."""
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE documents SET title = ?, label = ?, tags = ?, assigned_user_ids = ?,"
-                " body = ? WHERE id = ? AND customer_id = ?",
+                " body = ?, acl = ? WHERE id = ? AND customer_id = ?",
                 (
                     document.title,
                     document.label,
                     _sorted_json(document.tags),
                     _sorted_json(document.assigned_user_ids),
                     document.body,
+                    _acl_json(document.acl),
                     document.id,
                     document.customer_id,
                 ),
@@ -437,6 +446,8 @@ def _user(row: sqlite3.Row) -> User:
     # The operator flag is the store's bookkeeping, not part of the model.
     fields = dict(row)
     fields.pop("suspended_by_operator", None)
+    # A read-only open never migrates, so a store from before memberships lacks the column.
+    fields["memberships"] = json.loads(fields.get("memberships") or "[]")
     return User.model_validate(fields)
 
 
@@ -450,8 +461,21 @@ def _document(row: sqlite3.Row) -> Document:
             "tags": json.loads(row["tags"]),
             "assigned_user_ids": json.loads(row["assigned_user_ids"]),
             "body": row["body"],
+            # Absent from a store read (read-only, so unmigrated) from before source ACLs.
+            "acl": _acl(row),
         }
     )
+
+
+def _acl(row: sqlite3.Row) -> list[str] | None:
+    # `in row` would search the values of a sqlite3.Row, not its column names.
+    raw = row["acl"] if "acl" in row.keys() else None  # noqa: SIM118
+    return None if raw is None else list(json.loads(raw))
+
+
+def _acl_json(acl: frozenset[str] | None) -> str | None:
+    # NULL (no source ACL) and "[]" (shared with nobody) mean different things; keep both.
+    return None if acl is None else _sorted_json(acl)
 
 
 def _snapshot(row: sqlite3.Row) -> PolicySnapshot:
@@ -551,3 +575,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE users ADD COLUMN suspended_by_operator INTEGER NOT NULL DEFAULT 0"
             " CHECK (suspended_by_operator IN (0, 1))"
         )
+    if "memberships" not in columns:
+        # A store written before source ACLs existed: users hold no memberships.
+        conn.execute("ALTER TABLE users ADD COLUMN memberships TEXT NOT NULL DEFAULT '[]'")
+    document_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    if "acl" not in document_columns:
+        # Documents stored before then have no source ACL (NULL), as before.
+        conn.execute("ALTER TABLE documents ADD COLUMN acl TEXT")

@@ -8,6 +8,7 @@ pip install panoptes-agentgate
 
 - **Deny by default.** Per-customer YAML policies with roles, document labels, recipient lists and spend bands. Any matching deny wins.
 - **Permission-aware retrieval.** Search filters to the documents the run may read, then ranks only those, so forbidden documents never shift results.
+- **Source ACLs as the ceiling.** A document can carry the ACL of the system it came from. Unless the user holds one of its principals, the read is denied before any policy rule, so a policy can narrow what the source shares but never widen it.
 - **Approvals.** Risky or customer-facing calls wait for a manager. An approval is bound to a hash of the exact arguments, used once, and expires.
 - **Spend caps.** Calls and USD per run, USD per customer per day, reserved before every call.
 - **Audit.** Every decision goes to [Panoptes](https://github.com/miggy-code/Panoptes), a tamper-evident SQLite log. If the decision cannot be recorded, the tool does not run.

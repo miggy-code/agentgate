@@ -156,7 +156,7 @@ def _load_bundles(root: Path) -> list["_CustomerBundle"]:
     return bundles
 
 
-_USER_FIELDS = ("name", "email", "role", "status")
+_USER_FIELDS = ("name", "email", "role", "status", "memberships")
 
 
 def _sync(store: Store, bundles: list["_CustomerBundle"]) -> FixtureSync:

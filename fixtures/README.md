@@ -35,6 +35,8 @@ A list of users. `customer_id` is not written here; the loader sets it from the 
   email: rosa@kettlecreek.example
   role: owner          # owner | manager | staff | contractor
   status: active       # active | suspended (optional, default active)
+  memberships: []      # optional; principals held through a source system,
+                       # e.g. [group:dispatch@kettlecreek.example, slack:C0123]
 ```
 
 User ids start with the customer's prefix (`kc-` or `jr-`) and are unique across all customers.
@@ -50,6 +52,7 @@ title: Commercial pricing and margins 2026
 label: confidential    # public | internal | confidential | restricted
 tags: [pricing]
 assigned_user_ids: []  # optional; a non-empty list requires the "assigned" tag
+acl: [group:dispatch@kettlecreek.example]  # optional source ACL; absent means policy only
 ---
 Body text.
 

@@ -215,6 +215,7 @@ def _run_case(store: Store, engine: PolicyEngine, case: PolicyTestCase) -> CaseR
             recipients=case.recipients,
             amount_usd=case.amount_usd,
             run_max_label=case.run_max_label,
+            principals=user.principals,
         )
     )
     return _result(customer_id, case, decision)

@@ -1515,7 +1515,13 @@ class Gate:
         def search(query: str, limit: int) -> RetrievalResult:
             # The policy check per document is the retrieval filter itself.
             found = self._index.search(
-                run.engine, run.ctx, query, run_max_label=max_label, tool=SEARCH_TOOL, limit=limit
+                run.engine,
+                run.ctx,
+                query,
+                run_max_label=max_label,
+                tool=SEARCH_TOOL,
+                limit=limit,
+                principals=run.user.principals,
             )
             searches.append((found, call.latency_us()))
             return found
@@ -1916,6 +1922,8 @@ def _request(
         recipients=facts.recipients,
         amount_usd=facts.amount_usd,
         run_max_label=run_max_label,
+        # From the user re-read from the store for this call, never from the caller.
+        principals=run.user.principals,
     )
 
 

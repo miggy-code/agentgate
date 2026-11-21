@@ -267,6 +267,7 @@ class _Bench:
                 tool=READ_TOOL,
                 action=Action.READ,
                 document=DocumentFacts.from_document(self.document(doc_id)),
+                principals=user.principals,
             )
 
         allowed, denied = request(ALLOWED_DOC), request(RESTRICTED_DOC)
