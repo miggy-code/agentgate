@@ -446,7 +446,8 @@ def _user(row: sqlite3.Row) -> User:
     # The operator flag is the store's bookkeeping, not part of the model.
     fields = dict(row)
     fields.pop("suspended_by_operator", None)
-    fields["memberships"] = json.loads(fields["memberships"])
+    # A read-only open never migrates, so a store from before memberships lacks the column.
+    fields["memberships"] = json.loads(fields.get("memberships") or "[]")
     return User.model_validate(fields)
 
 
@@ -460,9 +461,16 @@ def _document(row: sqlite3.Row) -> Document:
             "tags": json.loads(row["tags"]),
             "assigned_user_ids": json.loads(row["assigned_user_ids"]),
             "body": row["body"],
-            "acl": None if row["acl"] is None else json.loads(row["acl"]),
+            # Absent from a store read (read-only, so unmigrated) from before source ACLs.
+            "acl": _acl(row),
         }
     )
+
+
+def _acl(row: sqlite3.Row) -> list[str] | None:
+    # `in row` would search the values of a sqlite3.Row, not its column names.
+    raw = row["acl"] if "acl" in row.keys() else None  # noqa: SIM118
+    return None if raw is None else list(json.loads(raw))
 
 
 def _acl_json(acl: frozenset[str] | None) -> str | None:

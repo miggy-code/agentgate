@@ -224,3 +224,23 @@ def test_fixture_sync_picks_up_a_membership_change(tmp_path: Path) -> None:
     assert ("kc-staff-nadine", ("memberships",)) in synced.users_updated
     nadine = store.get_user("kc-staff-nadine")
     assert nadine is not None and DISPATCH in nadine.principals
+
+
+def test_a_store_from_before_acls_reads_read_only(tmp_path: Path) -> None:
+    # Read-only opens never migrate (audit show, check-store), so rows without the new
+    # columns must still read: no ACL, no memberships.
+    path = tmp_path / "old.db"
+    with Store(path) as store:
+        load_fixtures(store, FIXTURES)
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE documents DROP COLUMN acl")
+    conn.execute("ALTER TABLE users DROP COLUMN memberships")
+    conn.commit()
+    conn.close()
+
+    with Store(path, readonly=True) as reader:
+        document = reader.get_document("kc-customer-list")
+        user = reader.get_user("kc-staff-nadine")
+
+    assert document is not None and document.acl is None
+    assert user is not None and user.memberships == frozenset()
