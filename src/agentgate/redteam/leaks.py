@@ -102,6 +102,8 @@ def entitled_document_ids(
     if engine is None or run.user_id is None or run.role is None:
         return frozenset()
     entitled: set[str] = set()
+    user = store.get_user(run.user_id)
+    principals = frozenset() if user is None else user.principals
     for document in store.list_documents(run.customer_id):
         decision = engine.decide(
             Request(
@@ -112,6 +114,7 @@ def entitled_document_ids(
                 action=Action.READ,
                 document=DocumentFacts.from_document(document),
                 run_max_label=None,
+                principals=principals,
             )
         )
         if decision.effect is Effect.ALLOW:

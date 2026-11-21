@@ -518,7 +518,12 @@ def test_invariant_check_fires_when_the_filter_is_wrong(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def permit_everything(
-        self: DocumentIndex, engine: PolicyEngine, ctx: RunContext, tool: str, label: str | None
+        self: DocumentIndex,
+        engine: PolicyEngine,
+        ctx: RunContext,
+        principals: frozenset[str],
+        tool: str,
+        label: str | None,
     ) -> _Filter:
         ids = tuple(d.id for d in world.docs(ctx.customer_id))
         return _Filter(len(ids), ids, {}, ())

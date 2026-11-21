@@ -16,6 +16,11 @@ ToolId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$", max
 Label = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=32)]
 Tag = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9:_-]*$", max_length=64)]
 Domain = Annotated[str, Field(pattern=r"^[a-z0-9-]+(\.[a-z0-9-]+)+$", max_length=253)]
+# An identity a source system grants access to, as an opaque string: "anyone", or
+# "<kind>:<value>" such as "group:sales@acme.example", "slack:C123" or "crm-team:7". agentgate
+# compares principals for equality only; it never interprets a kind.
+Principal = Annotated[str, Field(pattern=r"^(anyone|[a-z][a-z0-9-]*:\S+)$", max_length=320)]
+ANYONE = "anyone"
 
 
 class Role(StrEnum):
@@ -64,10 +69,21 @@ class User(_Model):
     email: str = Field(pattern=r"^[^@\s]+@[a-z0-9-]+(\.[a-z0-9-]+)+$", max_length=254)
     role: Role
     status: UserStatus = UserStatus.ACTIVE
+    # Principals the user holds through a source system beyond the ones derived from the
+    # email: group, channel and team memberships.
+    memberships: frozenset[Principal] = frozenset()
 
     @property
     def email_domain(self) -> str:
         return self.email.rsplit("@", 1)[1]
+
+    @property
+    def principals(self) -> frozenset[str]:
+        """Everything a document's source ACL can name this user by: anyone, the user's own
+        address, the user's email domain, and the user's memberships."""
+        return frozenset(
+            {ANYONE, f"user:{self.email}", f"domain:{self.email_domain}"} | self.memberships
+        )
 
 
 class Tool(_Model):
@@ -86,6 +102,9 @@ class Document(_Model):
     label: Label
     tags: frozenset[Tag] = frozenset()
     assigned_user_ids: frozenset[Slug] = frozenset()
+    # The source system's ACL: the principals the document is shared with. None means the
+    # document has no source ACL and only the policy decides; an empty set means nobody.
+    acl: frozenset[Principal] | None = None
     body: str
 
     @model_validator(mode="after")

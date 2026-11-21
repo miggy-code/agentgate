@@ -2,7 +2,9 @@
 
 Evaluation is deny by default and fails closed. Built-in checks reject requests the policy
 cannot reason about (another customer, an unknown tool, an unknown label) before any rule
-is consulted. A rule condition whose fact is missing never holds, whatever the rule's
+is consulted, and so does a document's source ACL: a document that carries one is readable
+only by a request whose principals meet it, so a policy can narrow what the source shares
+but never widen it. A rule condition whose fact is missing never holds, whatever the rule's
 effect, so an allow rule cannot match on absent data. Deny beats require approval, which
 beats allow.
 
@@ -41,6 +43,7 @@ class Reason(StrEnum):
     ACTION_NOT_SUPPORTED = "action_not_supported"
     UNKNOWN_LABEL = "unknown_label"
     DOCUMENT_REQUIRED = "document_required"
+    ACL_DENIED = "acl_denied"
     MODEL_ALLOWED = "model_allowed"
     MODEL_NOT_ALLOWED = "model_not_allowed"
     MODEL_ROLE_DENIED = "model_role_denied"
@@ -59,6 +62,8 @@ class DocumentFacts:
     label: str
     tags: frozenset[str] = frozenset()
     assigned_user_ids: frozenset[str] = frozenset()
+    # The source ACL, or None for a document without one (see Document.acl).
+    acl: frozenset[str] | None = None
 
     @classmethod
     def from_document(cls, document: Document) -> "DocumentFacts":
@@ -67,6 +72,7 @@ class DocumentFacts:
             label=document.label,
             tags=frozenset(document.tags),
             assigned_user_ids=frozenset(document.assigned_user_ids),
+            acl=document.acl,
         )
 
 
@@ -82,6 +88,9 @@ class Request:
     amount_usd: Decimal | None = None
     # The most sensitive label this run has read so far.
     run_max_label: str | None = None
+    # The principals the acting user holds (User.principals). A document with a source ACL is
+    # readable only when they meet it.
+    principals: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -262,6 +271,10 @@ class PolicyEngine:
                 return Reason.DOCUMENT_CUSTOMER_MISMATCH
             if document.label not in self._ranks:
                 return Reason.UNKNOWN_LABEL
+            # The source ACL is the ceiling: checked before any rule, so no policy can grant
+            # what the source system does not share. An empty ACL meets no principal.
+            if document.acl is not None and not document.acl & request.principals:
+                return Reason.ACL_DENIED
         if request.run_max_label is not None and request.run_max_label not in self._ranks:
             return Reason.UNKNOWN_LABEL
         return None

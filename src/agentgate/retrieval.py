@@ -3,9 +3,10 @@
 Documents are filtered before ranking, so nothing the run may not read reaches the ranker
 or the model: no bodies, no titles, no counts. The permitted set comes from the policy
 engine itself. For each of the run's customer documents, the engine decides a read with the
-search tool from the document's metadata alone (label, tags, assignment, never the body),
-and only an ALLOW counts; a read that would need approval is not searchable. Read and search
-therefore share one decision path and cannot disagree.
+search tool from the document's metadata alone (label, tags, assignment and source ACL,
+never the body), with the acting user's principals, and only an ALLOW counts; a read that
+would need approval is not searchable. Read and search therefore share one decision path
+and cannot disagree.
 
 Ranking is BM25F computed in Python over the permitted documents only. The index is a
 plain inverted index (per-field term frequencies and field lengths) built with the same
@@ -278,8 +279,13 @@ class DocumentIndex:
         run_max_label: str | None,
         tool: str = "docs.search",
         limit: int = 5,
+        principals: frozenset[str] = frozenset(),
     ) -> RetrievalResult:
-        """Return the best permitted matches for query, best first, with an audit trace."""
+        """Return the best permitted matches for query, best first, with an audit trace.
+
+        `principals` are the acting user's (User.principals), which a document's source ACL
+        must meet. The gate passes those of the user it re-read for the call; left empty, no
+        document with an ACL is permitted."""
         if ctx.customer_id != engine.bundle.customer_id:
             # A wiring bug in the caller, not something a user request can cause.
             raise ValueError(
@@ -293,10 +299,11 @@ class DocumentIndex:
         # One lock for the filter, the ranking and the re-check, so all three see the same
         # rows even if another thread writes documents in between.
         with self._store.locked():
-            filtered = self._permitted(engine, ctx, tool, run_max_label)
+            filtered = self._permitted(engine, ctx, principals, tool, run_max_label)
             ranked_ids = self._rank(terms, filtered.permitted_ids, limit)
             documents = tuple(
-                self._recheck(engine, ctx, tool, run_max_label, doc_id) for doc_id in ranked_ids
+                self._recheck(engine, ctx, principals, tool, run_max_label, doc_id)
+                for doc_id in ranked_ids
             )
 
         trace = RetrievalTrace(
@@ -316,11 +323,16 @@ class DocumentIndex:
         return RetrievalResult(documents=documents, trace=trace)
 
     def _permitted(
-        self, engine: PolicyEngine, ctx: RunContext, tool: str, run_max_label: str | None
+        self,
+        engine: PolicyEngine,
+        ctx: RunContext,
+        principals: frozenset[str],
+        tool: str,
+        run_max_label: str | None,
     ) -> _Filter:
         # Metadata only: bodies are not read for documents the run may not see.
         rows = self._store.connection.execute(
-            "SELECT id, customer_id, label, tags, assigned_user_ids FROM documents"
+            "SELECT id, customer_id, label, tags, assigned_user_ids, acl FROM documents"
             " WHERE customer_id = ? ORDER BY id",
             (ctx.customer_id,),
         ).fetchall()
@@ -333,8 +345,9 @@ class DocumentIndex:
                 label=row["label"],
                 tags=frozenset(json.loads(row["tags"])),
                 assigned_user_ids=frozenset(json.loads(row["assigned_user_ids"])),
+                acl=None if row["acl"] is None else frozenset(json.loads(row["acl"])),
             )
-            decision = engine.decide(_read_request(ctx, tool, facts, run_max_label))
+            decision = engine.decide(_read_request(ctx, principals, tool, facts, run_max_label))
             if decision.effect is Effect.ALLOW:
                 permitted.append(row["id"])
                 rules.update(decision.rule_ids)
@@ -368,6 +381,7 @@ class DocumentIndex:
         self,
         engine: PolicyEngine,
         ctx: RunContext,
+        principals: frozenset[str],
         tool: str,
         run_max_label: str | None,
         doc_id: str,
@@ -376,7 +390,7 @@ class DocumentIndex:
         if document is None or document.customer_id != ctx.customer_id:
             raise RetrievalInvariantError(f"ranked document {doc_id!r} is not in the run's tenant")
         facts = DocumentFacts.from_document(document)
-        decision = engine.decide(_read_request(ctx, tool, facts, run_max_label))
+        decision = engine.decide(_read_request(ctx, principals, tool, facts, run_max_label))
         if decision.effect is not Effect.ALLOW:
             raise RetrievalInvariantError(
                 f"ranked document {doc_id!r} is not readable: {decision.reason.value}"
@@ -409,7 +423,11 @@ def _write_rows(conn: sqlite3.Connection, doc_id: str, title_text: str, body_tex
 
 
 def _read_request(
-    ctx: RunContext, tool: str, facts: DocumentFacts, run_max_label: str | None
+    ctx: RunContext,
+    principals: frozenset[str],
+    tool: str,
+    facts: DocumentFacts,
+    run_max_label: str | None,
 ) -> Request:
     return Request(
         customer_id=ctx.customer_id,
@@ -419,4 +437,5 @@ def _read_request(
         action=Action.READ,
         document=facts,
         run_max_label=run_max_label,
+        principals=principals,
     )

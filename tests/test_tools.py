@@ -425,7 +425,8 @@ def test_a_note_write_does_not_block_another_connection(tmp_path: Path) -> None:
     body = " ".join(f"word{i % 997} term{i % 311}" for i in range(150))
     with writer.transaction():
         writer.connection.executemany(
-            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO documents (id, customer_id, title, label, tags, assigned_user_ids, body)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             [(f"jr-bulk-{i}", JR, "Bulk", "internal", "[]", "[]", body) for i in range(1500)],
         )
     index.rebuild()

@@ -6,6 +6,12 @@ The README covers what agentgate is and how a call flows through it. This page h
 
 Search filters before it ranks. Each search asks the policy engine about every one of the customer's documents, from metadata only, never the body. Only documents the engine allows outright are searchable. BM25F then ranks the permitted set, with term statistics computed from that set alone, so forbidden documents do not shift scores. Each ranked result is checked again before it is returned; a disagreement is an invariant violation and the search returns nothing.
 
+### Source ACLs
+
+A document can carry the ACL of the system it came from (`acl`: the principals a Drive file, mailbox or channel is shared with), and a user the principals they hold (`memberships`, plus `anyone`, `user:<email>` and `domain:<email domain>` derived from the address). Principals are opaque strings, compared for equality only. When a document has an ACL, the engine checks it before any rule: unless the requesting user holds one of its principals, the request is denied with `acl_denied`, whatever the policy says. So the source ACL is the ceiling and a policy can only narrow below it. An empty ACL is shared with nobody. A document without an ACL (`acl` absent) is decided by the policy alone, as before.
+
+The gate and search take the user's principals from the store's copy of the user, re-read for every call. Code that calls `PolicyEngine.decide` directly passes them in `Request.principals`; left empty, no document with an ACL is readable.
+
 A denied read looks like a missing document. Whether the id does not exist, belongs to another customer, or names a document the user may not read, the model is told `not_found`. The audit log keeps the real reason. `audit show`, which the customer's own owners and managers read, prints a denial naming another customer's document exactly as it prints a missing one (`document_not_found`, the id as an unknown reference, no args hash), so it cannot be used to find which ids exist elsewhere.
 
 ## Approvals
@@ -213,6 +219,7 @@ The full file has 7 directory addresses and 14 rules.
 
 - A matching `deny` beats `require_approval`, which beats `allow`. A request no rule matches is denied (`default: deny`).
 - `allow` and `require_approval` rules must list `roles`. Only a `deny` rule may omit them (it then applies to every role), so a missing line can never widen access.
+- A document with a source ACL is denied (`acl_denied`) before any rule is consulted unless the user holds one of its principals (see Source ACLs). No rule can grant past it.
 - A rule matches on `roles`, `tools`, `actions` and `labels: {max: ...}` (the document's label is at or below the bound), plus optional `where` conditions.
 - A condition whose fact is missing never holds. A condition on an action that never carries its fact (a recipient on a read) is a validation error.
 - There is no expression language. The conditions are a closed set:
