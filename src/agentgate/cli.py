@@ -1702,6 +1702,9 @@ def model_proxy_server(
             _, socket_path = server.start()
         except ProxySetupError as exc:
             _fail(str(exc))
+        except ValueError as exc:
+            # Panoptes refuses a non-loopback --host with a ValueError.
+            _fail(f"cannot start: {exc}")
         except (OSError, RateTableError) as exc:
             _fail(f"cannot start: {exc}")
         ready_fd: int | None = None

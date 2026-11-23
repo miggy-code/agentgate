@@ -40,6 +40,7 @@ from agentgate.store import Store
 from agentgate.world import World, open_world
 from conftest import FIXTURES, KC, POLICIES, mutant, open_file_world
 from proxyharness import BODY, PROVIDER_KEY, RATES, Provider, Reply
+from test_cli_ops import _cli, _error
 
 OWNER = "kc-owner-dale"
 STAFF = "kc-staff-nadine"
@@ -651,6 +652,32 @@ def test_the_server_needs_a_policy_with_a_served_model_and_a_key(tmp_path: Path)
                 MultiRunProxy(world, config).start()
     finally:
         world.close()
+
+
+# The command line
+
+
+def test_a_non_loopback_host_is_one_error_line_not_a_traceback(tmp_path: Path) -> None:
+    rates = tmp_path / "rates.json"
+    rates.write_text(json.dumps(RATES))
+    keys = tmp_path / "keys.json"
+    keys.write_text(json.dumps({UPSTREAM.value: PROVIDER_KEY}))
+    keys.chmod(0o600)
+    result = _cli(
+        tmp_path,
+        "model-proxy",
+        "server",
+        "--upstream",
+        "openai_compatible=http://127.0.0.1:9",
+        "--rate-table",
+        str(rates),
+        "--keys-file",
+        str(keys),
+        "--host",
+        "0.0.0.0",
+    )
+    assert "non-loopback" in _error(result)
+    assert PROVIDER_KEY not in result.output
 
 
 # Storage
