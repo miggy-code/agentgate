@@ -434,12 +434,14 @@ def _raw(path: Path, request: bytes) -> tuple[int, dict[str, str], bytes]:
         conn.settimeout(15)
         conn.connect(str(path))
         # A busy server answers and closes without reading the request; its answer is
-        # still there to read.
-        with contextlib.suppress(BrokenPipeError):
+        # still there to read. Linux resets a socket closed with unread data, so the send
+        # or the read after the answer can fail with a reset instead of a clean end.
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             conn.sendall(request)
         data = b""
-        while chunk := conn.recv(65536):
-            data += chunk
+        with contextlib.suppress(ConnectionResetError):
+            while chunk := conn.recv(65536):
+                data += chunk
     head, _, body = data.partition(b"\r\n\r\n")
     lines = head.decode().split("\r\n")
     headers = dict(line.split(": ", 1) for line in lines[1:])
