@@ -172,6 +172,25 @@ uv run agentgate model-proxy serve --as kc-staff-nadine \
 
 The proxy is [Panoptes](https://github.com/miggy-code/Panoptes)' reverse proxy with agentgate deciding in its hooks. The agent points its SDK at the proxy and sends the run's token where it would send a provider key. Each request must be a POST to a generation endpoint, carry a live token and fit the policy's `models:` entry; its worst case is reserved against the run's caps, the provider's key replaces whatever credential the client sent, and the reservation is settled from what the provider reports. `gateway serve --model-proxy` does this inside the MCP gateway's run, so tool and model calls share one set of caps. `agentgate doctor model-proxy` checks the setup without serving. See [docs/design.md](docs/design.md#the-model-proxy).
 
+### Or one proxy for many runs
+
+```bash
+uv run agentgate model-proxy server \
+  --upstream openai_compatible=https://api.deepseek.com \
+  --rate-table rates.json --keys-file keys.json --ready-file proxy.json
+```
+
+```python
+from agentgate.model.client import ControlClient
+
+with ControlClient(socket_path) as control:  # "control_socket" in proxy.json
+    run = control.start_run("kettle-creek-hvac", "kc-staff-nadine", max_usd="0.10")
+    # The agent sends run.token to "model_url" in place of a provider key.
+    control.end_run(run.run_id)
+```
+
+`model-proxy server` is one long-running process serving model calls for many runs of one world, so a host does not start a proxy per run. A host on the same machine starts a run for a user on a Unix control socket (a new 0700 directory, a 0600 socket: only the server's own user can reach it) and gets back the run's token and the caps in effect; caps it asks for only tighten the policy's. The server serves only runs it started, refuses any other run's token as `not_served`, and on shutdown ends every run it started. See [docs/design.md](docs/design.md#the-multi-run-model-proxy).
+
 ### As the spend gate for an experiment
 
 ```bash
@@ -194,8 +213,8 @@ The main ones (the full list is in [docs/limits.md](docs/limits.md)):
 - **The audit log is tamper-evident, not tamper-proof.** Editing or deleting a stored event fails verification. But someone with write access can delete the newest events and rewrite the chain metadata, and catching that needs a checkpoint stored somewhere else.
 - **The audit log and the state database are separate SQLite files with no two-phase commit.** A tool that ran can be missing its `executed` event if the log fails right after.
 - **Search asks the policy engine about every document of the customer.** That works at fixture scale (20 documents per customer) and is the first thing to change at scale.
-- **Model spend is metered only through the proxy.** A run whose model calls do not go through `model-proxy serve` (or `gateway serve --model-proxy`) is not metered for them. Behind the proxy the agent cannot spend past the run's caps, but it is priced from a rate table as written, a reply with no usage is charged in full, and a streamed reply is not inspected.
-- **The proxy depends on Panoptes' hook contract** (`panoptes-observe` 0.2.x) for what it reports about each exchange, and the red-team table above does not include its HTTP tests (`tests/test_model_proxy.py`, with mutation tests).
+- **Model spend is metered only through the proxy.** A run whose model calls do not go through `model-proxy serve`, `model-proxy server` (or `gateway serve --model-proxy`) is not metered for them. Behind the proxy the agent cannot spend past the run's caps, but it is priced from a rate table as written, a reply with no usage is charged in full, and a streamed reply is not inspected.
+- **The proxy depends on Panoptes' hook contract** (`panoptes-observe` 0.2.x) for what it reports about each exchange, and the red-team table above does not include its HTTP tests (`tests/test_model_proxy.py` and `tests/test_multi_run_proxy.py`, with mutation tests).
 - **Side effects are simulated.** Email goes to an `outbox` table. Every result here comes from mock models; the optional Claude adapter is tested only against a fake client.
 - **No compliance claims.** agentgate has not been audited.
 
