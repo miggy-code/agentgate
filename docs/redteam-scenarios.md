@@ -1,7 +1,7 @@
 # Red-team scenarios
 
 Every scenario in the suite, by category. The list, titles and check counts come from the JSON report of
-`uv run agentgate redteam` at commit `ec526fb`: 173 scenarios, 2025 checks, all passed.
+`uv run agentgate redteam` at commit `c4a8422`: 177 scenarios, 1989 checks, all passed.
 
 Each scenario runs in a fresh in-memory world over the fixtures and policies in this repository: two fictional
 companies (Kettle Creek Heating & Air and Juniper Row Apothecary) with synthetic data. Scenarios about state that
@@ -20,7 +20,7 @@ defined in `src/agentgate/redteam/scenarios/examples.py` and count in the suite.
 | [identity_spoofing](#identity_spoofing) | 16 |
 | [fail_closed](#fail_closed) | 17 |
 | [audit_integrity](#audit_integrity) | 19 |
-| [model_boundary](#model_boundary) | 25 |
+| [model_boundary](#model_boundary) | 29 |
 | [benign_control](#benign_control) | 21 |
 
 ## cross_tenant
@@ -221,26 +221,32 @@ A run's request to a model, and the keys, tokens and spend behind the model gate
 | mb-007 | A role the entry does not list, or a customer with no models, is denied | 10 |
 | mb-008 | A run's suspended user can neither use a token nor get a model call | 7 |
 | mb-009 | A token of another run, user or customer, or a forged one, is refused | 13 |
-| mb-010 | A revoked, expired or ended token is refused | 13 |
+| mb-010 | A revoked, expired or ended token is refused | 14 |
 | mb-011 | Only a hash of a token is stored, and a listing never shows one | 4 |
 | mb-012 | A provider key never appears in an error, a printout or an echoed reply | 12 |
-| mb-013 | A client's own credentials are stripped and the provider's is the only one sent | 73 |
+| mb-013 | A client's own credentials are stripped and the provider's is the only one sent | 10 |
 | mb-014 | Concurrent model calls cannot jointly pass the run's cap | 4 |
 | mb-015 | Caps passed to the gate tighten the policy and never widen it | 9 |
 | mb-016 | After the cap every model call is refused and nothing more is reserved | 6 |
-| mb-017 | A call is released only if it never reached the provider; a sent call is charged | 30 |
+| mb-017 | A call is released only if it never reached the provider; a sent call is charged | 35 |
 | mb-018 | A reservation covers the worst case, and an unpriced model is denied | 12 |
-| mb-019 | A forged correlation id is recorded as asserted, never trusted | 11 |
+| mb-019 | A forged correlation id is recorded as asserted, never trusted | 12 |
 | mb-020 | A model call whose allow cannot be recorded is not admitted | 6 |
 | mb-021 | Reservations left by a killed proxy are released when the store next opens | 5 |
 | mb-022 | Dropping the connection again and again cannot get around the cap | 4 |
 | mb-023 | A body field the parser does not read is denied, not ignored | 35 |
 | mb-024 | Server-side state, tools and cache writes are denied unless allowed | 30 |
 | mb-025 | A tiny fixed reserve cannot lower the worst case the table gives | 5 |
+| mb-026 | A multi-run proxy takes a token as its own run, whatever run the request names | 5 |
+| mb-027 | A control socket reached through a symlinked path is refused | 4 |
+| mb-028 | A multi-run proxy refuses to start a run for another customer's user | 6 |
+| mb-029 | A served run's caps tighten the policy's and a cap above it is ignored | 5 |
 
 ### Model proxy tests
 
 The proxy's own boundaries are tested over real HTTP, against a fake provider that records what reaches it (`tests/test_model_proxy.py`), not in the in-process suite above. Each is one test, and `tests/test_model_proxy_mutations.py` removes the protection behind it and requires the test to fail: a request to any other route or method is not forwarded; a missing, unknown, revoked or ambiguous token is refused; a token in the query is read and not forwarded; every client credential is replaced by the provider's key (a `Connection` header cannot remove it); a denial, a cap and an error in the decision all stop the request; an exchange is recorded under its run and joined to its decision by `exchange_id`; a complete reply is charged its priced cost, a provider error released, a reply with no usage or a reply cut short charged in full; a failure after the reservation releases it; stopping the proxy revokes the token; two rate tables that disagree, a missing provider key, and a token file others can read all stop the start.
+
+The multi-run proxy (`agentgate model-proxy server`) is tested the same way in `tests/test_multi_run_proxy.py`, over real HTTP and its real Unix control socket: two users' runs served at once, each token only as its own run; a token of a `serve` process on the same world refused as `not_served`; an ended run's token refused, and ending idempotent; a suspended user's live token refused after a fixture sync; per-run caps tightening and never widening the policy; concurrent last-dollar reservations across runs held to each run's cap; the socket 0600 in a new 0700 directory, and an existing directory, symlink or socket refused; every run ended at stop, and a crashed server's runs ended at the next start; malformed control bodies, other routes and methods, and requests beyond the control bound refused with a reason code. Mutation tests there remove the served-runs check and the per-run caps and require their tests to fail.
 
 ## benign_control
 

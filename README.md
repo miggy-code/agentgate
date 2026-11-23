@@ -27,11 +27,11 @@ pip install panoptes-agentgate
 | identity_spoofing | 16 | 16/16 | 16/16 |
 | fail_closed | 17 | 17/17 | 17/17 |
 | audit_integrity | 19 | 19/19 | 19/19 |
-| model_boundary | 25 | 25/25 | 25/25 |
-| **attacks total** | **152** | **152/152** | **152/152** |
+| model_boundary | 29 | 29/29 | 29/29 |
+| **attacks total** | **156** | **156/156** | **156/156** |
 | benign_control | 21 | 21/21 | 21/21 |
 
-From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `6b09d32`.
+From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `c4a8422`.
 
 The threat model is a fully compromised model: most attack scenarios propose the harmful call directly, and some prompt injection scenarios run a mock model that obeys any instruction it reads. Benign controls are legitimate tasks the gate must still allow, so a gate that denied everything would fail them.
 
