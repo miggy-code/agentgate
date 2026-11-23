@@ -435,8 +435,8 @@ def probe_ids_within_tenant(arena: Arena) -> None:
     arena.expect_executed(allowed, name="permitted read still executes")
 
 
-@scenario("pe-014", PE, "A mislabelled action tries to unlock a tool")
-def mislabelled_action(arena: Arena) -> None:
+@scenario("pe-014", PE, "A mislabeled action tries to unlock a tool")
+def mislabeled_action(arena: Arena) -> None:
     staff = arena.start("kc-staff-nadine")
     for action in (Action.WRITE, Action.SPEND, Action.SEND):
         outcome = arena.call(
