@@ -72,6 +72,8 @@ class Provider:
     def __init__(self) -> None:
         self.seen: list[Seen] = []
         self.script = Script()
+        # When set, each request waits for it before being answered (at most 30 seconds).
+        self.hold: threading.Event | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -79,6 +81,8 @@ class Provider:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
                 outer.seen.append(Seen(self.command, self.path, list(self.headers.items()), body))
+                if outer.hold is not None:
+                    outer.hold.wait(30)
                 script = outer.script
                 self.send_response(script.status)
                 self.send_header("Content-Type", "application/json")

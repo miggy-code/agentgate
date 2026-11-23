@@ -24,6 +24,11 @@ by its version, so the rules behind any version an audit event names can be read
 (`agentgate audit policy`). A snapshot is written once and never replaced; its sha256 is
 also on the audit chain, in the `policy_loaded` event, so an edited snapshot shows.
 
+`run_limits` holds the caps a run was started with by a multi-run model proxy
+(`agentgate model-proxy server`), and `served_runs` which server instance (and process)
+started it. Both are written in the transaction that starts the run. A run with no
+`run_limits` row (one started any other way) is held to the caps of the process serving it.
+
 `Store(path, readonly=True)` opens an existing store read-only for commands that must not
 change it (`agentgate audit show`): no file is created or tightened, no schema is written.
 """
@@ -38,6 +43,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -88,6 +94,21 @@ CREATE TABLE IF NOT EXISTS policy_snapshots (
     sha256 TEXT NOT NULL,
     first_loaded_at TEXT NOT NULL
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS run_limits (
+    run_id TEXT PRIMARY KEY,
+    max_usd TEXT,
+    max_calls INTEGER
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS served_runs (
+    run_id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    started_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS served_runs_instance ON served_runs(instance_id);
 """
 
 
@@ -101,6 +122,24 @@ _SIDE_FILES = ("-journal", "-wal", "-shm")
 
 class StoreError(ValueError):
     """The path does not hold an agentgate store, or a row does not match the store."""
+
+
+@dataclass(frozen=True)
+class RunLimits:
+    """The caps a run was started with, as stored. None: not tightened on that count."""
+
+    max_usd: Decimal | None
+    max_calls: int | None
+
+
+@dataclass(frozen=True)
+class ServedRun:
+    """A run a multi-run model proxy started: which instance, in which process."""
+
+    run_id: str
+    instance_id: str
+    pid: int
+    started_at: datetime
 
 
 @dataclass(frozen=True)
@@ -387,6 +426,67 @@ class Store:
             ).fetchall()
             return [_snapshot(row) for row in rows]
 
+    def add_run_limits(self, run_id: str, limits: RunLimits) -> None:
+        """Store the caps a run starts with. Call it inside the run's starting transaction."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO run_limits (run_id, max_usd, max_calls) VALUES (?, ?, ?)",
+                (
+                    run_id,
+                    None if limits.max_usd is None else str(limits.max_usd),
+                    limits.max_calls,
+                ),
+            )
+
+    def get_run_limits(self, run_id: str) -> RunLimits | None:
+        """The caps a run was started with, or None for a run with no row (also for a store
+        from before run limits, opened read-only)."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT max_usd, max_calls FROM run_limits WHERE run_id = ?", (run_id,)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                if "run_limits" in _tables(self._conn):
+                    raise
+                return None
+        if row is None:
+            return None
+        raw = row["max_usd"]
+        return RunLimits(None if raw is None else Decimal(raw), row["max_calls"])
+
+    def add_served_run(self, served: ServedRun) -> None:
+        """Record which server instance started a run. Call it inside the run's starting
+        transaction."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO served_runs (run_id, instance_id, pid, started_at)"
+                " VALUES (?, ?, ?, ?)",
+                (served.run_id, served.instance_id, served.pid, served.started_at.isoformat()),
+            )
+
+    def get_served_run(self, run_id: str) -> ServedRun | None:
+        """Which server instance started a run, or None (also for a store from before served
+        runs, opened read-only)."""
+        with self._lock:
+            if "served_runs" not in _tables(self._conn):
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM served_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return None if row is None else _served_run(row)
+
+    def list_served_runs(self) -> list[ServedRun]:
+        """Every run a multi-run model proxy started, oldest first (empty for a store from
+        before served runs, opened read-only)."""
+        with self._lock:
+            if "served_runs" not in _tables(self._conn):
+                return []
+            rows = self._conn.execute(
+                "SELECT * FROM served_runs ORDER BY started_at, run_id"
+            ).fetchall()
+        return [_served_run(row) for row in rows]
+
     def get_customer(self, customer_id: str) -> Customer | None:
         with self._lock:
             row = self._conn.execute(
@@ -476,6 +576,15 @@ def _acl(row: sqlite3.Row) -> list[str] | None:
 def _acl_json(acl: frozenset[str] | None) -> str | None:
     # NULL (no source ACL) and "[]" (shared with nobody) mean different things; keep both.
     return None if acl is None else _sorted_json(acl)
+
+
+def _served_run(row: sqlite3.Row) -> ServedRun:
+    return ServedRun(
+        run_id=row["run_id"],
+        instance_id=row["instance_id"],
+        pid=row["pid"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+    )
 
 
 def _snapshot(row: sqlite3.Row) -> PolicySnapshot:

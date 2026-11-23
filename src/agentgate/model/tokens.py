@@ -9,7 +9,8 @@ as the store holds it, so what the run may do is still decided by the gate: the 
 user's status and the spend caps. A token is refused when:
 
 - it is unknown, expired or revoked;
-- it belongs to another run than the one the gateway serves;
+- it belongs to another run than the one the gateway serves, or, for a multi-run proxy
+  (`agentgate model-proxy server`), to a run that proxy did not start (`not_served`);
 - its run is unknown, or its user is unknown, of another customer or suspended.
 
 A token dies with its run. `end_run` revokes every token of a run, which a gateway serving
@@ -32,7 +33,7 @@ from agentgate.clock import Clock
 from agentgate.context import RunContext
 from agentgate.model.keys import PRESENTED_CREDENTIAL_HEADERS, TOKEN_PREFIX
 from agentgate.models import Role, UserStatus
-from agentgate.store import Store
+from agentgate.store import ServedRun, Store
 
 DEFAULT_TTL = timedelta(hours=8)
 MAX_TTL = timedelta(days=30)
@@ -74,6 +75,8 @@ class TokenReason(StrEnum):
     WRONG_RUN = "wrong_run"
     RUN_INVALID = "run_invalid"
     USER_SUSPENDED = "user_suspended"
+    # A multi-run proxy serves only the runs it started itself.
+    NOT_SERVED = "not_served"
     # Revocation reasons.
     OPERATOR = "operator"
     RUN_ENDED = "run_ended"
@@ -211,12 +214,20 @@ class TokenStore:
             record(revoked)
             return True
 
-    def end_run(self, run_id: str, *, record: Callable[[TokenRecord], None]) -> int:
+    def end_run(
+        self,
+        run_id: str,
+        *,
+        record: Callable[[TokenRecord], None],
+        ended: Callable[[], None] | None = None,
+    ) -> int:
         """Revoke every live token of a run, and return how many.
 
         `record` is required: it runs inside the transaction once for each token revoked, with
         the token as revoked, so a revocation that cannot be recorded is not made (if it
-        raises, no token of the run is revoked) and none is made unrecorded.
+        raises, no token of the run is revoked) and none is made unrecorded. `ended`, if
+        given, runs inside the same transaction after them, only when this call is the one
+        that ends the run (not for a run already ended).
         """
         with self._store.transaction():
             ids = [
@@ -232,16 +243,38 @@ class TokenStore:
                 " WHERE run_id = ? AND revoked_at IS NULL",
                 (self._clock.now().isoformat(), TokenReason.RUN_ENDED.value, run_id),
             )
-            self._store.connection.execute(
-                "INSERT OR IGNORE INTO ended_runs (run_id, ended_at) VALUES (?, ?)",
-                (run_id, self._clock.now().isoformat()),
+            first_end = (
+                self._store.connection.execute(
+                    "INSERT OR IGNORE INTO ended_runs (run_id, ended_at) VALUES (?, ?)",
+                    (run_id, self._clock.now().isoformat()),
+                ).rowcount
+                == 1
             )
             for token_id in ids:
                 revoked = self.get(token_id)
                 if revoked is None:
                     raise TokenError("a token disappeared while its run was ending")
                 record(revoked)
+            if first_end and ended is not None:
+                ended()
             return len(ids)
+
+    def live_served_runs(self, instance_id: str | None = None) -> list[ServedRun]:
+        """The runs a multi-run proxy started and nothing has ended yet, oldest first: those
+        of one server instance, or of every instance."""
+        with self._store.locked():
+            ended = {
+                str(row["run_id"])
+                for row in self._store.connection.execute(
+                    "SELECT run_id FROM ended_runs"
+                ).fetchall()
+            }
+            served = self._store.list_served_runs()
+        return [
+            run
+            for run in served
+            if run.run_id not in ended and instance_id in (None, run.instance_id)
+        ]
 
     def get(self, token_id: str) -> TokenRecord | None:
         with self._store.locked():

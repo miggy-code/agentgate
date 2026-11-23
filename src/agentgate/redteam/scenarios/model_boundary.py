@@ -12,6 +12,11 @@ Around that boundary: a run token binds an agent to one run and is refused once 
 the run or its user is no longer good; only its hash is stored. A provider key lives in the
 gateway process alone, and a client's own credentials never reach the provider.
 
+The multi-run proxy (`agentgate model-proxy server`, mb-026 to mb-029) serves many runs of a
+world from one process and starts them on a Unix control socket. Its scenarios start a real
+server on a file world, with an upstream that is never contacted, and decide its requests
+through its own run source (`ServedRuns`) as its hooks do.
+
 Everything here is in-process under both transports: the model gateway is not carried over
 MCP. The scenarios call `Gate.admit_model`, `TokenStore` and the key helpers directly, as the
 model proxy's hooks do. The Kettle Creek policy lists one model, deepseek-flash, for the
@@ -20,17 +25,20 @@ Row lists none.
 """
 
 import json
+import shutil
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from agentgate.audit.base import AuditEvent, EventKind, OperatorAction
 from agentgate.context import RunContext
-from agentgate.gate import UNKNOWN_CUSTOMER, CapReached, Denied, Gate
+from agentgate.gate import UNKNOWN_CUSTOMER, CapReached, Denied, Gate, IdentityError
 from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_model_call
+from agentgate.model.client import ControlClient, ControlError
 from agentgate.model.keys import (
     CLIENT_CREDENTIAL_HEADERS,
     Credential,
@@ -40,6 +48,8 @@ from agentgate.model.keys import (
     upstream_headers,
 )
 from agentgate.model.pricing import RateTable
+from agentgate.model.proxy import ProxySetupError
+from agentgate.model.server import MultiRunProxy, ServedRuns, ServerConfig
 from agentgate.model.tokens import (
     DEFAULT_TTL,
     IssuedToken,
@@ -73,20 +83,19 @@ MAX_BYTES = 120_000
 
 # A made-up price list: 0.28 USD per million output tokens and 0.14 per million prompt tokens.
 # At the limits of the envelope a call reserves 0.019040 USD.
-RATES = RateTable.from_dict(
-    {
-        "version": "redteam-rates",
-        "source": "made up for the red-team suite",
-        "currency": "USD",
-        "models": {
-            MODEL: {
-                "input_per_million": "0.14",
-                "cached_input_per_million": "0.014",
-                "output_per_million": "0.28",
-            }
-        },
-    }
-)
+RATES_TABLE: dict[str, object] = {
+    "version": "redteam-rates",
+    "source": "made up for the red-team suite",
+    "currency": "USD",
+    "models": {
+        MODEL: {
+            "input_per_million": "0.14",
+            "cached_input_per_million": "0.014",
+            "output_per_million": "0.28",
+        }
+    },
+}
+RATES = RateTable.from_dict(RATES_TABLE)
 WORST_CASE = Decimal("0.019040")
 # Dropped-connection calls that fit under DROP_CAP.
 DROP_CALLS = 3
@@ -1394,6 +1403,201 @@ def _customer(world: World) -> Customer:
     customer = world.store.get_customer(KC)
     assert customer is not None
     return customer
+
+
+# The multi-run proxy
+
+
+@contextmanager
+def _multi_run(
+    disk: FileWorlds, *, control_socket: Path | None = None
+) -> Iterator[tuple[World, MultiRunProxy]]:
+    """A multi-run proxy serving a durable file world. Its upstream is never contacted."""
+    world = disk.open(durable=True)
+    rates = disk.path("rates.json")
+    if not rates.exists():
+        rates.write_text(json.dumps(RATES_TABLE))
+    proxy = MultiRunProxy(
+        world,
+        ServerConfig(
+            upstreams={PROVIDER: "http://127.0.0.1:9"},
+            keys=ProviderKeys({PROVIDER: FAKE_KEYS[PROVIDER]}),
+            rate_table=rates,
+            control_socket=control_socket,
+            sweep_interval=timedelta(hours=1),
+        ),
+    )
+    proxy.start()
+    try:
+        yield world, proxy
+    finally:
+        proxy.stop()
+
+
+def _served_refusal(source: ServedRuns, token: str) -> str:
+    try:
+        return source.resolve(token).run_id
+    except TokenRejected as rejected:
+        return rejected.reason.value
+
+
+def _admit_served(world: World, source: ServedRuns, token: str, call: ModelCall) -> object:
+    ctx = source.resolve(token)
+    return world.gate.admit_model(ctx, call, rates=RATES, caps=source.caps(ctx))
+
+
+@scenario(
+    "mb-026",
+    MB,
+    "A multi-run proxy takes a token as its own run, whatever run the request names",
+)
+def served_token_binding(arena: Arena) -> None:
+    """Two runs served at once: run A's token, sent with run B's id as its correlation id,
+    is A's call and reserves on A alone. A token of a run on the same world that the server
+    did not start (a `serve` process's) is refused as `not_served`."""
+    with FileWorlds(arena) as disk, _multi_run(disk) as (world, proxy):
+        source = ServedRuns(proxy)
+        a = proxy.start_run(KC, STAFF)
+        b = proxy.start_run(KC, MANAGER)
+        arena.expect("A's token is run A", _served_refusal(source, a.token) == a.run.run_id)
+        outcome = _admit_served(world, source, a.token, _call(correlation_id=b.run.run_id))
+        reserved = _admitted(arena, outcome, "A's call naming run B is admitted as A's")
+        ledger = world.gate.ledger
+        arena.expect(
+            "the call is reserved on A, not on B",
+            (ledger.run_calls(a.run.run_id), ledger.run_calls(b.run.run_id)) == (1, 0),
+        )
+        if reserved is not None:
+            world.gate.finish_model(a.run, reserved, NEVER_SENT)
+
+        # A run started on the same world by another process, with its own token.
+        other = world.gate.start_run(KC, OWNER)
+        tokens = TokenStore(world.store, world.clock)
+        foreign = tokens.issue(
+            other.run_id,
+            record=lambda made: world.gate.record_token_event(
+                OperatorAction.TOKEN_ISSUED, made, customer_id=KC, actor=None
+            ),
+        )
+        arena.expect(
+            "another process's token is refused as not served",
+            _served_refusal(source, foreign.token) == TokenReason.NOT_SERVED.value,
+            _served_refusal(source, foreign.token),
+        )
+        arena.expect(
+            "nothing is reserved on the other process's run",
+            ledger.run_calls(other.run_id) == 0,
+        )
+
+
+@scenario("mb-027", MB, "A control socket reached through a symlinked path is refused")
+def symlinked_control_socket(arena: Arena) -> None:
+    """A planted symlink where the control socket's directory should be: the server refuses
+    to start there rather than create its socket in the link's target. And a host handed a
+    symlink to a control socket refuses to send it a request, so it cannot be pointed at a
+    server other than the one it started."""
+    base = Path(tempfile.mkdtemp(prefix="ag-rt-"))
+    try:
+        target = base / "target"
+        target.mkdir(mode=0o700)
+        planted = base / "ctl"
+        planted.symlink_to(target)
+        with FileWorlds(arena) as disk:
+            try:
+                with _multi_run(disk, control_socket=planted / "control.sock"):
+                    refused = "started"
+            except ProxySetupError:
+                refused = "refused"
+            arena.expect("the server refuses a symlinked socket directory", refused == "refused")
+            arena.expect("nothing is created in the link's target", not any(target.iterdir()))
+
+            with _multi_run(disk) as (_, proxy):
+                assert proxy.socket_path is not None
+                link = base / "control.sock"
+                link.symlink_to(proxy.socket_path)
+                try:
+                    with ControlClient(link) as client:
+                        client.start_run(KC, STAFF)
+                    answer = "started"
+                except ControlError as error:
+                    answer = error.reason
+                arena.expect(
+                    "a request through the symlink is refused", answer == "unsafe_socket", answer
+                )
+                arena.expect("no run is started", proxy.live_runs() == 0)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+@scenario("mb-028", MB, "A multi-run proxy refuses to start a run for another customer's user")
+def served_run_for_another_customer(arena: Arena) -> None:
+    """A host names Kettle Creek and a Juniper Row user, in-process and on the control
+    socket. The gate refuses and records it; no run, token or served run exists."""
+    with FileWorlds(arena) as disk, _multi_run(disk) as (world, proxy):
+        try:
+            proxy.start_run(KC, JR_OWNER)
+            reason = "started"
+        except IdentityError as refused:
+            reason = refused.reason
+        except TokenError:
+            # The run started, and only issuing its token failed.
+            reason = "started without a token"
+        arena.expect("the start is refused as wrong_customer", reason == "wrong_customer", reason)
+        assert proxy.socket_path is not None
+        try:
+            with ControlClient(proxy.socket_path) as client:
+                client.start_run(JR, STAFF)
+            answer = "started"
+        except ControlError as error:
+            answer = f"{error.status} {error.reason}"
+        arena.expect(
+            "the control socket answers 403 wrong_customer",
+            answer == "403 wrong_customer",
+            answer,
+        )
+        arena.expect("no run is served", proxy.live_runs() == 0)
+        arena.expect("no served run is stored", world.store.list_served_runs() == [])
+        denied = [
+            e.reason
+            for e in disk.events()
+            if e.kind is EventKind.DENY and e.reason == "wrong_customer"
+        ]
+        arena.expect("both refusals are recorded", len(denied) == 2, f"{denied}")
+        started = [e for e in disk.events() if e.kind is EventKind.RUN_STARTED]
+        arena.expect("no run start is recorded", started == [])
+
+
+@scenario("mb-029", MB, "A served run's caps tighten the policy's and a cap above it is ignored")
+def served_run_caps(arena: Arena) -> None:
+    """At 0.20 USD a full-envelope call, the policy's 0.50 per run admits two calls. A run
+    started with 999 USD and 1000 calls still gets two; one started with 0.20 gets one."""
+    with FileWorlds(arena) as disk, _multi_run(disk) as (world, proxy):
+        source = ServedRuns(proxy)
+        wide = proxy.start_run(KC, STAFF, caps=Caps(max_usd=Decimal("999"), max_calls=1000))
+        tight = proxy.start_run(KC, MANAGER, caps=Caps(max_usd=Decimal("0.20")))
+        arena.expect(
+            "the wide run's caps in effect are the policy's",
+            (wide.limits.per_run_usd, wide.limits.max_calls_per_run) == (Decimal("0.50"), 40),
+            f"{wide.limits}",
+        )
+        for started, allowed in ((wide, 2), (tight, 1)):
+            admitted: list[Reservation] = []
+            outcome: object = None
+            for _ in range(allowed + 2):
+                ctx = source.resolve(started.token)
+                outcome = world.gate.admit_model(
+                    ctx, _call(), rates=DEAR_RATES, caps=source.caps(ctx)
+                )
+                if not isinstance(outcome, Reservation):
+                    break
+                admitted.append(outcome)
+            name = started.run.user_id
+            arena.expect(
+                f"{name}'s run admits {allowed} calls", len(admitted) == allowed, f"{len(admitted)}"
+            )
+            _expect_cap(arena, outcome, "run_cap", name=f"{name}'s next call hits the run cap")
+            for reservation in admitted:
+                world.gate.finish_model(started.run, reservation, NEVER_SENT)
 
 
 # Benign control

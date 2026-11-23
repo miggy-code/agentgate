@@ -12,6 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Miguel Padilla" }]
 dependencies = [
+    "httpx>=0.28,<1",
     "mcp>=2.3,<3",
     "panoptes-observe[proxy]>=0.2.0,<0.4",
     "pydantic>=2.9,<3",

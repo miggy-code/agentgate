@@ -17,6 +17,7 @@ import yaml
 
 import agentgate.gate as gate_module
 import agentgate.model.admission as admission_module
+import agentgate.model.client as client_module
 import agentgate.model.keys as keys_module
 import agentgate.model.tokens as tokens_module
 import agentgate.redteam.scenarios.model_boundary as scenarios_module
@@ -24,6 +25,7 @@ from agentgate.gate import Gate
 from agentgate.model.admission import Caps, ModelExchange
 from agentgate.model.keys import KeyConfigError, ProviderKeys
 from agentgate.model.pricing import RateTable
+from agentgate.model.server import ServedRuns
 from agentgate.model.tokens import TokenStore
 from agentgate.policy.engine import PolicyEngine, Reason
 from agentgate.policy.schema import SpendLimits
@@ -58,6 +60,14 @@ def ids(*numbers: int) -> tuple[str, ...]:
 
 
 # Replacements
+
+
+def _no_served_caps(self: ServedRuns, run: Any) -> Caps | None:
+    return None
+
+
+def _any_socket(path: Path) -> None:
+    return None
 
 
 def _first_entry(self: PolicyEngine, provider: Any, model: str) -> Any:
@@ -491,7 +501,7 @@ MUTATIONS = [
         replace=((SpendLedger, "reserve", _ignore_limits),),
     ),
     Mutation("caps are ignored", ids(14, 15, 16), replace=((Caps, "tighten", _caps_ignored),)),
-    Mutation("caps can widen the policy", ids(15), replace=((Caps, "tighten", _caps_widen),)),
+    Mutation("caps can widen the policy", ids(15, 29), replace=((Caps, "tighten", _caps_widen),)),
     Mutation(
         "a fixed reserve replaces the computed worst case",
         ids(25),
@@ -645,6 +655,37 @@ MUTATIONS = [
         "no stale sweep",
         ids(21),
         replace=((SpendLedger, "release_stale", lambda self, older_than: 0),),
+    ),
+]
+
+
+MUTATIONS += [
+    # The multi-run proxy
+    Mutation(
+        "a multi-run proxy serves any run of its world",
+        ids(26),
+        edits=(
+            (
+                ServedRuns,
+                "resolve",
+                (("if not self._proxy.serves(ctx.run_id):", "if False:"),),
+            ),
+        ),
+    ),
+    Mutation(
+        "a served run's own caps are ignored",
+        ids(29),
+        replace=((ServedRuns, "caps", _no_served_caps),),
+    ),
+    Mutation(
+        "the client follows any socket path",
+        ids(27),
+        replace=((client_module, "check_control_socket", _any_socket),),
+    ),
+    Mutation(
+        "a run may start for another customer's user",
+        ids(28),
+        edits=((Gate, "start_run", (("if user.customer_id != customer_id:", "if False:"),)),),
     ),
 ]
 

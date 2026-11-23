@@ -12,7 +12,8 @@ the side-effect row a tool wrote (`effect_ref`), and for approval events the app
 `approval_args_hash`, so the store's approval row can be checked against the chain.
 POLICY_LOADED records each customer's policy version and the sha256 of its canonical bundle
 every time a world opens; OPERATOR_ACTION records fixture syncs, suspensions,
-reinstatements and stale spend sweeps, with `details.action` saying which.
+reinstatements, stale spend sweeps, run tokens issued and revoked, and runs a multi-run model
+proxy ended, with `details.action` saying which.
 
 A value a caller chose (a document id, an approval id, a tool name, a claimed run, user or
 customer) is kept on the event as given, so in-process checks can see what was asked. When
@@ -57,6 +58,9 @@ class OperatorAction(StrEnum):
     STALE_RESERVATIONS_RELEASED = "stale_reservations_released"
     TOKEN_ISSUED = "token_issued"
     TOKEN_REVOKED = "token_revoked"
+    # A multi-run model proxy ended a run it started: on request, at shutdown, or at the next
+    # start after the instance that started it died (`details.reason`).
+    RUN_ENDED = "run_ended"
 
 
 # The fields of an event that can hold a caller's value, and so can be referenced.
