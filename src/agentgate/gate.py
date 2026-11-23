@@ -361,7 +361,19 @@ class Gate:
 
     # Runs
 
-    def start_run(self, customer_id: str, user_id: str) -> RunContext:
+    def start_run(
+        self,
+        customer_id: str,
+        user_id: str,
+        *,
+        record: Callable[[RunContext], None] | None = None,
+    ) -> RunContext:
+        """Start a run for a user of a customer, or raise IdentityError (recorded).
+
+        `record`, if given, runs inside the transaction that stores the run, before the run's
+        start is recorded, so what it writes (a multi-run proxy's caps and ownership of the
+        run) exists exactly when the run does: if it raises, there is no run.
+        """
         engine = self._engines.get(customer_id)
         version = None if engine is None else engine.version
         call = _Call(
@@ -406,6 +418,8 @@ class Gate:
                     ctx.started_at.isoformat(),
                 ),
             )
+            if record is not None:
+                record(ctx)
             self._emit(
                 replace(call, run_id=ctx.run_id), EventKind.RUN_STARTED, GateReason.RUN_STARTED
             )
