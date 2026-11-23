@@ -4,8 +4,10 @@ Panoptes observes and forwards. `ModelGatewayHooks.before_forward` decides: it a
 request only if it is a POST to a generation endpoint, carries a live run token, and passes
 `Gate.admit_model` (policy, worst-case reservation, caps). It then swaps the client's
 credential for the provider's key. `after_exchange` ends the reservation by what happened to
-the call (`Gate.finish_model`). `ModelProxy` is the process around it: it starts the run,
-issues the one token, serves, sweeps stale reservations, and ends the run on shutdown.
+the call (`Gate.finish_model`). Which runs a token may name, and the caps each is held to,
+come from a `RunSource`: `SingleRun` for `ModelProxy`, the process around one run (it starts
+the run, issues the one token, serves, sweeps stale reservations, and ends the run on
+shutdown), and the multi-run source of `agentgate.model.server` for a proxy serving many.
 
 A client sees a status and a reason code, never a policy detail or a key.
 """
@@ -19,6 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Protocol
 
 from panoptes.db import AuditDB
 from panoptes.hooks import (
@@ -116,6 +119,34 @@ def generation_route(method: str, target: str) -> Route | None:
     return None
 
 
+class RunSource(Protocol):
+    """The runs a proxy serves: which run a presented token names, and its caps."""
+
+    def resolve(self, token: str | None) -> RunContext:
+        """The served run a token belongs to, as the store holds it, or TokenRejected."""
+        ...
+
+    def caps(self, run: RunContext) -> Caps | None:
+        """The caps a served run's model calls are held to, on top of the policy's."""
+        ...
+
+
+class SingleRun:
+    """One run, as `model-proxy serve` and `gateway serve --model-proxy` serve it: a token
+    of any other run is refused (`wrong_run`), and the process's caps apply."""
+
+    def __init__(self, tokens: TokenStore, run: RunContext, caps: Caps | None) -> None:
+        self._tokens = tokens
+        self._run = run
+        self._caps = caps
+
+    def resolve(self, token: str | None) -> RunContext:
+        return self._tokens.resolve(token, run_id=self._run.run_id)
+
+    def caps(self, run: RunContext) -> Caps | None:
+        return self._caps
+
+
 @dataclass
 class _Admitted:
     """What `before_forward` hands `after_exchange` through `exchange.state`."""
@@ -129,20 +160,18 @@ class ModelGatewayHooks(ProxyHooks):
         self,
         gate: Gate,
         tokens: TokenStore,
-        run: RunContext,
+        runs: RunSource,
         keys: ProviderKeys,
         rates: RateTable,
         providers: Mapping[str, ModelProvider],
-        caps: Caps | None = None,
     ) -> None:
         self._gate = gate
         self._tokens = tokens
-        self._run = run
+        self._runs = runs
         self._keys = keys
         self._rates = rates
         # The policy provider each wire protocol is served as.
         self._providers = dict(providers)
-        self._caps = caps
 
     def before_forward(self, exchange: Exchange) -> Reject | None:
         ex = exchange
@@ -170,7 +199,7 @@ class ModelGatewayHooks(ProxyHooks):
         # 4. The token, then the run and its user.
         try:
             token = presented_token(ex.request_headers.items(), ex.query_credentials)
-            ctx = self._tokens.resolve(token, run_id=self._run.run_id)
+            ctx = self._runs.resolve(token)
         except TokenRejected as refused:
             return self._token_refused(refused, ex)
         # 5. Everything that can raise happens before the reservation exists.
@@ -180,9 +209,10 @@ class ModelGatewayHooks(ProxyHooks):
         except (ValidationError, ValueError, TypeError, KeyError):
             return _reject(403, IDENTITY_REFUSED)
         ex.identity = identity
-        # 6. The decision, and the reservation it makes.
+        # 6. The decision, and the reservation it makes, under the run's caps as stored now.
         try:
-            admitted = self._gate.admit_model(ctx, call, rates=self._rates, caps=self._caps)
+            caps = self._runs.caps(ctx)
+            admitted = self._gate.admit_model(ctx, call, rates=self._rates, caps=caps)
         except Exception:
             log.exception("admit_model failed; the request is not forwarded")
             return _reject(503, UNAVAILABLE)
@@ -273,6 +303,63 @@ def check_rates(rates: RateTable, pricing: PricingTable, models: set[str]) -> No
                 raise ProxySetupError(f"model {name!r} has different {field} in the two tables")
 
 
+def check_upstreams(upstreams: Mapping[ModelProvider, str], keys: ProviderKeys) -> None:
+    """One upstream per wire protocol, at least one, and a key for each, or ProxySetupError."""
+    wires = [WIRE_OF[provider] for provider in upstreams]
+    if not upstreams or len(wires) != len(set(wires)):
+        raise ProxySetupError("serve one upstream per wire protocol, and at least one")
+    for provider in upstreams:
+        if not keys.has(provider):
+            raise ProxySetupError(f"no provider key for {provider.value}")
+
+
+def load_rates(path: Path, models: set[str]) -> tuple[RateTable, PricingTable]:
+    """The rate table read both ways, agreeing on every listed model, or ProxySetupError."""
+    try:
+        rates = RateTable.load(path)
+        pricing = PricingTable.load(str(path))
+        check_rates(rates, pricing, models)
+    except ValueError as exc:
+        raise ProxySetupError(str(exc)) from None
+    return rates, pricing
+
+
+def audit_db(world: World) -> AuditDB:
+    """The world's Panoptes audit log, which the proxy shares, or ProxySetupError."""
+    sink_db = world.sink.db if isinstance(world.sink, PanoptesSink) else None
+    if sink_db is None:
+        raise ProxySetupError("the model proxy needs a Panoptes audit log")
+    return sink_db
+
+
+def served_providers(upstreams: Mapping[ModelProvider, str]) -> dict[str, ModelProvider]:
+    """The policy provider each served wire protocol is served as."""
+    return {WIRE_OF[provider]: provider for provider in upstreams}
+
+
+def proxy_server(
+    host: str,
+    port: int,
+    hooks: ModelGatewayHooks,
+    db: AuditDB,
+    upstreams: Mapping[ModelProvider, str],
+    pricing: PricingTable,
+) -> ProxyServer:
+    """Panoptes' proxy with agentgate's hooks, writing to the world's audit chain."""
+    return ProxyServer(
+        host=host,
+        port=port,
+        hooks=hooks,
+        db=db,
+        chain=True,
+        upstreams={
+            WIRE_OF[provider]: Upstream(url, name=provider.value)
+            for provider, url in upstreams.items()
+        },
+        pricing=pricing,
+    )
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     # Origin of the upstream serving each policy provider (at most one per wire protocol).
@@ -341,16 +428,8 @@ class ModelProxy:
         }
         if not listed:
             raise ProxySetupError("the policy lists no model for the served providers")
-        try:
-            rates = RateTable.load(config.rate_table)
-            pricing = PricingTable.load(str(config.rate_table))
-            check_rates(rates, pricing, listed)
-        except ValueError as exc:
-            raise ProxySetupError(str(exc)) from None
-        sink_db = world.sink.db if isinstance(world.sink, PanoptesSink) else None
-        if sink_db is None:
-            raise ProxySetupError("the model proxy needs a Panoptes audit log")
-        return rates, pricing, sink_db, user
+        rates, pricing = load_rates(config.rate_table, listed)
+        return rates, pricing, audit_db(world), user
 
     def start(self, run: RunContext | None = None) -> int:
         """Validate, start (or join) the run, issue its token and serve."""
@@ -376,23 +455,13 @@ class ModelProxy:
             hooks = ModelGatewayHooks(
                 world.gate,
                 self._tokens,
-                ctx,
+                SingleRun(self._tokens, ctx, config.caps),
                 config.keys,
                 rates,
-                {WIRE_OF[provider]: provider for provider in config.upstreams},
-                config.caps,
+                served_providers(config.upstreams),
             )
-            self._server = ProxyServer(
-                host=config.host,
-                port=config.port,
-                hooks=hooks,
-                db=sink_db,
-                chain=True,
-                upstreams={
-                    WIRE_OF[provider]: Upstream(url, name=provider.value)
-                    for provider, url in config.upstreams.items()
-                },
-                pricing=pricing,
+            self._server = proxy_server(
+                config.host, config.port, hooks, sink_db, config.upstreams, pricing
             )
             self.port = self._server.start()
         except BaseException:
