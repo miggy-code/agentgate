@@ -65,6 +65,7 @@ from agentgate.model.admission import Caps
 from agentgate.model.keys import KeyConfigError, load_provider_keys
 from agentgate.model.pricing import RateTableError
 from agentgate.model.proxy import ProxyConfig
+from agentgate.model.server import DEFAULT_MAX_TOKEN_TTL
 from agentgate.model.tokens import (
     DEFAULT_TTL,
     MAX_TTL,
@@ -1590,8 +1591,9 @@ def _plain_decimal(value: Decimal) -> str:
     return "0" if value.is_zero() else format(value.normalize(), "f")
 
 
-def _remove_own_ready_file(path: Path, run_id: str, fd: int) -> None:
-    """Remove path only if it is still the file this process wrote for this run.
+def _remove_own_ready_file(path: Path, run_id: str, fd: int, *, key: str = "run_id") -> None:
+    """Remove path only if it is still the file this process wrote for this run (or, with
+    key, whatever the file names under that key).
 
     The file must be the one still open as fd since publishing and name this pid and run, so
     another process's replacement is left alone (see `unlink_if_same` for the remaining
@@ -1602,7 +1604,7 @@ def _remove_own_ready_file(path: Path, run_id: str, fd: int) -> None:
         if path.is_symlink():
             return
         info = json.loads(path.read_text(encoding="utf-8"))
-        if info.get("pid") == os.getpid() and info.get("run_id") == run_id:
+        if info.get("pid") == os.getpid() and info.get(key) == run_id:
             unlink_if_same(path, fd)
 
 
@@ -1628,6 +1630,118 @@ def _write_ready_file(path: Path, info: dict[str, JsonValue]) -> int:
     finally:
         with contextlib.suppress(OSError):
             temporary.unlink()
+
+
+@model_proxy_app.command("server")
+def model_proxy_server(
+    upstream: UpstreamOption,
+    rate_table: RateTableOption,
+    keys_file: Annotated[
+        Path, typer.Option("--keys-file", help="Owner-only JSON of provider keys (required).")
+    ],
+    host: Annotated[str, typer.Option("--host", help="Loopback address to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port to bind (0 picks a free one).")] = 0,
+    control_socket: Annotated[
+        Path | None,
+        typer.Option(
+            "--control-socket",
+            help="Path of the control socket. Its directory must not exist: it is created "
+            "0700 and removed on stop. Default: a new private temporary directory.",
+        ),
+    ] = None,
+    max_token_ttl: Annotated[
+        int,
+        typer.Option(
+            "--max-token-ttl",
+            min=1,
+            help="Longest lifetime of a run's token, in seconds, and its default.",
+        ),
+    ] = int(DEFAULT_MAX_TOKEN_TTL.total_seconds()),
+    ready_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--ready-file",
+            help="Once listening, write a new JSON file (mode 0600) with the model url, the "
+            "control socket, the pid and the instance id. Removed on stop.",
+        ),
+    ] = None,
+    db: DbOption = DEFAULT_DB,
+    audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
+    policies: PoliciesOption = DEFAULT_POLICIES,
+    fixtures: FixturesOption = DEFAULT_FIXTURES,
+) -> None:
+    """Serve model APIs for many runs of one world until interrupted.
+
+    A host on this machine starts and ends runs on the control socket (see
+    agentgate.model.client.ControlClient): each start returns the run's token, which its
+    client sends to the model url in place of a provider key. Only processes of the user
+    running the server can reach the socket. Each request is decided as with `model-proxy
+    serve`, under the caps its run was started with. Stopping (SIGTERM or an interrupt) drains
+    in-flight requests, then ends every run this server started and revokes their tokens.
+    Runs of a server that died are ended when the next one starts."""
+    from agentgate.model.proxy import ProxySetupError
+    from agentgate.model.server import MultiRunProxy, ServerConfig
+
+    if ready_file is not None and (ready_file.exists() or ready_file.is_symlink()):
+        _fail(f"--ready-file {ready_file} already exists")
+    if max_token_ttl > MAX_TTL.total_seconds():
+        _fail(f"--max-token-ttl is at most {int(MAX_TTL.total_seconds())} seconds")
+    base = _proxy_config(upstream, keys_file, rate_table, host=host, port=port)
+    config = ServerConfig(
+        upstreams=dict(base.upstreams),
+        keys=base.keys,
+        rate_table=rate_table,
+        host=host,
+        port=port,
+        control_socket=control_socket,
+        max_token_ttl=timedelta(seconds=max_token_ttl),
+    )
+    with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
+        server = MultiRunProxy(world, config)
+        try:
+            _, socket_path = server.start()
+        except ProxySetupError as exc:
+            _fail(str(exc))
+        except (OSError, RateTableError) as exc:
+            _fail(f"cannot start: {exc}")
+        ready_fd: int | None = None
+        try:
+            # As `serve`: SIGTERM ends the runs as an interrupt does, and is handled before
+            # the ready file exists.
+            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+            if server.recovered:
+                typer.echo(f"note: ended {server.recovered} runs of stopped servers", err=True)
+            typer.echo(
+                f"model proxy server {server.instance_id}: {server.model_url},"
+                f" control socket {socket_path}",
+                err=True,
+            )
+            if ready_file is not None:
+                info: dict[str, JsonValue] = {
+                    "model_url": server.model_url,
+                    "control_socket": str(socket_path),
+                    "pid": os.getpid(),
+                    "instance_id": server.instance_id,
+                }
+                try:
+                    ready_fd = _write_ready_file(ready_file, info)
+                except OSError as exc:
+                    _fail(f"cannot write {ready_file}: {exc.strerror}")
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                server.stop()
+            finally:
+                if ready_file is not None and ready_fd is not None:
+                    try:
+                        _remove_own_ready_file(
+                            ready_file, server.instance_id, ready_fd, key="instance_id"
+                        )
+                    finally:
+                        os.close(ready_fd)
 
 
 @app.command("init-experiment")

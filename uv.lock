@@ -704,6 +704,7 @@ name = "panoptes-agentgate"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "panoptes-observe", extra = ["proxy"] },
     { name = "pydantic" },
@@ -728,6 +729,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=1.0,<2" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "panoptes-observe", extras = ["proxy"], specifier = ">=0.2.0,<0.4" },
     { name = "pydantic", specifier = ">=2.9,<3" },
