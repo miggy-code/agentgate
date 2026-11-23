@@ -1449,7 +1449,7 @@ def _admit_served(world: World, source: ServedRuns, token: str, call: ModelCall)
 @scenario(
     "mb-026",
     MB,
-    "A multi-run proxy takes a token as its own run only, whatever run the request names",
+    "A multi-run proxy takes a token as its own run, whatever run the request names",
 )
 def served_token_binding(arena: Arena) -> None:
     """Two runs served at once: run A's token, sent with run B's id as its correlation id,
