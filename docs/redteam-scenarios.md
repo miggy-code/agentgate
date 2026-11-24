@@ -1,7 +1,7 @@
 # Red-team scenarios
 
 This page lists every scenario in the suite, by category. The list, the titles and the check counts come from the
-JSON report of `uv run agentgate redteam` at commit `c4a8422`: 177 scenarios and 1989 checks, all passed.
+JSON report of `uv run agentgate redteam` at commit `5f3a057`: 186 scenarios and 2055 checks, all passed.
 
 Each scenario runs in a new in-memory world, with the fixtures and policies in this repository. These are two
 fictional companies, Kettle Creek Heating & Air and Juniper Row Apothecary, with synthetic data. Some scenarios test
@@ -19,7 +19,7 @@ passed, and the leak detector found nothing. `pe-000` and `bn-000` are defined i
 | [prompt_injection_exfil](#prompt_injection_exfil) | 16 |
 | [approval_bypass](#approval_bypass) | 15 |
 | [spend_runaway](#spend_runaway) | 14 |
-| [identity_spoofing](#identity_spoofing) | 16 |
+| [identity_spoofing](#identity_spoofing) | 25 |
 | [fail_closed](#fail_closed) | 17 |
 | [audit_integrity](#audit_integrity) | 19 |
 | [model_boundary](#model_boundary) | 29 |
@@ -137,7 +137,7 @@ Loops, very large model bills and parallel runs try to get past the call limit, 
 
 ## identity_spoofing
 
-These scenarios try to act as someone else. They use forged or hand-built run contexts, users who were suspended, moved or given a new role, and roles claimed in model text or tool arguments.
+These scenarios try to act as someone else. They use forged or hand-built run contexts, users who were suspended, moved or given a new role, and roles claimed in model text or tool arguments. `id-017` to `id-025` attack a verified run start on a multi-run model proxy with a trust configuration: forged, borrowed and stretched identity assertions. Each of them first starts a run from a good assertion, so it cannot pass by refusing everything.
 
 | Id | Scenario | Checks |
 | --- | --- | ---: |
@@ -157,6 +157,15 @@ These scenarios try to act as someone else. They use forged or hand-built run co
 | id-014 | An object shaped like a run context, built by the caller | 4 |
 | id-015 | A user suspended through the CLI is refused on the live run's next call | 15 |
 | id-016 | A role change and a suspension in the fixtures take effect on reopen | 9 |
+| id-017 | An identity assertion with alg none is refused | 10 |
+| id-018 | HS256 signed with the issuer's public key (algorithm confusion) | 7 |
+| id-019 | An assertion whose kid names another issuer's key | 4 |
+| id-020 | A jku or x5u header pointing at the forger's own keys | 11 |
+| id-021 | A valid assertion for another audience | 7 |
+| id-022 | An expired assertion replayed after its use was pruned | 10 |
+| id-023 | A persona assertion naming a suspended user | 5 |
+| id-024 | An identity assertion over 8 KiB | 5 |
+| id-025 | An issuer URL that differs only by a trailing slash | 7 |
 
 ## fail_closed
 
