@@ -697,18 +697,53 @@ A call goes directly to the gate only when MCP cannot express it:
 
 Every benign_control scenario makes at least one MCP call. The suite's sessions use the MCP SDK's in-memory transport, with one gateway per run. A test covers the stdio launch (see [The MCP gateway](#the-mcp-gateway)).
 
+## Architecture
+
+The code has six layers. A module imports only from layers below its own. [import-linter](https://import-linter.readthedocs.io/) checks this in `make lint`, so CI fails on an import that goes the wrong way. The contracts are in `pyproject.toml`.
+
+| Layer | Packages | Role |
+| --- | --- | --- |
+| Entry points | `cli`, then `demo`, `redteam`, `experiment` | Commands and reports. Nothing imports them. |
+| Adapters | `gateway`, `model_proxy`, `agent` | Put the gate behind MCP or HTTP, or drive it with a model. |
+| Composition | `world` | Opens a store, fixtures, policies, an audit sink and a gate in one call. |
+| Gate | `gate` | Decides, records and runs every call. |
+| Services | `approvals`, `spend`, `tools`, `audit`, `model`, `retrieval`, `policy` | One job each. None of them knows about the gate. |
+| Foundation | `fixtures`, `store`, `context`, `clock`, `domain` | Data and the types everything shares. |
+
+The contract orders the packages inside a row too. For example, `tools` may import `retrieval`, and `retrieval` may import `policy`, but not the other way around.
+
+`model` holds what the gate needs to decide a model call: strict request reading, prices, run tokens and provider keys. `model_proxy` is the HTTP server in front of a provider. It uses the gate, so it sits two layers above `model`.
+
+### Inside the gate
+
+`Gate` is the whole interface of the `gate` package. A second import-linter contract stops any other package from importing the modules behind it. `Gate` builds these parts and passes each one the others it needs:
+
+| Module | Part | Job |
+| --- | --- | --- |
+| `recorder.py` | `AuditRecorder` | Writes every event. Records caller values as keyed references. |
+| `runs.py` | `RunRegistry` | Starts runs. Checks every call's run against the `runs` table. Tracks the max label. Reserves spend. |
+| `tool_calls.py` | `ToolCalls` | The tool-call steps, from argument validation to running the tool. |
+| `model_calls.py` | `ModelAdmission` | Admits model requests, and settles what they cost. |
+| `decisions.py` | `ApprovalDecisions` | Approve, reject and expire, each recorded in its own transaction. |
+| `operator_log.py` | `OperatorLog` | Policy loads, operator actions and the stale spend sweep. |
+| `outcomes.py` | | `Executed`, `Denied`, `PendingApproval`, `CapReached` and the gate's reason codes. |
+
+The tool path and the model path share the run check, the recorder and the spend reservation. So both paths fail closed in the same way.
+
 ## Project layout
 
 | Path | Contents |
 | --- | --- |
-| `src/agentgate/gate.py` | the gate: check, decide, record, then run every tool call |
+| `src/agentgate/gate/` | the gate: check, decide, record, then run every tool and model call (see [Inside the gate](#inside-the-gate)) |
+| `src/agentgate/domain.py` | domain types: customers, users, roles, tools, documents |
 | `src/agentgate/context.py` | `RunContext`, the identity of one run, created only by the gate |
 | `src/agentgate/policy/` | policy schema, engine (deny by default), `tests.yaml` runner, version hash |
 | `src/agentgate/policy/addresses.py` | the one recipient address rule, used by the engine, the gate and the email tool |
 | `src/agentgate/retrieval.py` | permission-aware search: filter, BM25F over the permitted set, check again |
 | `src/agentgate/approvals.py` | approval queue bound to tool, action and args hash |
 | `src/agentgate/spend.py` | spend ledger: calls and USD per run, USD per customer day |
-| `src/agentgate/model/` | model gateway: provider keys, run tokens, strict request reading and caps, rate tables and the worst-case reservation, the single-run proxy (`proxy.py`), the multi-run server and its control socket (`server.py`, `client.py`) |
+| `src/agentgate/model/` | model calls: provider keys, run tokens, strict request reading and caps, rate tables and the worst-case reservation |
+| `src/agentgate/model_proxy/` | the model proxy: one run (`proxy.py`), many runs and their control socket (`server.py`, `client.py`) |
 | `src/agentgate/audit/` | audit event type and keyed references, memory sink, Panoptes sink |
 | `src/agentgate/tools/` | tool adapter interface and the built-in tools |
 | `src/agentgate/agent/` | model protocol, reference agent loop, mock models, optional Anthropic adapter |
@@ -717,7 +752,8 @@ Every benign_control scenario makes at least one MCP call. The suite's sessions 
 | `src/agentgate/gateway/` | MCP gateway: one run per process, every tool call through the gate |
 | `src/agentgate/redteam/` | scenario registry, leak detector, file worlds, baseline check, reports, benchmark, MCP transport |
 | `src/agentgate/experiment.py` | `init-experiment`: a customer with one user and a models-only policy |
-| `src/agentgate/demo.py`, `cli.py` | `make demo` and the `agentgate` CLI |
+| `src/agentgate/demo.py` | `make demo` |
+| `src/agentgate/cli/` | the `agentgate` CLI, one module per command group |
 | `policies/` | one folder per customer: `policy.yaml`, `tools.yaml`, `tests.yaml` (`tools.yaml` is optional for a models-only policy) |
 | `fixtures/` | the synthetic customers, users and documents |
 | `redteam/baseline.json` | the scenarios that must exist and pass |
