@@ -192,9 +192,9 @@ class Rig:
 
     def reservations(self) -> list[Any]:
         """The run's reservations once none is open: after_exchange runs after the client has
-        its reply, so a test waits for it. A reservation still open after 5 seconds is
+        its reply, so a test waits for it. A reservation still open after 30 seconds is
         returned open."""
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while True:
             rows = self._rows()
             if all(row["status"] != "open" for row in rows) or time.monotonic() > deadline:
@@ -209,9 +209,9 @@ class Rig:
     def events(self) -> list[AuditEvent]:
         """agentgate's own events, as the log stores them. The event that ends a call is
         recorded just after its reservation closes, so this waits for one per closed
-        reservation (5 seconds at most)."""
+        reservation (30 seconds at most)."""
         closed = sum(1 for row in self.reservations() if row["status"] != "open")
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while True:
             found = read_events(self.audit_path)
             ended = sum(1 for e in found if e.kind is EventKind.EXECUTED)

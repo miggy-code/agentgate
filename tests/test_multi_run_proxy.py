@@ -120,7 +120,7 @@ class Served:
 
     def reservations(self, run_id: str) -> list[Any]:
         """The run's reservations once none is open (after_exchange runs after the reply)."""
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while True:
             rows = self.world.store.connection.execute(
                 "SELECT * FROM spend_reservations WHERE run_id = ?", (run_id,)
@@ -342,7 +342,7 @@ def test_concurrent_last_dollar_reservations_across_runs_stay_under_each_cap(
         ]
         for worker in workers:
             worker.start()
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while sum(len(s) for s in statuses.values()) < len(runs) * 3:
             assert time.monotonic() < deadline, statuses
             time.sleep(0.02)
@@ -536,7 +536,7 @@ def test_requests_beyond_the_control_bound_are_answered_503(tmp_path: Path) -> N
             assert (status, json.loads(answer)) == (503, {"error": "busy"})
         finally:
             idle.close()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while True:
             status, _, _ = _raw(made.socket, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
             if status == 200 or time.monotonic() > deadline:

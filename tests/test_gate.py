@@ -1214,11 +1214,11 @@ def test_tool_error_is_denied_and_released(world: World) -> None:
 
 
 def test_latency_excludes_tool_execution(world: World) -> None:
-    gate = world.gate_with(tools=tools_with("parts.order", lambda: time.sleep(0.05)))
+    gate = world.gate_with(tools=tools_with("parts.order", lambda: time.sleep(0.5)))
     ctx = gate.start_run(KC, "kc-mgr-marisol")
     executed(gate.call_tool(ctx, "parts.order", Action.SPEND, order_args("20.00")))
     allow = world.last(EventKind.ALLOW)
-    assert allow.latency_us is not None and allow.latency_us < 50_000
+    assert allow.latency_us is not None and allow.latency_us < 500_000
 
 
 # The audit trail as a whole

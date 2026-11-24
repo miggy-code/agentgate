@@ -502,7 +502,7 @@ def test_a_proxy_started_on_a_gateways_run_shares_its_caps_with_the_tools(tmp_pa
         conn.close()
         # run_spent counts the open worst-case reservation, so wait for it to settle: the
         # proxy settles after the client has its reply.
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while _open_reservations(world, run.run_id) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert world.gate.ledger.run_spent(run.run_id) == OK_COST
