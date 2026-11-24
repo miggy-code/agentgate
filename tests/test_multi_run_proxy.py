@@ -34,7 +34,12 @@ from agentgate.model.keys import ProviderKeys
 from agentgate.model.tokens import TokenStore
 from agentgate.model_proxy.client import ControlClient, ControlError
 from agentgate.model_proxy.proxy import ProxyConfig, ProxySetupError
-from agentgate.model_proxy.server import MultiRunProxy, ServedRuns, ServerConfig
+from agentgate.model_proxy.server import (
+    MAX_CONTROL_BODY,
+    MultiRunProxy,
+    ServedRuns,
+    ServerConfig,
+)
 from agentgate.policy.schema import ModelProvider
 from agentgate.store import Store
 from agentgate.world import World, open_world
@@ -489,7 +494,7 @@ def test_other_routes_methods_and_oversized_bodies_are_refused(tmp_path: Path) -
             (b"BREW /health HTTP/1.1\r\nHost: x\r\n\r\n", 405, "method_not_allowed"),
             (b"GET /admin HTTP/1.1\r\nHost: x\r\n\r\n", 404, "not_found"),
             (b"GET /runs/a/b/end HTTP/1.1\r\nHost: x\r\n\r\n", 404, "not_found"),
-            (_post(made.socket, "/runs", b"{" * 5000), 413, "body_too_large"),
+            (_post(made.socket, "/runs", b"{" * (MAX_CONTROL_BODY + 1)), 413, "body_too_large"),
             (b"GET /health HTTP/x\r\n\r\n", 400, "bad_request"),
             (b"garbage\r\n\r\n", 400, "bad_request"),
         ]

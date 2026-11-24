@@ -531,7 +531,13 @@ def _code_mutations() -> list[Mutation]:
                 (
                     AuditRecorder,
                     "identity_denied",
-                    (("self.emit(call, EventKind.DENY, reason, decision=True)", "pass"),),
+                    (
+                        (
+                            "self.emit(call, EventKind.DENY, reason, decision=True,"
+                            " details=details)",
+                            "pass",
+                        ),
+                    ),
                 ),
             ),
             breaks=("ai-010",),

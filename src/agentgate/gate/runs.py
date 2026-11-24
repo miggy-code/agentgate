@@ -1,7 +1,8 @@
 """Runs: who each run is, what it has seen, and what it may still spend.
 
 The model only proposes calls. Who is asking comes from a RunContext the gate created in
-`start` from an identity the host application already authenticated, and each call checks
+`start` from an identity the host application already authenticated (or that agentgate
+verified from a signed assertion, recorded as the run's assurance), and each call checks
 that context against the gate's own `runs` row and re-reads the user, so a hand-built or
 altered context, or a user suspended mid-run, is refused before anything else happens.
 
@@ -22,7 +23,7 @@ from pydantic import JsonValue
 
 from agentgate.audit.base import EventKind
 from agentgate.clock import Clock
-from agentgate.context import RunContext
+from agentgate.context import RunAssurance, RunContext
 from agentgate.domain import Action, Customer, Role, User, UserStatus
 from agentgate.gate._values import (
     TOOL_ID,
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS runs (
     user_id TEXT NOT NULL,
     role TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    max_label TEXT
+    max_label TEXT,
+    assurance TEXT
 ) STRICT
 """
 
@@ -86,6 +88,13 @@ class RunRegistry:
         self._clock = clock
         with store.locked():
             store.connection.execute(_SCHEMA)
+            columns = {
+                str(row[1])
+                for row in store.connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            if "assurance" not in columns:
+                # Runs stored before verified identity were all named by their host (NULL).
+                store.connection.execute("ALTER TABLE runs ADD COLUMN assurance TEXT")
 
     def start(
         self,
@@ -93,7 +102,9 @@ class RunRegistry:
         user_id: str,
         *,
         record: Callable[[RunContext], None] | None = None,
+        assurance: RunAssurance | None = None,
     ) -> RunContext:
+        details = _assurance_details(assurance)
         engine = self._engines.get(customer_id)
         version = None if engine is None else engine.version
         call = Call(
@@ -105,20 +116,26 @@ class RunRegistry:
         )
         user = get_user(self._store, user_id)
         if user is None:
-            self._recorder.identity_denied(call, GateReason.UNKNOWN_USER, "unknown user")
+            self._recorder.identity_denied(
+                call, GateReason.UNKNOWN_USER, "unknown user", details=details
+            )
         call = replace(call, claimed=frozenset({"customer_id"}))
         # Checked before status, so nothing about another customer's user is revealed.
         if user.customer_id != customer_id:
             self._recorder.identity_denied(
-                call, GateReason.WRONG_CUSTOMER, "user of another customer"
+                call, GateReason.WRONG_CUSTOMER, "user of another customer", details=details
             )
         # The user's own customer: from here every field names something the store knows.
         call = replace(call, role=user.role, claimed=frozenset())
         if user.status is not UserStatus.ACTIVE:
-            self._recorder.identity_denied(call, GateReason.SUSPENDED_USER, "user is suspended")
+            self._recorder.identity_denied(
+                call, GateReason.SUSPENDED_USER, "user is suspended", details=details
+            )
         customer = get_customer(self._store, customer_id)
         if engine is None or customer is None:
-            self._recorder.identity_denied(call, GateReason.NO_POLICY, "customer has no policy")
+            self._recorder.identity_denied(
+                call, GateReason.NO_POLICY, "customer has no policy", details=details
+            )
 
         ctx = RunContext(
             run_id=str(uuid.uuid4()),
@@ -130,22 +147,57 @@ class RunRegistry:
         # Recorded inside the transaction, so a run the audit log never saw does not exist.
         with self._store.transaction():
             self._store.connection.execute(
-                "INSERT INTO runs (run_id, customer_id, user_id, role, started_at, max_label)"
-                " VALUES (?, ?, ?, ?, ?, NULL)",
+                "INSERT INTO runs"
+                " (run_id, customer_id, user_id, role, started_at, max_label, assurance)"
+                " VALUES (?, ?, ?, ?, ?, NULL, ?)",
                 (
                     ctx.run_id,
                     ctx.customer_id,
                     ctx.user_id,
                     ctx.role.value,
                     ctx.started_at.isoformat(),
+                    None if assurance is None else assurance.label,
                 ),
             )
             if record is not None:
                 record(ctx)
             self._recorder.emit(
-                replace(call, run_id=ctx.run_id), EventKind.RUN_STARTED, GateReason.RUN_STARTED
+                replace(call, run_id=ctx.run_id),
+                EventKind.RUN_STARTED,
+                GateReason.RUN_STARTED,
+                details=details,
             )
         return ctx
+
+    def refuse_start(
+        self,
+        customer_id: str,
+        reason: str,
+        *,
+        user_id: str | None = None,
+        details: dict[str, JsonValue] | None = None,
+    ) -> None:
+        """Record a run start refused before any user was resolved: an identity assertion
+        that failed verification, or a host naming a user where an assertion is required.
+        The customer and user are recorded as claims (a reference unless the store knows
+        them); nothing is started."""
+        engine = self._engines.get(customer_id)
+        call = Call(
+            time.perf_counter_ns(),
+            customer_id,
+            user_id=user_id,
+            policy_version=None if engine is None else engine.version,
+            claimed=frozenset({"customer_id", "user_id"}),
+        )
+        self._recorder.emit(call, EventKind.DENY, reason, decision=True, details=details)
+
+    def assurance(self, run_id: str) -> str | None:
+        """The run's assurance (`verified:<issuer>`), or None for a host-named run."""
+        with self._store.locked():
+            row = self._store.connection.execute(
+                "SELECT assurance FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return None if row is None else row["assurance"]
 
     def max_label(self, run_id: str) -> str | None:
         with self._store.locked():
@@ -286,6 +338,16 @@ def bind(call: Call, run: CheckedRun) -> Call:
         policy_version=run.engine.version,
         claimed=frozenset(),
     )
+
+
+def _assurance_details(assurance: RunAssurance | None) -> dict[str, JsonValue] | None:
+    """What a verified run start, or its refusal, records about the verification."""
+    if assurance is None:
+        return None
+    details: dict[str, JsonValue] = {"assurance": assurance.label, "issuer": assurance.issuer}
+    if assurance.jti_ref is not None:
+        details["jti_ref"] = assurance.jti_ref
+    return details
 
 
 def _cap_details(hit: CapHit) -> dict[str, JsonValue]:

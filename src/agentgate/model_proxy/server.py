@@ -10,6 +10,12 @@ The control socket has no authentication of its own: its directory is created ne
 0700, and the socket is 0600, so only processes of the user running the server can reach it.
 That is the same trust as `--as` on the command line. There is no TCP control port.
 
+With a trust configuration (`--identity-config`, agentgate.identity) the host no longer names
+the user: it hands over a signed identity assertion, which the server verifies itself before
+it starts the run, and a start naming a user is refused as `assertion_required`. Every
+refused assertion is recorded with its reason code, never the assertion; a verified run is
+stored and recorded with its assurance, `verified:<issuer>`.
+
 The proxy serves only the runs it started. A token of any other run of the world (a `serve`
 process's, another server instance's) is refused as `not_served`. Each run is held to the
 caps it was started with, stored in `run_limits` in the transaction that starts it, which
@@ -37,14 +43,21 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
+import httpx
 from panoptes.db import AuditDB
 from panoptes.pricing import PricingTable
 from panoptes.proxy import ProxyServer
 
 from agentgate._json import no_duplicate_keys
 from agentgate.audit.base import OperatorAction
-from agentgate.context import RunContext
-from agentgate.gate import IdentityError
+from agentgate.context import RunAssurance, RunContext
+from agentgate.gate import UNKNOWN_CUSTOMER, IdentityError
+from agentgate.identity import (
+    AssertionReason,
+    AssertionRefused,
+    AssertionVerifier,
+    TrustConfig,
+)
 from agentgate.model.admission import Caps
 from agentgate.model.keys import ProviderKeys
 from agentgate.model.pricing import RateTable
@@ -74,8 +87,10 @@ log = logging.getLogger(__name__)
 DEFAULT_MAX_TOKEN_TTL = timedelta(hours=1)
 DEFAULT_CONTROL_WORKERS = 16
 SOCKET_NAME = "control.sock"
-# A control request is a few hundred bytes; anything far larger is not one.
-MAX_CONTROL_BODY = 4096
+# A control request is a few hundred bytes, or one identity assertion of at most 8 KiB;
+# anything far larger is not one. Room above 8 KiB, so an oversized assertion reaches the
+# verifier and is refused and recorded as malformed.
+MAX_CONTROL_BODY = 16 * 1024
 # How long a control connection may take to send its request.
 CONTROL_TIMEOUT_SECONDS = 10.0
 # How long stopping waits for in-flight control requests.
@@ -118,6 +133,11 @@ class ServerConfig:
     control_workers: int = DEFAULT_CONTROL_WORKERS
     lease: timedelta = DEFAULT_RESERVATION_LEASE
     sweep_interval: timedelta = SWEEP_INTERVAL
+    # The issuers whose assertions start runs. None: the host names the user (the U3 form,
+    # a demo identity as `--as` is).
+    identity: TrustConfig | None = None
+    # The HTTP client OIDC key fetches use (tests pass one with a fake transport).
+    identity_http: httpx.Client | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +199,10 @@ class MultiRunProxy:
         self.model_port = 0
         # Runs of dead instances this start ended.
         self.recovered = 0
+        self.verifier: AssertionVerifier | None = None
+        # Per OIDC issuer whose keys did not load at start: why. Its assertions are refused
+        # as issuer_unavailable until they load.
+        self.identity_problems: dict[str, str] = {}
 
     @property
     def model_url(self) -> str:
@@ -203,6 +227,13 @@ class MultiRunProxy:
         }
         if not listed:
             raise ProxySetupError("no customer's policy lists a model for the served providers")
+        if config.identity is not None:
+            for issuer in config.identity.issuers:
+                if issuer.customer not in self.world.engines:
+                    raise ProxySetupError(
+                        f"identity issuer {issuer.name!r}: customer {issuer.customer!r}"
+                        " has no policy in this world"
+                    )
         rates, pricing = load_rates(config.rate_table, listed)
         return rates, pricing, audit_db(self.world)
 
@@ -213,6 +244,18 @@ class MultiRunProxy:
             raise RuntimeError("the server has already been started")
         config = self._config
         rates, pricing, sink_db = self.validate()
+        if config.identity is not None:
+            self.verifier = AssertionVerifier(
+                config.identity,
+                self.world.store,
+                self.world.clock,
+                reference=self.world.gate.audit_reference,
+                http=config.identity_http,
+            )
+            loaded = self.verifier.load()
+            self.identity_problems = {
+                name: problem for name, problem in loaded.items() if problem is not None
+            }
         self.recovered = self._end_dead_instances()
         socket_path = self._make_socket_dir()
         try:
@@ -234,6 +277,7 @@ class MultiRunProxy:
         except BaseException:
             self._close_listeners()
             self._remove_socket()
+            self._close_verifier()
             raise
         self._control_thread = threading.Thread(
             target=self._control.serve_forever, name="model-proxy-control", daemon=True
@@ -252,6 +296,11 @@ class MultiRunProxy:
         with self._lock:
             return len(self._live)
 
+    @property
+    def verifies_identity(self) -> bool:
+        """Whether runs start only from a verified assertion (`--identity-config`)."""
+        return self._config.identity is not None
+
     def start_run(
         self,
         customer_id: str,
@@ -259,14 +308,60 @@ class MultiRunProxy:
         ttl: timedelta | None = None,
         caps: Caps | None = None,
     ) -> StartedRun:
-        """Start a run for a user of a customer and issue its one token.
+        """Start a run for a user the host names, and issue its one token.
 
         The gate starts the run, so an unknown, suspended or other customer's user is
         refused (IdentityError) and the refusal is recorded. The caps are stored with the
         run and only tighten the policy's; the token's lifetime is at most the server's.
+
+        A server that verifies identity refuses this, as `assertion_required` (recorded):
+        use start_verified_run.
         """
         if self._stopping.is_set():
             raise ServerStopping("the server is stopping")
+        if self.verifies_identity:
+            self.world.gate.refuse_run_start(
+                customer_id,
+                ASSERTION_REQUIRED,
+                user_id=user_id,
+                details={"verification": "assertion"},
+            )
+            raise IdentityError(ASSERTION_REQUIRED, "this server starts runs from assertions")
+        return self._start(customer_id, user_id, ttl, caps, None)
+
+    def start_verified_run(
+        self, assertion: object, ttl: timedelta | None = None, caps: Caps | None = None
+    ) -> StartedRun:
+        """Verify an identity assertion, then start a run for the user it names in the
+        issuer's customer, as start_run does. The run is stored and recorded as
+        `verified:<issuer>`.
+
+        A refused assertion raises IdentityError with its reason code (AssertionReason),
+        recorded with the issuer and a reference to its jti, never the assertion. A server
+        without a trust configuration trusts no issuer: `issuer_unknown`."""
+        if self._stopping.is_set():
+            raise ServerStopping("the server is stopping")
+        try:
+            if self.verifier is None:
+                raise AssertionRefused(AssertionReason.ISSUER_UNKNOWN)
+            subject = self.verifier.verify(assertion)
+        except AssertionRefused as refused:
+            self.world.gate.refuse_run_start(
+                refused.customer_id or UNKNOWN_CUSTOMER,
+                refused.reason.value,
+                details=refused.details(),
+            )
+            raise IdentityError(refused.reason.value, "identity assertion refused") from None
+        return self._start(subject.customer_id, subject.user_id, ttl, caps, subject.assurance)
+
+    def _start(
+        self,
+        customer_id: str,
+        user_id: str,
+        ttl: timedelta | None,
+        caps: Caps | None,
+        assurance: RunAssurance | None,
+    ) -> StartedRun:
         config = self._config
         ttl = config.max_token_ttl if ttl is None else min(ttl, config.max_token_ttl)
         if ttl <= timedelta(0):
@@ -281,7 +376,7 @@ class MultiRunProxy:
                 ServedRun(ctx.run_id, self.instance_id, os.getpid(), ctx.started_at)
             )
 
-        ctx = self.world.gate.start_run(customer_id, user_id, record=record)
+        ctx = self.world.gate.start_run(customer_id, user_id, record=record, assurance=assurance)
         with self._lock:
             self._live[ctx.run_id] = ctx
             closed = self._closed
@@ -337,8 +432,14 @@ class MultiRunProxy:
                         log.exception("could not end a run at shutdown")
             finally:
                 self._remove_socket()
+                self._close_verifier()
                 if self._sweeper is not None:
                     self._sweeper.join(timeout=5)
+
+    def _close_verifier(self) -> None:
+        verifier, self.verifier = self.verifier, None
+        if verifier is not None:
+            verifier.close()
 
     def _close_listeners(self) -> None:
         control, self._control = self._control, None
@@ -465,6 +566,10 @@ def _secure_socket(path: Path, directory: Path | None) -> None:
         raise ProxySetupError(f"{path} is not the control socket")
 
 
+# The reason a start naming a user is refused by a server that verifies identity.
+ASSERTION_REQUIRED = "assertion_required"
+
+
 # The control listener
 
 
@@ -526,7 +631,9 @@ def _answer_busy(request: socket.socket) -> None:
 
 
 _END_ROUTE = re.compile(r"/runs/(?P<run_id>[^/]+)/end")
-_START_FIELDS = frozenset({"customer_id", "user_id", "ttl_seconds", "max_usd", "max_calls"})
+_CAP_FIELDS = frozenset({"ttl_seconds", "max_usd", "max_calls"})
+_START_FIELDS = frozenset({"customer_id", "user_id"}) | _CAP_FIELDS
+_VERIFIED_START_FIELDS = frozenset({"assertion"}) | _CAP_FIELDS
 
 
 class _BadRequest(Exception):
@@ -601,11 +708,20 @@ class _ControlHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _start(self, body: bytes) -> None:
-        customer_id, user_id, ttl, caps = _start_request(body)
+        request = _start_request(body)
+        proxy = self.server.proxy
         try:
-            started = self.server.proxy.start_run(customer_id, user_id, ttl, caps)
+            if isinstance(request, _VerifiedStart):
+                started = proxy.start_verified_run(request.assertion, request.ttl, request.caps)
+            else:
+                started = proxy.start_run(
+                    request.customer_id, request.user_id, request.ttl, request.caps
+                )
         except IdentityError as refused:
-            self._send(403, {"error": refused.reason})
+            # An issuer whose keys cannot be fetched is the server's problem, not the
+            # caller's: worth a retry later.
+            status = 503 if refused.reason == AssertionReason.ISSUER_UNAVAILABLE else 403
+            self._send(status, {"error": refused.reason})
             return
         limits = started.limits
         self._send(
@@ -656,14 +772,39 @@ class _ControlHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _start_request(body: bytes) -> tuple[str, str, timedelta | None, Caps | None]:
-    """The fields of a `POST /runs` body, read strictly, or _BadRequest with a reason."""
+@dataclass(frozen=True)
+class _NamedStart:
+    customer_id: str
+    user_id: str
+    ttl: timedelta | None
+    caps: Caps
+
+
+@dataclass(frozen=True)
+class _VerifiedStart:
+    # Handed to the verifier as sent, whatever its type: it decides and records.
+    assertion: object
+    ttl: timedelta | None
+    caps: Caps
+
+    def __repr__(self) -> str:
+        return f"_VerifiedStart(ttl={self.ttl!r}, caps={self.caps!r})"
+
+
+def _start_request(body: bytes) -> _NamedStart | _VerifiedStart:
+    """A `POST /runs` body, read strictly, or _BadRequest with a reason: an assertion, or a
+    customer and user named by the host, and the optional caps."""
     try:
         data = json.loads(body.decode("utf-8"), object_pairs_hook=no_duplicate_keys)
     except (UnicodeDecodeError, ValueError):
         raise _BadRequest("invalid_json") from None
     if not isinstance(data, dict):
         raise _BadRequest("invalid_json")
+    if "assertion" in data:
+        if set(data) - _VERIFIED_START_FIELDS:
+            raise _BadRequest("unknown_field")
+        ttl, caps = _caps(data)
+        return _VerifiedStart(data["assertion"], ttl, caps)
     if set(data) - _START_FIELDS:
         raise _BadRequest("unknown_field")
     if "customer_id" not in data or "user_id" not in data:
@@ -672,6 +813,11 @@ def _start_request(body: bytes) -> tuple[str, str, timedelta | None, Caps | None
     for value in (customer_id, user_id):
         if not isinstance(value, str) or not 0 < len(value) <= _MAX_ID_LENGTH:
             raise _BadRequest("invalid_field")
+    ttl, caps = _caps(data)
+    return _NamedStart(customer_id, user_id, ttl, caps)
+
+
+def _caps(data: dict[str, Any]) -> tuple[timedelta | None, Caps]:
     ttl = None
     if (seconds := data.get("ttl_seconds")) is not None:
         if not _positive_int(seconds):
@@ -693,7 +839,7 @@ def _start_request(body: bytes) -> tuple[str, str, timedelta | None, Caps | None
         caps = Caps(max_usd=max_usd, max_calls=max_calls)
     except (TypeError, ValueError):
         raise _BadRequest("invalid_field") from None
-    return customer_id, user_id, ttl, caps
+    return ttl, caps
 
 
 def _positive_int(value: object) -> bool:

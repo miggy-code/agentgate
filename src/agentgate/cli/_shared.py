@@ -69,9 +69,10 @@ def open_cli_world(
     *,
     reservation_lease: timedelta | None = DEFAULT_RESERVATION_LEASE,
     record_open: OpenRecord = OpenRecord.ALL,
+    identity_note: str = DEMO_IDENTITY_NOTE,
 ) -> Iterator[World]:
     # Printed before anything else, so even a failing command says it once.
-    typer.echo(DEMO_IDENTITY_NOTE, err=True)
+    typer.echo(identity_note, err=True)
     try:
         world = open_world(
             db_path=db,

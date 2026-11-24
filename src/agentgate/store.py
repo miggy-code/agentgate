@@ -29,6 +29,11 @@ also on the audit chain, in the `policy_loaded` event, so an edited snapshot sho
 started it. Both are written in the transaction that starts the run. A run with no
 `run_limits` row (one started any other way) is held to the caps of the process serving it.
 
+`used_assertions` holds the single-use identity assertions a run was started with
+(agentgate.identity): the issuer's name, the sha256 of the assertion's `jti` (never the
+assertion) and when it expires. A row is pruned once its assertion could no longer pass the
+time check, so a replay after that is refused as expired rather than as replayed.
+
 `Store(path, readonly=True)` opens an existing store read-only for commands that must not
 change it (`agentgate audit show`): no file is created or tightened, no schema is written.
 """
@@ -109,6 +114,13 @@ CREATE TABLE IF NOT EXISTS served_runs (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS served_runs_instance ON served_runs(instance_id);
+
+CREATE TABLE IF NOT EXISTS used_assertions (
+    issuer TEXT NOT NULL,
+    jti_sha256 TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer, jti_sha256)
+) STRICT;
 """
 
 
@@ -486,6 +498,35 @@ class Store:
                 "SELECT * FROM served_runs ORDER BY started_at, run_id"
             ).fetchall()
         return [_served_run(row) for row in rows]
+
+    def use_assertion(
+        self, issuer: str, jti_sha256: str, expires_at: int, *, prune_before: int
+    ) -> bool:
+        """Record a single-use assertion as used. Returns False if it was used already.
+
+        In one transaction: rows expiring before `prune_before` (epoch seconds) are deleted,
+        then this one is inserted unless the issuer already has it, so two requests racing
+        with one assertion cannot both use it."""
+        with self.transaction():
+            self._conn.execute("DELETE FROM used_assertions WHERE expires_at < ?", (prune_before,))
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO used_assertions (issuer, jti_sha256, expires_at)"
+                " VALUES (?, ?, ?)",
+                (issuer, jti_sha256, expires_at),
+            )
+            return cursor.rowcount == 1
+
+    def users_by_email(self, customer_id: str, email: str) -> list[User]:
+        """The customer's users whose email is this one, with ASCII letters compared
+        lowercased. Only ASCII is folded (SQLite's lower(), on both sides): Python's
+        str.lower() would fold a KELVIN SIGN to "k", so a look-alike address at an identity
+        provider would name a user whose address it is not."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM users WHERE customer_id = ? AND lower(email) = lower(?) ORDER BY id",
+                (customer_id, email),
+            ).fetchall()
+            return [_user(row) for row in rows]
 
     def get_customer(self, customer_id: str) -> Customer | None:
         with self._lock:

@@ -16,6 +16,7 @@ dependencies = [
     "mcp>=2.3,<3",
     "panoptes-observe[proxy]>=0.2.0,<0.4",
     "pydantic>=2.9,<3",
+    "pyjwt[crypto]>=2.10,<3",
     "pyyaml>=6,<7",
     "typer>=0.12,<1",
 ]
@@ -61,6 +62,9 @@ files = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "keycloak: needs a Keycloak with the test realm (AGENTGATE_KEYCLOAK_URL); skipped without it",
+]
 
 # The architecture, enforced: a module may import only from layers below its own. `|` marks
 # siblings that may not import each other; `:` siblings may.
@@ -77,7 +81,7 @@ layers = [
     "agentgate.agent",
     "agentgate.world",
     "agentgate.gate",
-    "agentgate.approvals | agentgate.spend | agentgate.tools | agentgate.audit | agentgate.model",
+    "agentgate.approvals | agentgate.spend | agentgate.tools | agentgate.audit | agentgate.model | agentgate.identity",
     "agentgate.retrieval",
     "agentgate.policy",
     "agentgate.fixtures",

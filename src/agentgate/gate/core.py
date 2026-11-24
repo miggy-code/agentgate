@@ -19,7 +19,7 @@ from pydantic import JsonValue
 from agentgate.approvals import Approval, ApprovalQueue
 from agentgate.audit.base import AuditSink, OperatorAction
 from agentgate.clock import Clock
-from agentgate.context import RunContext
+from agentgate.context import RunAssurance, RunContext
 from agentgate.domain import Action, User
 from agentgate.gate.decisions import ApprovalDecisions
 from agentgate.gate.model_calls import ModelAdmission
@@ -128,14 +128,40 @@ class Gate:
         user_id: str,
         *,
         record: Callable[[RunContext], None] | None = None,
+        assurance: RunAssurance | None = None,
     ) -> RunContext:
         """Start a run for a user of a customer, or raise IdentityError (recorded).
 
         `record`, if given, runs inside the transaction that stores the run, before the run's
         start is recorded, so what it writes (a multi-run proxy's caps and ownership of the
         run) exists exactly when the run does: if it raises, there is no run.
+
+        `assurance`, for a user agentgate verified from a signed assertion, is stored on the
+        run (`verified:<issuer>`) and recorded on its start, or on its refusal, with the
+        issuer and the reference to the assertion's jti. The checks are the same either way.
         """
-        return self._runs.start(customer_id, user_id, record=record)
+        return self._runs.start(customer_id, user_id, record=record, assurance=assurance)
+
+    def refuse_run_start(
+        self,
+        customer_id: str,
+        reason: str,
+        *,
+        user_id: str | None = None,
+        details: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        """Record a run start refused before the gate resolved a user: an identity assertion
+        that failed verification (agentgate.identity reason codes), or a user named where a
+        verified assertion is required. `details` holds identifiers and references only,
+        never the assertion. Raises if not recorded."""
+        self._runs.refuse_start(
+            customer_id, reason, user_id=user_id, details=None if details is None else dict(details)
+        )
+
+    def run_assurance(self, run_id: str) -> str | None:
+        """How the run's user was identified: `verified:<issuer>`, or None when the host
+        named the user."""
+        return self._runs.assurance(run_id)
 
     def run_max_label(self, run_id: str) -> str | None:
         """The most sensitive label returned to the model in this run, or None."""

@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
+import httpx
+import jwt
 import pytest
 from pydantic import ConfigDict
 
@@ -16,6 +18,7 @@ from agentgate.domain import Action, Document, Role, User, UserStatus
 from agentgate.fixtures import FixtureSync
 from agentgate.gate import Gate
 from agentgate.gate.runs import CheckedRun
+from agentgate.identity import verify as verify_module
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Conditions, Effect, LabelBound, PolicyBundle, Rule
 from agentgate.redteam.core import (
@@ -485,6 +488,135 @@ def _rebuild_per_note(self: DocumentIndex, document: Document) -> None:
     self.rebuild()
 
 
+# Verified run starts (id-017 to id-025): each removes one step of assertion verification.
+
+_VERIFIER = verify_module.AssertionVerifier
+_REAL_GET_USER = Store.get_user
+
+
+def _active_get_user(self: Store, user_id: str) -> User | None:
+    user = _REAL_GET_USER(self, user_id)
+    return None if user is None else user.model_copy(update={"status": UserStatus.ACTIVE})
+
+
+def _key_from_jku(header: dict[str, Any]) -> jwt.PyJWK | None:
+    """What a verifier that trusted the token's own key URL would use."""
+    url = header.get("jku")
+    if not isinstance(url, str):
+        return None
+    for key in httpx.get(url, timeout=5).json()["keys"]:
+        if key.get("kid") == header.get("kid"):
+            return jwt.PyJWK(key, algorithm=str(header["alg"]))
+    return None
+
+
+def _verifier_edit(attribute: str, *edits: tuple[str, str]) -> tuple[Any, str, Any]:
+    return (_VERIFIER, attribute, edits)
+
+
+VERIFIED_START_MUTATIONS = [
+    Mutation(
+        "any algorithm the header names",
+        ("id-017",),
+        edits=(
+            _verifier_edit(
+                "verify",
+                (
+                    "if not _acceptable(algorithm) or algorithm not in issuer.algorithms:",
+                    "if False:",
+                ),
+            ),
+        ),
+    ),
+    Mutation(
+        "no refusal of HMAC or none",
+        ("id-018",),
+        replace=((verify_module, "_acceptable", lambda algorithm: isinstance(algorithm, str)),),
+    ),
+    Mutation(
+        "keys of every issuer",
+        ("id-019",),
+        edits=(
+            _verifier_edit(
+                "_key",
+                (
+                    "jwk = self._signed.get(issuer.name, {}).get(kid)",
+                    "jwk = next((k[kid] for k in self._signed.values() if kid in k), None)",
+                ),
+            ),
+        ),
+    ),
+    Mutation(
+        "keys from the token's jku",
+        ("id-020",),
+        edits=(
+            _verifier_edit(
+                "verify",
+                (
+                    'key = self._key(issuer, header.get("kid"), algorithm)',
+                    "key = _key_from_jku(header)"
+                    ' or self._key(issuer, header.get("kid"), algorithm)',
+                ),
+            ),
+        ),
+        names={"_key_from_jku": _key_from_jku},
+    ),
+    Mutation(
+        "no audience check",
+        ("id-021",),
+        edits=(
+            _verifier_edit(
+                "verify",
+                ('if not _audience_contains(claims.get("aud"), issuer.audience):', "if False:"),
+            ),
+        ),
+    ),
+    Mutation(
+        "no expiry check",
+        ("id-022",),
+        edits=(
+            _verifier_edit("_check_times", ("if expires <= now - LEEWAY_SECONDS:", "if False:")),
+        ),
+        must_fail="the replay after pruning",
+    ),
+    Mutation(
+        "a verified start ignores suspension",
+        ("id-023",),
+        replace=((Store, "get_user", _active_get_user),),
+    ),
+    Mutation(
+        "no size limit on an assertion",
+        ("id-024",),
+        edits=(
+            (
+                verify_module,
+                "_shape",
+                (('len(token.encode("utf-8")) > MAX_ASSERTION_BYTES', "False"),),
+            ),
+        ),
+    ),
+    Mutation(
+        "issuers matched without a trailing slash",
+        ("id-025",),
+        edits=(
+            _verifier_edit(
+                "verify",
+                (
+                    "issuer = self._issuers.get(named) if isinstance(named, str) else None",
+                    'issuer = self._issuers.get(named.rstrip("/")) if isinstance(named, str)'
+                    " else None",
+                ),
+                (
+                    'if claims.get("iss") != issuer.issuer:',
+                    'if str(claims.get("iss")).rstrip("/") != issuer.issuer:',
+                ),
+            ),
+        ),
+        must_fail="iss with a slash",
+    ),
+]
+
+
 def _by_protection() -> list[Mutation]:
     breaks: dict[WorldMutation, list[str]] = {}
     for scenario_id, protections in PROTECTIONS.items():
@@ -495,6 +627,7 @@ def _by_protection() -> list[Mutation]:
 
 MUTATIONS = [
     *_by_protection(),
+    *VERIFIED_START_MUTATIONS,
     Mutation(
         "suspension leaves the user active",
         ("id-015",),

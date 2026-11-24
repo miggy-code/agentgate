@@ -1,7 +1,7 @@
 """The agentgate command line: policy lint and test, the audit log, the approval queue,
-users, the spend ledger, model-proxy run tokens, the demo, one-off agent runs, the MCP
-gateway, the model proxy, the red-team suite and the latency bench. One module per command
-group; this one assembles them.
+users, the spend ledger, model-proxy run tokens, identity keys and trust configurations, the
+demo, one-off agent runs, the MCP gateway, the model proxy, the red-team suite and the latency
+bench. One module per command group; this one assembles them.
 
 Output is plain, deterministic text (customers sorted, cases in file order, no colour), so
 it reads the same in a terminal, a CI log and a diff. Problems that stop a command go to
@@ -25,6 +25,7 @@ from agentgate.cli import (
     approvals,
     audit,
     gateway,
+    identity,
     model_proxy,
     policy,
     redteam,
@@ -52,6 +53,7 @@ app.add_typer(spend.spend_app, name="spend")
 app.add_typer(tokens.token_app, name="token")
 app.add_typer(model_proxy.model_proxy_app, name="model-proxy")
 app.add_typer(model_proxy.doctor_app, name="doctor")
+app.add_typer(identity.identity_app, name="identity")
 app.command("demo")(agent.demo)
 app.command("init-experiment")(model_proxy.init_experiment)
 app.command("redteam")(redteam.redteam)

@@ -102,8 +102,15 @@ class AuditRecorder:
         """The reference the durable audit log stores for this value in place of it."""
         return _reference(self._key, value)
 
-    def identity_denied(self, call: Call, reason: GateReason, message: str) -> NoReturn:
-        self.emit(call, EventKind.DENY, reason, decision=True)
+    def identity_denied(
+        self,
+        call: Call,
+        reason: GateReason,
+        message: str,
+        *,
+        details: dict[str, JsonValue] | None = None,
+    ) -> NoReturn:
+        self.emit(call, EventKind.DENY, reason, decision=True, details=details)
         raise IdentityError(reason.value, message)
 
     def deny(
