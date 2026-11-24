@@ -13,11 +13,11 @@ from decimal import Decimal
 
 import pytest
 
-from agentgate import gate as gate_module
 from agentgate.approvals import Approval, ApprovalError, ApprovalQueue, ApprovalStatus
 from agentgate.context import RunContext
-from agentgate.gate import Gate
-from agentgate.models import User
+from agentgate.domain import User
+from agentgate.gate import tool_calls as tool_calls_module
+from agentgate.gate.tool_calls import ToolCalls
 from agentgate.policy import addresses
 from agentgate.policy import engine as engine_module
 from agentgate.policy.engine import PolicyEngine
@@ -156,10 +156,10 @@ def lenient_parser(arena: Arena, monkeypatch: pytest.MonkeyPatch) -> None:
 def no_write_down(arena: Arena, monkeypatch: pytest.MonkeyPatch) -> None:
     """The gate decides a note write by policy alone, without its write-down check."""
 
-    def verdict(self: Gate, run: object, prepared: object) -> object:
-        max_label = self.run_max_label(run.ctx.run_id)  # type: ignore[attr-defined]
+    def verdict(self: ToolCalls, run: object, prepared: object) -> object:
+        max_label = self._runs.max_label(run.ctx.run_id)  # type: ignore[attr-defined]
         decision = run.engine.decide(  # type: ignore[attr-defined]
-            gate_module._request(
+            tool_calls_module._request(
                 run,  # type: ignore[arg-type]
                 prepared.config.id,  # type: ignore[attr-defined]
                 prepared.action,  # type: ignore[attr-defined]
@@ -168,11 +168,11 @@ def no_write_down(arena: Arena, monkeypatch: pytest.MonkeyPatch) -> None:
                 max_label,
             )
         )
-        return gate_module._Verdict(
+        return tool_calls_module.Verdict(
             decision.effect, decision.reason.value, decision.rule_ids, decision.policy_version
         )
 
-    monkeypatch.setattr(Gate, "_verdict", verdict)
+    monkeypatch.setattr(ToolCalls, "_verdict", verdict)
 
 
 def self_approval_allowed(arena: Arena, monkeypatch: pytest.MonkeyPatch) -> None:

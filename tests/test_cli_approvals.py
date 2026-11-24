@@ -16,8 +16,8 @@ from agentgate.audit.panoptes import PanoptesSink
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.clock import Clock, FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action
 from agentgate.gate import Denied, Executed, PendingApproval
-from agentgate.models import Action
 from agentgate.tools.builtin import list_outbox
 from conftest import FIXTURES, KC, POLICIES, open_file_world, plain_text
 

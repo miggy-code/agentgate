@@ -297,7 +297,7 @@ def test_serve_refuses_an_existing_ready_file_before_starting(tmp_path: Path) ->
 
 
 def test_ready_file_cleanup_removes_only_this_process_file(tmp_path: Path) -> None:
-    from agentgate.cli import _remove_own_ready_file
+    from agentgate.cli.model_proxy import _remove_own_ready_file
 
     def identity(path: Path) -> int:
         fd = os.open(path, os.O_RDONLY)
@@ -323,7 +323,7 @@ def test_ready_file_cleanup_removes_only_this_process_file(tmp_path: Path) -> No
 def test_ready_file_cleanup_spares_a_replacement_with_the_same_contents(tmp_path: Path) -> None:
     """Another process replaced the ready file with one that even names this pid and run:
     a different inode, so it is left alone."""
-    from agentgate.cli import _remove_own_ready_file, _write_ready_file
+    from agentgate.cli.model_proxy import _remove_own_ready_file, _write_ready_file
 
     ready = tmp_path / "ready.json"
     info = {"pid": os.getpid(), "run_id": "r1"}

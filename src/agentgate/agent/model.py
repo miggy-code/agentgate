@@ -13,7 +13,7 @@ from typing import Literal, Protocol
 
 from pydantic import JsonValue
 
-from agentgate.models import Action
+from agentgate.domain import Action
 
 
 @dataclass(frozen=True)

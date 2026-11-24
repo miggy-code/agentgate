@@ -13,8 +13,8 @@ from pydantic import BaseModel, ValidationError
 
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Document, Role
 from agentgate.fixtures import load_fixtures
-from agentgate.models import Action, Document, Role
 from agentgate.policy import addresses
 from agentgate.policy import engine as engine_module
 from agentgate.policy.engine import Request

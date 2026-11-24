@@ -19,8 +19,8 @@ import agentgate.gateway
 from agentgate.audit.base import MemorySink
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.clock import FixedClock
+from agentgate.domain import Action, UserStatus
 from agentgate.gate import Denied, Executed, Gate
-from agentgate.models import Action, UserStatus
 from agentgate.spend import Reservation
 from agentgate.store import Store
 from agentgate.world import World, open_world
@@ -446,7 +446,7 @@ def test_a_database_error_while_serving_is_one_error_line(
 
 
 def test_a_database_error_in_agent_run_is_one_error_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("agentgate.cli.run_agent", _raise_locked)
+    monkeypatch.setattr("agentgate.cli.agent.run_agent", _raise_locked)
     result = runner.invoke(
         app,
         [

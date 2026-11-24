@@ -36,9 +36,9 @@ from pathlib import Path
 
 from agentgate.audit.base import AuditEvent, EventKind, OperatorAction
 from agentgate.context import RunContext
+from agentgate.domain import Customer, Role, UserStatus
 from agentgate.gate import UNKNOWN_CUSTOMER, CapReached, Denied, Gate, IdentityError
 from agentgate.model.admission import Caps, ModelCall, ModelExchange, parse_model_call
-from agentgate.model.client import ControlClient, ControlError
 from agentgate.model.keys import (
     CLIENT_CREDENTIAL_HEADERS,
     Credential,
@@ -48,8 +48,6 @@ from agentgate.model.keys import (
     upstream_headers,
 )
 from agentgate.model.pricing import RateTable
-from agentgate.model.proxy import ProxySetupError
-from agentgate.model.server import MultiRunProxy, ServedRuns, ServerConfig
 from agentgate.model.tokens import (
     DEFAULT_TTL,
     IssuedToken,
@@ -60,7 +58,9 @@ from agentgate.model.tokens import (
     TokenStore,
     presented_token,
 )
-from agentgate.models import Customer, Role, UserStatus
+from agentgate.model_proxy.client import ControlClient, ControlError
+from agentgate.model_proxy.proxy import ProxySetupError
+from agentgate.model_proxy.server import MultiRunProxy, ServedRuns, ServerConfig
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import ModelProvider
 from agentgate.redteam.core import Arena, Category, describe, scenario

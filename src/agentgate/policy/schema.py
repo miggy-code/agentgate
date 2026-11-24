@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from agentgate._yaml import parse_yaml
-from agentgate.models import Action, Label, Role, Slug, Tag, Tool, ToolId
+from agentgate.domain import Action, Label, Role, Slug, Tag, Tool, ToolId
 
 API_VERSION = "agentgate/v1"
 

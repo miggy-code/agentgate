@@ -27,7 +27,7 @@ from typing import Annotated
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, JsonValue
 
 from agentgate.context import RunContext
-from agentgate.models import Document, Label, Slug
+from agentgate.domain import Document, Label, Slug
 from agentgate.policy import addresses
 from agentgate.store import Store
 from agentgate.tools.base import ToolAdapter, ToolEnv, ToolFacts, ToolResult

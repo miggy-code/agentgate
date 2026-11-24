@@ -16,8 +16,8 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agentgate._yaml import parse_yaml
+from agentgate.domain import Action
 from agentgate.fixtures import FixtureError, load_fixtures
-from agentgate.models import Action
 from agentgate.policy.engine import (
     Decision,
     DocumentFacts,

@@ -23,13 +23,13 @@ from agentgate.audit.panoptes import verify_log
 from agentgate.gate import Gate
 from agentgate.model.admission import Caps
 from agentgate.model.pricing import RateTable
-from agentgate.model.proxy import (
+from agentgate.model.tokens import TokenReason, TokenRejected
+from agentgate.model_proxy.proxy import (
     ProxyConfig,
     ProxySetupError,
     check_rates,
     generation_route,
 )
-from agentgate.model.tokens import TokenReason, TokenRejected
 from proxyharness import (
     BODY,
     OK_COST,
@@ -378,7 +378,7 @@ def test_stopping_drains_ends_the_run_and_revokes_its_token(tmp_path: Path) -> N
 
 
 def test_the_token_file_is_private_and_removed_when_the_proxy_stops(tmp_path: Path) -> None:
-    from agentgate.model.proxy import ModelProxy
+    from agentgate.model_proxy.proxy import ModelProxy
     from conftest import open_file_world
     from proxyharness import STAFF
 
@@ -446,7 +446,7 @@ def test_two_rate_tables_that_disagree_do_not_start() -> None:
 
 def test_the_proxy_does_not_start_without_a_key_for_its_upstream(tmp_path: Path) -> None:
     from agentgate.model.keys import ProviderKeys
-    from agentgate.model.proxy import ModelProxy
+    from agentgate.model_proxy.proxy import ModelProxy
     from agentgate.policy.schema import ModelProvider
     from conftest import open_file_world
     from proxyharness import STAFF
@@ -470,8 +470,8 @@ def test_the_proxy_does_not_start_without_a_key_for_its_upstream(tmp_path: Path)
 
 
 def test_a_proxy_started_on_a_gateways_run_shares_its_caps_with_the_tools(tmp_path: Path) -> None:
-    from agentgate.model.proxy import ModelProxy
-    from agentgate.models import Action
+    from agentgate.domain import Action
+    from agentgate.model_proxy.proxy import ModelProxy
     from conftest import open_file_world
     from proxyharness import STAFF
 

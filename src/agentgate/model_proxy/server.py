@@ -48,7 +48,14 @@ from agentgate.gate import IdentityError
 from agentgate.model.admission import Caps
 from agentgate.model.keys import ProviderKeys
 from agentgate.model.pricing import RateTable
-from agentgate.model.proxy import (
+from agentgate.model.tokens import (
+    MAX_TTL,
+    TokenReason,
+    TokenRecord,
+    TokenRejected,
+    TokenStore,
+)
+from agentgate.model_proxy.proxy import (
     SWEEP_INTERVAL,
     ModelGatewayHooks,
     ProxySetupError,
@@ -57,13 +64,6 @@ from agentgate.model.proxy import (
     load_rates,
     proxy_server,
     served_providers,
-)
-from agentgate.model.tokens import (
-    MAX_TTL,
-    TokenReason,
-    TokenRecord,
-    TokenRejected,
-    TokenStore,
 )
 from agentgate.policy.schema import ModelProvider, SpendLimits
 from agentgate.store import RunLimits, ServedRun

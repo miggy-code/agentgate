@@ -6,6 +6,7 @@ install:
 lint:
 	uv run ruff check .
 	uv run ruff format --check .
+	uv run lint-imports
 
 format:
 	uv run ruff check --fix .
@@ -14,8 +15,9 @@ format:
 type:
 	uv run mypy
 
+# One worker per core. `uv run pytest` alone runs serially, for a single file or test.
 test:
-	uv run pytest
+	uv run pytest -n auto
 
 policy:
 	uv run agentgate policy lint

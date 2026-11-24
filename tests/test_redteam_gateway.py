@@ -20,9 +20,9 @@ import agentgate.gateway.server as gateway_server
 from agentgate.agent.mock import ScriptedModel
 from agentgate.audit.base import EventKind
 from agentgate.context import RunContext
+from agentgate.domain import Action, Role
 from agentgate.gate import CapReached, Denied, Executed, Gate, Outcome, PendingApproval
 from agentgate.gateway import EXECUTE_TOOL, build_gateway
-from agentgate.models import Action, Role
 from agentgate.redteam import core
 from agentgate.redteam.core import (
     Arena,

@@ -15,18 +15,19 @@ from typing import Any
 import pytest
 import yaml
 
-import agentgate.gate as gate_module
+import agentgate.gate._values as values_module
 import agentgate.model.admission as admission_module
-import agentgate.model.client as client_module
 import agentgate.model.keys as keys_module
 import agentgate.model.tokens as tokens_module
+import agentgate.model_proxy.client as client_module
 import agentgate.redteam.scenarios.model_boundary as scenarios_module
-from agentgate.gate import Gate
+from agentgate.gate.model_calls import ModelAdmission
+from agentgate.gate.runs import RunRegistry
 from agentgate.model.admission import Caps, ModelExchange
 from agentgate.model.keys import KeyConfigError, ProviderKeys
 from agentgate.model.pricing import RateTable
-from agentgate.model.server import ServedRuns
 from agentgate.model.tokens import TokenStore
+from agentgate.model_proxy.server import ServedRuns
 from agentgate.policy.engine import PolicyEngine, Reason
 from agentgate.policy.schema import SpendLimits
 from agentgate.redteam.core import Category, run_suite
@@ -213,8 +214,8 @@ MUTATIONS = [
         ids(3, 18),
         edits=(
             (
-                Gate,
-                "admit_model",
+                ModelAdmission,
+                "admit",
                 (("if models is None or call.max_tokens is None:", "if False:"),),
             ),
         ),
@@ -251,11 +252,11 @@ MUTATIONS = [
         ids(4, 5, 6),
         edits=(
             (
-                Gate,
-                "admit_model",
+                ModelAdmission,
+                "admit",
                 (
                     (
-                        "return self._deny(asked, GateReason.MODEL_REQUEST_INVALID, "
+                        "return self._recorder.deny(asked, GateReason.MODEL_REQUEST_INVALID, "
                         "details=values)",
                         "pass",
                     ),
@@ -339,7 +340,7 @@ MUTATIONS = [
     Mutation(
         "the gate lets unread fields through",
         ids(23),
-        edits=((Gate, "admit_model", (("if call.unknown_fields:", "if False:"),)),),
+        edits=((ModelAdmission, "admit", (("if call.unknown_fields:", "if False:"),)),),
     ),
     Mutation(
         "server features are not seen",
@@ -374,9 +375,9 @@ MUTATIONS = [
         ids(8),
         edits=(
             (
-                Gate,
-                "_check_run",
-                (("return self._deny(call, GateReason.SUSPENDED_USER)", "pass"),),
+                RunRegistry,
+                "check",
+                (("return self._recorder.deny(call, GateReason.SUSPENDED_USER)", "pass"),),
             ),
         ),
     ),
@@ -507,8 +508,8 @@ MUTATIONS = [
         ids(25),
         edits=(
             (
-                Gate,
-                "admit_model",
+                ModelAdmission,
+                "admit",
                 (
                     (
                         "amount = fixed if computed is None else "
@@ -529,8 +530,8 @@ MUTATIONS = [
         ids(17),
         edits=(
             (
-                Gate,
-                "settle_model",
+                ModelAdmission,
+                "settle",
                 (('raise ValueError("a gateway reservation is ended by finish_model")', "pass"),),
             ),
         ),
@@ -542,8 +543,8 @@ MUTATIONS = [
         (*ids(17, 22),),
         edits=(
             (
-                Gate,
-                "finish_model",
+                ModelAdmission,
+                "finish",
                 (
                     (
                         "released = not exchange.request_sent or (",
@@ -575,8 +576,8 @@ MUTATIONS = [
         ids(17),
         edits=(
             (
-                Gate,
-                "finish_model",
+                ModelAdmission,
+                "finish",
                 (
                     (
                         "exchange.provider_error and not exchange.produced_output",
@@ -591,8 +592,8 @@ MUTATIONS = [
         ids(17),
         edits=(
             (
-                Gate,
-                "finish_model",
+                ModelAdmission,
+                "finish",
                 (
                     (
                         "if exchange.complete and exchange.cost_usd is not None:",
@@ -607,8 +608,8 @@ MUTATIONS = [
         (*ids(17), "bn-020"),
         edits=(
             (
-                Gate,
-                "finish_model",
+                ModelAdmission,
+                "finish",
                 (("exchange.provider_error and not exchange.produced_output", "False"),),
             ),
         ),
@@ -627,20 +628,20 @@ MUTATIONS = [
     Mutation(
         "any correlation id is recorded as written",
         ids(19),
-        replace=((gate_module, "_EFFECT_REF", re.compile(r"(?s).*")),),
+        replace=((values_module, "PLAIN_ID", re.compile(r"(?s).*")),),
     ),
     Mutation(
         "a key-shaped correlation id is recorded as written",
         ids(19),
-        replace=((gate_module, "storable_identifier", lambda value: True),),
+        replace=((values_module, "storable_identifier", lambda value: True),),
     ),
     Mutation(
         "an allow that cannot be recorded is admitted anyway",
         ids(20),
         edits=(
             (
-                Gate,
-                "admit_model",
+                ModelAdmission,
+                "admit",
                 (
                     (
                         "        self._ledger.release(reserved)\n"
@@ -685,7 +686,7 @@ MUTATIONS += [
     Mutation(
         "a run may start for another customer's user",
         ids(28),
-        edits=((Gate, "start_run", (("if user.customer_id != customer_id:", "if False:"),)),),
+        edits=((RunRegistry, "start", (("if user.customer_id != customer_id:", "if False:"),)),),
     ),
 ]
 

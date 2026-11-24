@@ -12,10 +12,10 @@ from typing import Any
 
 import pytest
 
-import agentgate.model.proxy as proxy_module
+import agentgate.model_proxy.proxy as proxy_module
 import test_model_proxy as t
-from agentgate.model.proxy import ModelGatewayHooks, ModelProxy, Route
 from agentgate.model.tokens import TokenStore
+from agentgate.model_proxy.proxy import ModelGatewayHooks, ModelProxy, Route
 from conftest import mutant
 
 Case = tuple[Callable[..., None], tuple[Any, ...]]

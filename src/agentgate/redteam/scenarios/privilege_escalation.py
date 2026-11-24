@@ -14,8 +14,8 @@ from pydantic import JsonValue
 from agentgate.agent.mock import NaiveModel
 from agentgate.audit.base import EventKind
 from agentgate.context import RunContext
+from agentgate.domain import Action
 from agentgate.gate import Executed
-from agentgate.models import Action
 from agentgate.redteam.core import Arena, Category, returned_ids, scenario, transcript_calls
 
 KC = "kettle-creek-hvac"

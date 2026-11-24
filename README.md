@@ -131,7 +131,7 @@ I deployed company-brain agents for small businesses. Each was an agent in front
                                                 +---------------------------+
 ```
 
-`Gate.call_tool` in [src/agentgate/gate.py](src/agentgate/gate.py) does these steps for every call:
+`Gate.call_tool` does these steps for every call. The code is in [src/agentgate/gate/tool_calls.py](src/agentgate/gate/tool_calls.py).
 
 1. **Check the run.** The context must match the gate's own `runs` row. The gate reads the user again from the store. It refuses a forged context and a user who was suspended or moved during the run.
 2. **Validate.** The customer must have the tool, and the arguments must pass strict validation. All recipients go through one shared address rule. This rule refuses control, bidi and look-alike characters.
@@ -150,7 +150,7 @@ The model sees the tool's content, a reason code, an approval id or `cap_reached
 ```python
 from pathlib import Path
 
-from agentgate.models import Action
+from agentgate.domain import Action
 from agentgate.world import open_world
 
 with open_world(
@@ -204,7 +204,7 @@ uv run agentgate model-proxy server \
 ```
 
 ```python
-from agentgate.model.client import ControlClient
+from agentgate.model_proxy.client import ControlClient
 
 with ControlClient(socket_path) as control:  # "control_socket" in proxy.json
     run = control.start_run("kettle-creek-hvac", "kc-staff-nadine", max_usd="0.10")
@@ -247,7 +247,7 @@ These are the main limits. [docs/limits.md](docs/limits.md) has the full list.
 
 ```bash
 make install   # uv sync
-make check     # ruff, mypy strict, pytest, policy lint and tests, red-team suite
+make check     # ruff, import contracts, mypy strict, pytest (parallel), policy tests, red-team suite
 make redteam   # red-team suite over both transports, reports in reports/
 make bench     # latency benchmark
 make demo      # the ten demo scenarios
@@ -256,7 +256,7 @@ uv run agentgate --help
 
 More docs:
 
-- [docs/design.md](docs/design.md): search, approvals, spend, recipients, audit, integration, the MCP gateway, the model proxy, the policy format, the CLI, latency, a real model, and the project layout.
+- [docs/design.md](docs/design.md): search, approvals, spend, recipients, audit, integration, the MCP gateway, the model proxy, the policy format, the CLI, latency, a real model, the architecture and the project layout.
 - [docs/limits.md](docs/limits.md): all known limits.
 - [docs/redteam-scenarios.md](docs/redteam-scenarios.md): all red-team scenarios.
 

@@ -27,8 +27,8 @@ from agentgate.approvals import Approval, ApprovalError, ApprovalErrorReason, ar
 from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, OperatorAction
 from agentgate.audit.panoptes import PanoptesSink, read_events
 from agentgate.context import RunContext
+from agentgate.domain import Action, Role
 from agentgate.gate import PendingApproval
-from agentgate.models import Action, Role
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import Policy, PolicyBundle
 from agentgate.redteam.core import (

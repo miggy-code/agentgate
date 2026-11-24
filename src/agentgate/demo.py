@@ -32,8 +32,8 @@ from agentgate.audit.base import AuditEvent, AuditSink, EventKind
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Role
 from agentgate.gate import CapReached, Denied, Executed, IdentityError, Outcome, PendingApproval
-from agentgate.models import Action, Role
 from agentgate.spend import CapKind
 from agentgate.store import Store
 from agentgate.tools.builtin import default_tools, list_outbox, list_refunds

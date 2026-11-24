@@ -17,9 +17,9 @@ from agentgate.approvals import ApprovalStatus
 from agentgate.audit.base import EventKind, MemorySink
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import Clock, FixedClock, SystemClock
+from agentgate.domain import Action, UserStatus
 from agentgate.fixtures import FixtureError, load_fixtures
 from agentgate.gate import Denied, Executed, PendingApproval
-from agentgate.models import Action, UserStatus
 from agentgate.spend import Reservation
 from agentgate.store import Store, StoreError, table_names
 from agentgate.world import (

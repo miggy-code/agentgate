@@ -71,8 +71,8 @@ import agentgate
 from agentgate.agent.loop import tool_specs
 from agentgate.agent.model import ToolSpec
 from agentgate.context import RunContext
+from agentgate.domain import Action
 from agentgate.gate import Denied, Executed, Outcome, PendingApproval
-from agentgate.models import Action
 from agentgate.tools.builtin import default_tools
 from agentgate.world import World
 

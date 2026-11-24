@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agentgate.audit.panoptes import PanoptesSink
-from agentgate.models import Customer, Document, Role, User, UserStatus
+from agentgate.domain import Customer, Document, Role, User, UserStatus
 from agentgate.store import Store, StoreError, make_private_dirs, table_names
 
 

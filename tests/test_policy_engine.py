@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from agentgate.models import Action, Customer, Document, Role
+from agentgate.domain import Action, Customer, Document, Role
 from agentgate.policy import addresses
 from agentgate.policy import engine as engine_module
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Reason, Request

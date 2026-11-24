@@ -30,7 +30,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from agentgate.models import Action, Role
+from agentgate.domain import Action, Role
 
 
 class EventKind(StrEnum):

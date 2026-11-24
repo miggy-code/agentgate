@@ -17,12 +17,15 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, JsonValue
 
-import agentgate.gate as gate_module
+import agentgate.gate._values as values_module
+import agentgate.gate.recorder as recorder_module
+import agentgate.gate.tool_calls as tool_calls_module
 from agentgate.approvals import ApprovalError, ApprovalErrorReason, ApprovalStatus, args_hash
 from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, MemorySink
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Document, Role
 from agentgate.gate import (
     CapReached,
     Denied,
@@ -32,7 +35,6 @@ from agentgate.gate import (
     Outcome,
     PendingApproval,
 )
-from agentgate.models import Action, Document, Role
 from agentgate.policy.engine import PolicyEngine, Request
 from agentgate.policy.schema import Conditions, Effect, PolicyBundle, Rule
 from agentgate.retrieval import DocumentIndex
@@ -570,8 +572,8 @@ KELVIN_DALE = "dale@\u212aettlecreek.example"
 )
 def test_gate_counts_a_malformed_or_look_alike_address_as_external(raw: str) -> None:
     domains = frozenset({"kettlecreek.example"})
-    assert gate_module._is_external(raw, domains)
-    assert not gate_module._is_external(" Dale@KettleCreek.example ", domains)
+    assert values_module.is_external(raw, domains)
+    assert not values_module.is_external(" Dale@KettleCreek.example ", domains)
 
 
 def test_look_alike_recipient_escalates_where_the_policy_allows_it(world: World) -> None:
@@ -599,7 +601,7 @@ def test_look_alike_recipient_escalates_where_the_policy_allows_it(world: World)
     pending(gate.call_tool(ctx, "email.send", Action.SEND, email_args(KELVIN_DALE)))
     event = world.last(EventKind.APPROVAL_REQUIRED)
     assert (event.reason, event.rule_ids) == ("escalated_customer_facing", ("email-anyone",))
-    assert event.details["risk_score"] > gate_module.EXTERNAL_RECIPIENT_RISK
+    assert event.details["risk_score"] > tool_calls_module.EXTERNAL_RECIPIENT_RISK
     assert [sent.recipients for sent in list_outbox(world.store, KC)] == [
         ("dale@kettlecreek.example",)
     ]
@@ -1659,7 +1661,8 @@ def test_panoptes_refusal_the_gate_missed_is_recorded_reference_only(
     )
     ctx = audited.gate.start_run(KC, "kc-owner-dale")
     # As if the gate's own check missed a value Panoptes refuses.
-    monkeypatch.setattr(gate_module, "storable_identifier", lambda value: True)
+    for module in (recorder_module, values_module):
+        monkeypatch.setattr(module, "storable_identifier", lambda value: True)
     outcome = audited.gate.call_tool(ctx, "docs.read", Action.READ, {"document_id": secretish})
     executed(outcome)
     allow, done = audited.rows()[-2:]

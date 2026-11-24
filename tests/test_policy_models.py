@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
-from agentgate.models import Customer, Role
+from agentgate.domain import Customer, Role
 from agentgate.policy.engine import ModelRequest, PolicyEngine, Reason
 from agentgate.policy.schema import Effect, ModelProvider, PolicyError, load_bundle
 from agentgate.policy.testing import load_cases, run_policy_tests

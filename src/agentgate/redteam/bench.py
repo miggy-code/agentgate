@@ -36,8 +36,8 @@ from pydantic import JsonValue
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Document
 from agentgate.gate import Denied, Executed, Gate
-from agentgate.models import Action, Document
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Request
 from agentgate.policy.schema import Effect
 from agentgate.redteam.core import REDTEAM_START, describe
