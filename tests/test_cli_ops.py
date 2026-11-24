@@ -446,7 +446,7 @@ def test_a_database_error_while_serving_is_one_error_line(
 
 
 def test_a_database_error_in_agent_run_is_one_error_line(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("agentgate.cli.run_agent", _raise_locked)
+    monkeypatch.setattr("agentgate.cli.agent.run_agent", _raise_locked)
     result = runner.invoke(
         app,
         [
