@@ -101,10 +101,11 @@ class Served:
         body: dict[str, Any] | None = None,
         *,
         headers: dict[str, str] | None = None,
+        conn: http.client.HTTPConnection | None = None,
     ) -> Reply:
         sent = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
         sent.update(headers or {})
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        conn = conn or self.connect()
         try:
             conn.request(
                 "POST", "/v1/chat/completions", body=json.dumps(body or BODY), headers=sent
@@ -113,6 +114,9 @@ class Served:
             return Reply(response.status, response.read())
         finally:
             conn.close()
+
+    def connect(self) -> http.client.HTTPConnection:
+        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
 
     def reservations(self, run_id: str) -> list[Any]:
         """The run's reservations once none is open (after_exchange runs after the reply)."""
@@ -318,12 +322,21 @@ def test_concurrent_last_dollar_reservations_across_runs_stay_under_each_cap(
         statuses: dict[str, list[int]] = {run.run_id: [] for run in runs}
         start = threading.Barrier(len(runs) * 5)
 
-        def send(run_id: str, token: str) -> None:
+        def send(run_id: str, token: str, conn: http.client.HTTPConnection) -> None:
             start.wait()
-            statuses[run_id].append(made.post(token).status)
+            statuses[run_id].append(made.post(token, conn=conn).status)
+
+        # Connect one at a time before the barrier: the listener's backlog is 5, and 15
+        # connects at once overflow it, which Linux recovers from only after seconds of
+        # SYN-ACK retries. The race under test is the reservation, not the TCP accept.
+        conns = []
+        for _ in range(len(runs) * 5):
+            conn = made.connect()
+            conn.connect()
+            conns.append(conn)
 
         workers = [
-            threading.Thread(target=send, args=(run.run_id, run.token))
+            threading.Thread(target=send, args=(run.run_id, run.token, conns.pop()))
             for run in runs
             for _ in range(5)
         ]
