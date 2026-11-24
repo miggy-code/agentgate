@@ -1,16 +1,28 @@
 [build-system]
-requires = ["hatchling>=1.25,<2"]
+requires = ["hatchling>=1.25,<2", "hatch-fancy-pypi-readme>=24.1,<26"]
 build-backend = "hatchling.build"
 
 [project]
 name = "panoptes-agentgate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Permissions, approval and audit layer between an AI agent and a company's tools and documents."
-readme = "README.md"
+dynamic = ["readme"]
 requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Miguel Padilla" }]
+keywords = ["ai-agents", "authorization", "audit-log", "mcp", "llm", "policy", "security"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.28,<1",
     "mcp>=2.3,<3",
@@ -25,6 +37,21 @@ agentgate = "agentgate.cli:main"
 
 [project.urls]
 Repository = "https://github.com/miggy-code/agentgate"
+Documentation = "https://github.com/miggy-code/agentgate/blob/main/docs/design.md"
+Changelog = "https://github.com/miggy-code/agentgate/blob/main/CHANGELOG.md"
+Issues = "https://github.com/miggy-code/agentgate/issues"
+
+# PyPI shows the README without the repository around it, so its relative links are made
+# absolute there. On GitHub they stay relative.
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|#|mailto:)([^)]+)\)'
+replacement = '](https://github.com/miggy-code/agentgate/blob/main/\1)'
 
 [project.optional-dependencies]
 anthropic = [

@@ -42,9 +42,10 @@ The threat model is a fully compromised model. Most attack scenarios propose the
 
 ## Demo
 
-You need [uv](https://docs.astral.sh/uv/). The demo needs no API keys and no network access after install.
+The demo runs from a clone, because it uses the fictional companies in `fixtures/` and `policies/`. You need [uv](https://docs.astral.sh/uv/). It needs no API keys and no network access after install.
 
 ```bash
+git clone https://github.com/miggy-code/agentgate && cd agentgate
 make demo
 ```
 
