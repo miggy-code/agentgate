@@ -67,7 +67,7 @@ agentgate stores each event as a Panoptes schema-v5 event:
 - The agentgate fields go in `attributes`. The run and the user go in Panoptes' own fields.
 - For a model request through the proxy, `exchange_id` goes in `attributes`, and the exchange's `correlation_id` goes on the event.
 - An event with no run has no run id, and its session is `customer:<id>`. An event with no user has no user.
-- agentgate records no auth method, because it never sees a credential.
+- agentgate records no auth method, because it never sees a credential. The exception is a run started from a verified identity assertion: its run-start event names the issuer and its assurance (see [Verified run start](#verified-run-start)), never the assertion.
 
 agentgate writes identifiers with strict ingest. If Panoptes would redact an identifier, it refuses the event. It never stores a changed value. Logs written with schema v4 (the same fields under `context.agentgate`) still read and verify, and new events extend their chain.
 
@@ -287,7 +287,8 @@ This starts the same proxy inside the MCP gateway's run. There is one run id, so
 ```bash
 agentgate model-proxy server --upstream openai_compatible=https://api.deepseek.com \
   --rate-table rates.json --keys-file keys.json \
-  [--control-socket PATH] [--max-token-ttl 3600] [--ready-file F]
+  [--control-socket PATH] [--max-token-ttl 3600] [--ready-file F] \
+  [--identity-config identity.yaml]
 ```
 
 This is one long-running process that serves model calls for many runs of one world. The model listener is the same Panoptes proxy on a loopback port, with the same `before_forward` and `after_exchange` steps as `serve`.
@@ -312,7 +313,8 @@ Requests are small JSON over HTTP/1.1, one per connection. agentgate's own handl
 
 | Request | Answer |
 | --- | --- |
-| `POST /runs` `{"customer_id", "user_id", "ttl_seconds"?, "max_usd"?, "max_calls"?}` | `201 {"run_id", "customer_id", "user_id", "token", "expires_at", "max_usd", "max_calls", "per_customer_day_usd"}` |
+| `POST /runs` `{"customer_id", "user_id", "ttl_seconds"?, "max_usd"?, "max_calls"?}` | `201 {"run_id", "customer_id", "user_id", "token", "expires_at", "max_usd", "max_calls", "per_customer_day_usd"}`; 403 `assertion_required` on a server started with `--identity-config` |
+| `POST /runs` `{"assertion", "ttl_seconds"?, "max_usd"?, "max_calls"?}` | the same `201`, for the user the assertion names (see [Verified run start](#verified-run-start)); 403 with the reason code, or 503 `issuer_unavailable` |
 | `POST /runs/{run_id}/end` | `200 {"run_id", "status": "ended"}`, also for a run that already ended; 404 `unknown_run` for a run that this server did not start |
 | `GET /health` | `200 {"status": "ok", "model_url", "runs_live"}` |
 
@@ -326,7 +328,7 @@ How `POST /runs` works:
 
 A malformed request gets a 400 with a reason code. Malformed means it is not one JSON object, or it has a repeated or unknown field, or a wrong type. Another route gets 404, and another method gets 405. The server never sends a traceback.
 
-`agentgate.model_proxy.client.ControlClient(socket_path)` wraps the three requests over httpx's Unix-socket transport. It refuses a socket path that is a symlink or not a socket. It also refuses a socket in a directory that is a symlink, that another user owns, or that group or others can open.
+`agentgate.model_proxy.client.ControlClient(socket_path)` wraps the requests (`start_run`, `start_verified_run`, `end_run`, `health`) over httpx's Unix-socket transport. It refuses a socket path that is a symlink or not a socket. It also refuses a socket in a directory that is a symlink, that another user owns, or that group or others can open.
 
 #### Lifecycle
 
@@ -334,7 +336,95 @@ A malformed request gets a 400 with a reason code. Malformed means it is not one
 - **Ending a run.** A request to end a run records `run_ended` with reason `requested`.
 - **Shutdown.** On SIGTERM or an interrupt, the server stops accepting on both listeners. It lets in-flight control requests and exchanges finish, and it settles each exchange. It ends every run it started, with `run_ended` reason `shutdown` and a `token_revoked` for each token. Then it removes the socket, its directory and the ready file.
 - **Recovery.** A server that dies without a clean stop leaves its runs' tokens live. The next server that starts on the world ends every live run whose server process is gone, with `run_ended` reason `recovered`. Its stale-reservation sweep runs the same as in `serve`.
-- **Startup checks.** The server checks the upstreams and keys. It checks that some customer's policy lists a model for the served providers. It also checks the rate table both ways, as `serve` does.
+- **Startup checks.** The server checks the upstreams and keys. It checks that some customer's policy lists a model for the served providers. It also checks the rate table both ways, as `serve` does. With `--identity-config`, it checks that every issuer's customer has a policy in the world, and fetches each OIDC issuer's keys.
+
+### Verified run start
+
+```bash
+agentgate identity keygen --out keys/          # signing-key.pem (0600) and jwks.json
+agentgate identity check-config identity.yaml  # load it and fetch every OIDC issuer's keys
+agentgate model-proxy server ... --identity-config identity.yaml
+```
+
+Without a trust configuration, the multi-run server starts a run for whatever user its host names, as `--as` does. With `--identity-config`, a host cannot name a user. It hands over a signed identity assertion, and agentgate verifies it before it starts the run. A start that names a user is refused as `assertion_required`, and the refusal is recorded. The code is `agentgate.identity`. It is a service that the gate does not import. The server verifies, and the gate starts and records the run.
+
+```python
+from datetime import timedelta
+from pathlib import Path
+from agentgate.identity import load_signing_key, mint_assertion
+
+key = load_signing_key(Path("keys/signing-key.pem"))
+assertion = mint_assertion(
+    key,
+    issuer="https://brain.local/personas",
+    audience="agentgate:kettle-creek",
+    subject="nadine@kettlecreek.example",
+    ttl=timedelta(minutes=2),
+    kid=KID,
+)  # KID: printed by keygen, the key's thumbprint
+run = control.start_verified_run(assertion, max_usd="0.10")
+```
+
+agentgate trusts two kinds of issuer:
+
+- **`signed`**: a host's own persona signer. Its public keys are in a local JWKS file. `agentgate identity keygen` writes an Ed25519 key and that file, with the RFC 7638 thumbprint as the `kid`. The host signs with `agentgate.identity.mint_assertion`. The person is in `sub`.
+- **`oidc`**: any OpenID Connect provider, such as Keycloak. Its keys come from discovery (`<issuer>/.well-known/openid-configuration`, then `jwks_uri`). With `subject: email`, the person is in the `email` claim, and `email_verified` must be `true`. With `subject: user_id`, the person is in `sub`.
+
+The trust configuration is YAML, read strictly. agentgate refuses unknown keys and duplicate names or issuer URLs (a trailing slash apart counts as the same URL). It also refuses `none` and HMAC algorithms, and a plain-http OIDC issuer that is not on a loopback host. A JWKS file may hold public signing keys only.
+
+```yaml
+issuers:
+  - name: casa-prado-personas      # recorded on the run
+    kind: signed
+    issuer: https://brain.local/personas
+    audience: agentgate:casa-prado
+    customer: casa-prado            # the only customer this issuer can start runs in
+    subject: email                  # sub holds the user's email (or: user_id)
+    jwks_file: personas.jwks.json   # relative to this file
+    algorithms: [EdDSA]
+    max_lifetime_seconds: 300
+    single_use: true
+  - name: casa-prado-keycloak
+    kind: oidc
+    issuer: http://127.0.0.1:8080/realms/casa-prado
+    audience: agentgate
+    customer: casa-prado
+    subject: email                  # the email claim, with email_verified: true
+    algorithms: [RS256, ES256]
+    max_lifetime_seconds: 3600
+    single_use: false
+```
+
+Each issuer is bound to one customer. agentgate looks for the person only among that customer's users, and starts the run only in that customer. So an issuer can never start a run in another customer, whatever it signs.
+
+`AssertionVerifier.verify` checks an assertion in this order. The first failed check decides the reason code:
+
+1. **Size and shape.** At most 8 KiB, a compact JWS whose header and payload are JSON objects with no repeated member. A `crit` or `b64` header is refused. Otherwise `assertion_malformed`.
+2. **Issuer.** The unverified `iss` selects the issuer configuration. It is matched exactly, so a trailing slash or a change of case names no issuer: `issuer_unknown`.
+3. **Header.** `alg` must be one of the issuer's algorithms, and never `none` or `HS*`, whatever the configuration says: `algorithm_refused`. `kid` must name a key of this issuer that can be used with that algorithm: `key_unknown`. agentgate ignores a `jku`, `x5u` or `jwk` header and never fetches it. Keys come only from the configuration.
+4. **Signature.** PyJWT checks the signature with that one key and that one algorithm: `signature_invalid`.
+5. **Issuer again.** The verified `iss` must equal the configured one.
+6. **Audience.** `aud`, a string or a list, must contain the issuer's audience: `audience_mismatch`.
+7. **Times.** `exp` and `iat` are required numbers. `nbf` is checked if present. The leeway is 30 s. The reason codes are `expired`, `not_yet_valid` and `lifetime_too_long` (when `exp - iat` is above `max_lifetime_seconds`).
+8. **Replay.** For a `single_use` issuer, `jti` is required. agentgate records it in `used_assertions` with the issuer's name, the sha256 of the `jti` and the expiry. A second use is `replayed`. A row is deleted once its assertion is past `exp` and the leeway, so a later replay is refused as `expired`.
+9. **Subject.** The subject must match exactly one user of the issuer's customer. Emails are compared lowercased. Otherwise `subject_unknown`. An OIDC email needs `email_verified: true`: `email_unverified`.
+
+Then the run starts through `Gate.start_run`. So the gate still refuses an unknown, suspended or other customer's user, with its own reason, as for any run.
+
+Recording:
+
+- Every refused assertion is a `deny` event with its reason code, the issuer's name and a keyed reference to the `jti` (`details.jti_ref`). The event never holds the assertion or a claim value. An assertion whose issuer is unknown is recorded under the customer `unknown`.
+- A verified run stores its assurance in `runs.assurance` as `verified:<issuer name>`. A run that its host named has `NULL` there. The run-start event carries `assurance`, `issuer` and `jti_ref`. A refusal by the gate after verification carries the same fields.
+- The control socket answers a refusal with 403 and the reason code. The exception is `issuer_unavailable`, which gets 503: the provider is down, so the request can be retried later.
+
+OIDC keys (`identity/oidc.py`):
+
+- Discovery runs at startup. The discovered `issuer` must equal the configured one, and `jwks_uri` must be https, or http on a loopback host.
+- agentgate caches the JWKS for its `Cache-Control` max-age, or 10 minutes without one. The cache time is never shorter than 60 s.
+- An unknown `kid` makes agentgate fetch the JWKS again, in case of a key rotation. It fetches at most once per 60 s for each issuer, for any reason.
+- Keys published for encryption (`use: enc`) and symmetric keys are never used.
+- Fetches use httpx with 5 s timeouts. They follow no redirects, use no proxy or netrc from the environment, and read at most 256 KiB.
+- If an issuer cannot be reached, the server still starts and prints a warning. Every assertion from that issuer is refused as `issuer_unavailable` until its keys load. agentgate does not use keys past their max-age when the provider stops answering.
 
 ## Policy format
 
@@ -592,6 +682,8 @@ uv run agentgate audit show --as kc-mgr-terrence [--run <RUN_ID>] [--kind deny] 
 uv run agentgate audit policy sha256:66ca6bb217693239 --as kc-mgr-terrence
 uv run agentgate audit check-store --as kc-owner-dale
 uv run agentgate audit verify [--db data/audit.db]
+uv run agentgate identity keygen --out keys/
+uv run agentgate identity check-config identity.yaml
 ```
 
 ### Common behavior
@@ -642,6 +734,12 @@ No approvals command creates an approval. A pending approval comes from an agent
 - `audit policy` and `audit check-store` exit with code 1 on any mismatch.
 - The three commands above open the store read-only. They change neither file.
 - `agentgate audit verify` checks the Panoptes hash chain. It prints `<path>  N events  chain intact`, or it prints `chain BROKEN: ...` and exits with code 1. An agentgate log is chained from its first event, so events outside the chain also fail. An example is a log whose hashes were set to null and whose chain metadata was deleted. The command opens the file read-only through Panoptes' read API. So it never migrates the file, starts a chain or writes to it. It has no checkpoint option; see [Limits](limits.md#audit).
+
+### Identity
+
+- `identity keygen --out DIR` writes a new Ed25519 persona signing key, `signing-key.pem` (mode 0600), and its public `jwks.json`. It prints the paths and the `kid`, never the key. It creates DIR with mode 0700 if it is missing, and never overwrites either file.
+- `identity check-config FILE` loads a trust configuration and fetches every OIDC issuer's discovery document and keys. It prints one line for each issuer: name, kind, customer, subject, issuer URL, and the number of keys or why they are unavailable. It exits with code 1 if the file is invalid or an issuer's keys cannot be loaded. It opens no world.
+- Neither command takes `--as` or prints the demo-identity note. `model-proxy server --identity-config` prints `note: runs start only from a verified identity assertion (issuers: ...)` in its place.
 
 ## Latency
 
@@ -707,7 +805,7 @@ The code has six layers. A module imports only from layers below its own. [impor
 | Adapters | `gateway`, `model_proxy`, `agent` | Put the gate behind MCP or HTTP, or drive it with a model. |
 | Composition | `world` | Opens a store, fixtures, policies, an audit sink and a gate in one call. |
 | Gate | `gate` | Decides, records and runs every call. |
-| Services | `approvals`, `spend`, `tools`, `audit`, `model`, `retrieval`, `policy` | One job each. None of them knows about the gate. |
+| Services | `approvals`, `spend`, `tools`, `audit`, `model`, `identity`, `retrieval`, `policy` | One job each. None of them knows about the gate. |
 | Foundation | `fixtures`, `store`, `context`, `clock`, `domain` | Data and the types everything shares. |
 
 The contract orders the packages inside a row too. For example, `tools` may import `retrieval`, and `retrieval` may import `policy`, but not the other way around.
@@ -744,6 +842,7 @@ The tool path and the model path share the run check, the recorder and the spend
 | `src/agentgate/spend.py` | spend ledger: calls and USD per run, USD per customer day |
 | `src/agentgate/model/` | model calls: provider keys, run tokens, strict request reading and caps, rate tables and the worst-case reservation |
 | `src/agentgate/model_proxy/` | the model proxy: one run (`proxy.py`), many runs and their control socket (`server.py`, `client.py`) |
+| `src/agentgate/identity/` | verified run start: the trust configuration, assertion verification, OIDC discovery and keys, and the host's signing helpers |
 | `src/agentgate/audit/` | audit event type and keyed references, memory sink, Panoptes sink |
 | `src/agentgate/tools/` | tool adapter interface and the built-in tools |
 | `src/agentgate/agent/` | model protocol, reference agent loop, mock models, optional Anthropic adapter |

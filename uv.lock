@@ -815,6 +815,7 @@ dependencies = [
     { name = "mcp" },
     { name = "panoptes-observe", extra = ["proxy"] },
     { name = "pydantic" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pyyaml" },
     { name = "typer" },
 ]
@@ -842,6 +843,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "panoptes-observe", extras = ["proxy"], specifier = ">=0.2.0,<0.4" },
     { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "typer", specifier = ">=0.12,<1" },
 ]

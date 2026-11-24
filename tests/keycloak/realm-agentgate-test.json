@@ -1,0 +1,69 @@
+{
+  "realm": "agentgate-test",
+  "displayName": "agentgate tests (synthetic users, local Keycloak only)",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "clients": [
+    {
+      "clientId": "agentgate-test-cli",
+      "name": "agentgate test client: direct grant, for tests only",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "agentgate-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "agentgate",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "nadine",
+      "email": "nadine@kettlecreek.example",
+      "emailVerified": true,
+      "firstName": "Nadine",
+      "lastName": "Ferro",
+      "enabled": true,
+      "credentials": [
+        { "type": "password", "value": "test-only-nadine", "temporary": false }
+      ]
+    },
+    {
+      "username": "colby",
+      "email": "colby@kettlecreek.example",
+      "emailVerified": false,
+      "firstName": "Colby",
+      "lastName": "Reyes",
+      "enabled": true,
+      "credentials": [
+        { "type": "password", "value": "test-only-colby", "temporary": false }
+      ]
+    },
+    {
+      "username": "stranger",
+      "email": "stranger@kettlecreek.example",
+      "emailVerified": true,
+      "firstName": "Sam",
+      "lastName": "Stranger",
+      "enabled": true,
+      "credentials": [
+        { "type": "password", "value": "test-only-stranger", "temporary": false }
+      ]
+    }
+  ]
+}

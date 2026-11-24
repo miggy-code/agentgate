@@ -46,6 +46,7 @@ from agentgate.world import (
 if TYPE_CHECKING:
     from agentgate.model_proxy.proxy import ModelProxy, ProxyConfig
 from agentgate.cli._shared import (
+    DEMO_IDENTITY_NOTE,
     AsOption,
     AuditDbOption,
     DbOption,
@@ -345,6 +346,14 @@ def model_proxy_server(
             "control socket, the pid and the instance id. Removed on stop.",
         ),
     ] = None,
+    identity_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--identity-config",
+            help="Trust configuration (YAML): the issuers whose signed identity assertions "
+            "start runs. With it, a start naming a user is refused (assertion_required).",
+        ),
+    ] = None,
     db: DbOption = DEFAULT_DB,
     audit_db: AuditDbOption = DEFAULT_AUDIT_DB,
     policies: PoliciesOption = DEFAULT_POLICIES,
@@ -358,7 +367,11 @@ def model_proxy_server(
     running the server can reach the socket. Each request is decided as with `model-proxy
     serve`, under the caps its run was started with. Stopping (SIGTERM or an interrupt) drains
     in-flight requests, then ends every run this server started and revokes their tokens.
-    Runs of a server that died are ended when the next one starts."""
+    Runs of a server that died are ended when the next one starts.
+
+    With --identity-config the host hands over a signed identity assertion instead of naming
+    the user, and the server verifies it before it starts the run (see agentgate.identity)."""
+    from agentgate.identity import IdentityConfigError, TrustConfig, load_identity_config
     from agentgate.model_proxy.proxy import ProxySetupError
     from agentgate.model_proxy.server import MultiRunProxy, ServerConfig
 
@@ -366,6 +379,15 @@ def model_proxy_server(
         fail(f"--ready-file {ready_file} already exists")
     if max_token_ttl > MAX_TTL.total_seconds():
         fail(f"--max-token-ttl is at most {int(MAX_TTL.total_seconds())} seconds")
+    trust: TrustConfig | None = None
+    note = DEMO_IDENTITY_NOTE
+    if identity_config is not None:
+        try:
+            trust = load_identity_config(identity_config)
+        except IdentityConfigError as exc:
+            fail(str(exc))
+        names = ", ".join(issuer.name for issuer in trust.issuers)
+        note = f"note: runs start only from a verified identity assertion (issuers: {names})"
     base = proxy_config(upstream, keys_file, rate_table, host=host, port=port)
     config = ServerConfig(
         upstreams=dict(base.upstreams),
@@ -375,8 +397,11 @@ def model_proxy_server(
         port=port,
         control_socket=control_socket,
         max_token_ttl=timedelta(seconds=max_token_ttl),
+        identity=trust,
     )
-    with open_cli_world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
+    with open_cli_world(
+        db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES, identity_note=note
+    ) as world:
         server = MultiRunProxy(world, config)
         try:
             _, socket_path = server.start()
@@ -394,6 +419,12 @@ def model_proxy_server(
             signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
             if server.recovered:
                 typer.echo(f"note: ended {server.recovered} runs of stopped servers", err=True)
+            for name, problem in sorted(server.identity_problems.items()):
+                typer.echo(
+                    f"warning: identity issuer {name}: keys not loaded ({problem});"
+                    " its assertions are refused until they load",
+                    err=True,
+                )
             typer.echo(
                 f"model proxy server {server.instance_id}: {server.model_url},"
                 f" control socket {socket_path}",

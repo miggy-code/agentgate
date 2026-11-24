@@ -73,6 +73,29 @@ class ControlClient:
         max_calls: int | None = None,
     ) -> RunStart:
         body: dict[str, Any] = {"customer_id": customer_id, "user_id": user_id}
+        return self._start(body, ttl_seconds, max_usd, max_calls)
+
+    def start_verified_run(
+        self,
+        assertion: str,
+        *,
+        ttl_seconds: int | None = None,
+        max_usd: Decimal | str | None = None,
+        max_calls: int | None = None,
+    ) -> RunStart:
+        """Start a run for the person a signed identity assertion names (a server started
+        with `--identity-config`). The server verifies it and starts the run in the issuer's
+        customer. A refusal is a ControlError with the reason code (`expired`, `replayed`,
+        ...; `issuer_unavailable` with status 503). The assertion is never in an error."""
+        return self._start({"assertion": assertion}, ttl_seconds, max_usd, max_calls)
+
+    def _start(
+        self,
+        body: dict[str, Any],
+        ttl_seconds: int | None,
+        max_usd: Decimal | str | None,
+        max_calls: int | None,
+    ) -> RunStart:
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         if max_usd is not None:

@@ -27,14 +27,14 @@ Each attack scenario has a mutation test. The test removes the protection the sc
 | prompt_injection_exfil | 16 | 16/16 | 16/16 |
 | approval_bypass | 15 | 15/15 | 15/15 |
 | spend_runaway | 14 | 14/14 | 14/14 |
-| identity_spoofing | 16 | 16/16 | 16/16 |
+| identity_spoofing | 25 | 25/25 | 25/25 |
 | fail_closed | 17 | 17/17 | 17/17 |
 | audit_integrity | 19 | 19/19 | 19/19 |
 | model_boundary | 29 | 29/29 | 29/29 |
-| **attacks total** | **156** | **156/156** | **156/156** |
+| **attacks total** | **165** | **165/165** | **165/165** |
 | benign_control | 21 | 21/21 | 21/21 |
 
-From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `c4a8422`.
+From `uv run agentgate redteam` and `uv run agentgate redteam --transport mcp` at commit `5f3a057`.
 
 The threat model is a fully compromised model. Most attack scenarios propose the harmful call directly. Some prompt injection scenarios use a mock model that obeys any instruction it reads. Benign controls are normal tasks that the gate must allow, so a gate that denies everything fails them.
 
@@ -215,6 +215,8 @@ with ControlClient(socket_path) as control:  # "control_socket" in proxy.json
 
 `model-proxy server` is one long-running process. It serves model calls for many runs of one world, so a host does not need a proxy for each run. A host on the same machine starts a run on a Unix control socket. The socket is 0600 in a new 0700 directory, so only the server's own user can reach it. The host gets back the run token and the caps in effect. Caps that the host asks for can only tighten the policy's caps. The server serves only the runs it started. It refuses a token of any other run as `not_served`. When it stops, it ends every run it started. See [The multi-run model proxy](docs/design.md#the-multi-run-model-proxy).
 
+With `--identity-config identity.yaml`, the host cannot name the user. It hands over a signed identity assertion instead, `control.start_verified_run(assertion)`, and agentgate verifies the assertion itself before it starts the run. Two kinds of issuer are trusted, and each is bound to one customer: a host's own persona signer (Ed25519 keys from `agentgate identity keygen`, assertions from `agentgate.identity.mint_assertion`), and any OpenID Connect provider. The OIDC side is tested against Keycloak. Every refusal is recorded with its reason code, never the assertion, and a verified run is recorded as `verified:<issuer>`. See [Verified run start](docs/design.md#verified-run-start).
+
 ### As the spend gate for an experiment
 
 ```bash
@@ -234,7 +236,7 @@ When the proxy is listening, it writes the `--ready-file`. This is a 0600 JSON f
 
 These are the main limits. [docs/limits.md](docs/limits.md) has the full list.
 
-- **agentgate does not authenticate users.** The host, or the person who starts the gateway, must do that. `--as` on the CLI is a demo identity.
+- **agentgate authenticates users only at a verified run start.** A multi-run model proxy started with `--identity-config` checks a signed identity assertion before it starts a run. Everywhere else, the host or the person who starts the gateway must authenticate users, and `--as` on the CLI is a demo identity. A verified start proves only that a trusted issuer vouched for the person. A stolen signing key can start runs for any user of that issuer's customer.
 - **In-process, agentgate guards only the tools that the gate alone can reach.** Code that holds a tool's credentials or the database can skip the gate. The MCP gateway closes this gap for an agent that holds only the MCP connection.
 - **The audit log is tamper-evident, not tamper-proof.** If someone edits or deletes a stored event, verification fails. But a person with write access can delete the newest events and rewrite the chain metadata. To find that, you need a checkpoint stored in a different place.
 - **The audit log and the state database are two SQLite files with no two-phase commit.** If the log fails just after a tool runs, the `executed` event for that tool can be missing.
@@ -257,7 +259,7 @@ uv run agentgate --help
 
 More docs:
 
-- [docs/design.md](docs/design.md): search, approvals, spend, recipients, audit, integration, the MCP gateway, the model proxy, the policy format, the CLI, latency, a real model, the architecture and the project layout.
+- [docs/design.md](docs/design.md): search, approvals, spend, recipients, audit, integration, the MCP gateway, the model proxy, verified run start, the policy format, the CLI, latency, a real model, the architecture and the project layout.
 - [docs/limits.md](docs/limits.md): all known limits.
 - [docs/redteam-scenarios.md](docs/redteam-scenarios.md): all red-team scenarios.
 
