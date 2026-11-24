@@ -30,6 +30,7 @@ from agentgate.model_proxy.proxy import (
     check_rates,
     generation_route,
 )
+from agentgate.world import World
 from proxyharness import (
     BODY,
     OK_COST,
@@ -499,8 +500,10 @@ def test_a_proxy_started_on_a_gateways_run_shares_its_caps_with_the_tools(tmp_pa
         )
         assert conn.getresponse().status == 200
         conn.close()
+        # run_spent counts the open worst-case reservation, so wait for it to settle: the
+        # proxy settles after the client has its reply.
         deadline = time.monotonic() + 5
-        while world.gate.ledger.run_spent(run.run_id) == 0 and time.monotonic() < deadline:
+        while _open_reservations(world, run.run_id) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert world.gate.ledger.run_spent(run.run_id) == OK_COST
         assert world.gate.ledger.run_calls(run.run_id) == 1
@@ -510,3 +513,12 @@ def test_a_proxy_started_on_a_gateways_run_shares_its_caps_with_the_tools(tmp_pa
         proxy.stop()
         world.close()
         provider.close()
+
+
+def _open_reservations(world: World, run_id: str) -> int:
+    with world.store.locked():
+        row = world.store.connection.execute(
+            "SELECT COUNT(*) FROM spend_reservations WHERE run_id = ? AND status = 'open'",
+            (run_id,),
+        ).fetchone()
+    return int(row[0])
