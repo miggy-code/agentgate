@@ -14,7 +14,8 @@ from agentgate.approvals import ApprovalQueue
 from agentgate.context import RunContext
 from agentgate.domain import Action, Document, Role, User, UserStatus
 from agentgate.fixtures import FixtureSync
-from agentgate.gate import Gate, _Run
+from agentgate.gate import Gate
+from agentgate.gate.runs import CheckedRun
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Conditions, Effect, LabelBound, PolicyBundle, Rule
 from agentgate.redteam.core import (
@@ -40,16 +41,16 @@ WorldMutation = Callable[[World, pytest.MonkeyPatch], None]
 def _track_runs(world: World, mp: pytest.MonkeyPatch) -> dict[str, str]:
     """Remember the customer and run id of the last run the gate accepted."""
     current: dict[str, str] = {}
-    real = world.gate._check_run
+    real = world.gate._runs.check
 
     def check_run(ctx: RunContext, call: Any) -> Any:
         result = real(ctx, call)
-        if isinstance(result, _Run):
+        if isinstance(result, CheckedRun):
             current["customer"] = result.ctx.customer_id
             current["run"] = result.ctx.run_id
         return result
 
-    mp.setattr(world.gate, "_check_run", check_run)
+    mp.setattr(world.gate._runs, "check", check_run)
     return current
 
 
@@ -139,7 +140,9 @@ class _TenantBlindQueue:
 
 def approval_tenant_blind(world: World, mp: pytest.MonkeyPatch) -> None:
     current = _track_runs(world, mp)
-    mp.setattr(world.gate, "_approvals", _TenantBlindQueue(world.gate.approvals, current))
+    blind = _TenantBlindQueue(world.gate.approvals, current)
+    for part in (world.gate._tool_calls, world.gate._decisions):
+        mp.setattr(part, "_approvals", blind)
 
 
 def lax_args(world: World, mp: pytest.MonkeyPatch) -> None:
@@ -169,7 +172,9 @@ def _rebuild(
         customer = world.store.get_customer(customer_id)
         assert customer is not None
         engines[customer_id] = PolicyEngine(edit(engine.bundle), customer)
-    mp.setattr(world.gate, "_engines", engines)
+    # Every part of the gate shares the one engines mapping.
+    for customer_id, engine in engines.items():
+        mp.setitem(world.gate._engines, customer_id, engine)
 
 
 def _edit_rules(world: World, mp: pytest.MonkeyPatch, edit: Callable[[Rule], Rule]) -> None:
@@ -299,18 +304,18 @@ def any_role_approves(world: World, mp: pytest.MonkeyPatch) -> None:
 
 def no_recipient_clearance(world: World, mp: pytest.MonkeyPatch) -> None:
     """Every internal recipient counts as cleared for whatever the run has read."""
-    mp.setattr(world.gate, "_uncleared_recipient", lambda run, recipients: False)
+    mp.setattr(world.gate._tool_calls, "_uncleared_recipient", lambda run, recipients: False)
 
 
 def no_label_tracking(world: World, mp: pytest.MonkeyPatch) -> None:
     """The run's max label never rises, so write-down has nothing to compare against."""
-    mp.setattr(world.gate, "_raise_label", lambda run, labels: None)
+    mp.setattr(world.gate._runs, "raise_label", lambda run, labels: None)
 
 
 def trust_context(world: World, mp: pytest.MonkeyPatch) -> None:
     """The gate believes whatever RunContext-shaped object it is handed."""
     gate: Gate = world.gate
-    real = gate._check_run
+    real = gate._runs.check
 
     def check_run(ctx: Any, call: Any) -> Any:
         customer_id = getattr(ctx, "customer_id", None)
@@ -341,9 +346,9 @@ def trust_context(world: World, mp: pytest.MonkeyPatch) -> None:
                 " max_label) VALUES (?, ?, ?, ?, ?, NULL)",
                 (trusted.run_id, customer.id, trusted.user_id, role.value, "2026-10-22T15:00:00"),
             )
-        return _Run(ctx=trusted, user=user, customer=customer, engine=engine)
+        return CheckedRun(ctx=trusted, user=user, customer=customer, engine=engine)
 
-    mp.setattr(gate, "_check_run", check_run)
+    mp.setattr(gate._runs, "check", check_run)
 
 
 def ignore_suspension(world: World, mp: pytest.MonkeyPatch) -> None:
@@ -377,15 +382,15 @@ def unknown_approver_is_manager(world: World, mp: pytest.MonkeyPatch) -> None:
 
 def run_role_is_owner(world: World, mp: pytest.MonkeyPatch) -> None:
     """The gate honours an owner claim: every accepted run acts as the owner."""
-    real = world.gate._check_run
+    real = world.gate._runs.check
 
     def check_run(ctx: RunContext, call: Any) -> Any:
         result = real(ctx, call)
-        if isinstance(result, _Run):
+        if isinstance(result, CheckedRun):
             return replace(result, ctx=replace(result.ctx, role=Role.OWNER))
         return result
 
-    mp.setattr(world.gate, "_check_run", check_run)
+    mp.setattr(world.gate._runs, "check", check_run)
 
 
 def start_run_customer_blind(world: World, mp: pytest.MonkeyPatch) -> None:

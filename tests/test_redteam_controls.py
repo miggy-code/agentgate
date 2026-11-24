@@ -23,14 +23,19 @@ import pytest
 import yaml
 
 import agentgate.audit.panoptes as panoptes_module
-import agentgate.gate as gate_module
+import agentgate.gate.tool_calls as tool_calls_module
 import agentgate.policy.engine as engine_module
 import agentgate.retrieval as retrieval_module
 import agentgate.store as store_module
 import agentgate.world as world_module
 from agentgate.approvals import ApprovalQueue
 from agentgate.audit.panoptes import PanoptesSink
-from agentgate.gate import CapReached, Denied, Gate
+from agentgate.gate import CapReached, Denied
+from agentgate.gate.decisions import ApprovalDecisions
+from agentgate.gate.operator_log import OperatorLog
+from agentgate.gate.recorder import AuditRecorder
+from agentgate.gate.runs import RunRegistry, bind
+from agentgate.gate.tool_calls import ToolCalls
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import Effect
 from agentgate.redteam.core import (
@@ -57,21 +62,21 @@ from conftest import (
 
 
 def execute_ignoring_approval(
-    self: Gate, ctx: Any, approval_id: str, tool: str, action: Any, args: Any
+    self: ToolCalls, ctx: Any, approval_id: str, tool: str, action: Any, args: Any
 ) -> Any:
     """execute_approved with every approval check removed: decide, then run."""
-    call = self._begin(ctx, tool, action)
-    checked = self._check_run(ctx, call)
+    call = self._runs.begin(ctx, tool, action)
+    checked = self._runs.check(ctx, call)
     if isinstance(checked, Denied):
         return checked
-    call = gate_module._bind(call, checked)
+    call = bind(call, checked)
     prepared = self._prepare(checked, call, tool, action, args)
     if isinstance(prepared, Denied):
         return prepared
     verdict = self._verdict(checked, prepared)
     if verdict.effect is Effect.DENY:
         return self._deny_verdict(call, prepared, verdict, None)
-    reservation = self._reserve(checked, call, prepared.config.cost_usd)
+    reservation = self._runs.reserve(checked, call, prepared.config.cost_usd)
     if isinstance(reservation, CapReached):
         return reservation
     return self._execute(checked, call, prepared, reservation, verdict, subject=None)
@@ -123,7 +128,7 @@ def _code_mutations() -> list[Mutation]:
         # Approval bypass
         Mutation(
             "approvals ignored",
-            replace=((Gate, "execute_approved", execute_ignoring_approval),),
+            replace=((ToolCalls, "execute_approved", execute_ignoring_approval),),
             breaks=(
                 "ab-001",
                 "ab-002",
@@ -144,7 +149,7 @@ def _code_mutations() -> list[Mutation]:
             "approval not bound to its run",
             edits=(
                 (
-                    Gate,
+                    ToolCalls,
                     "execute_approved",
                     (
                         (
@@ -219,7 +224,11 @@ def _code_mutations() -> list[Mutation]:
         Mutation(
             "approved calls not decided again",
             edits=(
-                (Gate, "execute_approved", (("if verdict.effect is Effect.DENY:", "if False:"),)),
+                (
+                    ToolCalls,
+                    "execute_approved",
+                    (("if verdict.effect is Effect.DENY:", "if False:"),),
+                ),
             ),
             breaks=("ab-013", "ab-014"),
         ),
@@ -243,12 +252,11 @@ def _code_mutations() -> list[Mutation]:
             "raw approval ids written to the audit",
             edits=(
                 (
-                    Gate,
+                    ApprovalDecisions,
                     "_decide_approval",
                     (
                         (
-                            "safe_id = approval_id if _APPROVAL_ID.fullmatch(approval_id)"
-                            " else None",
+                            "safe_id = approval_id if APPROVAL_ID.fullmatch(approval_id) else None",
                             "safe_id = approval_id",
                         ),
                     ),
@@ -261,11 +269,11 @@ def _code_mutations() -> list[Mutation]:
             "model-chosen tool names written to the audit",
             edits=(
                 (
-                    Gate,
-                    "_begin",
+                    RunRegistry,
+                    "begin",
                     (
                         (
-                            "tool=tool if tool is not None and _TOOL_ID.fullmatch(tool) else None,",
+                            "tool=tool if tool is not None and TOOL_ID.fullmatch(tool) else None,",
                             "tool=tool,",
                         ),
                     ),
@@ -277,7 +285,7 @@ def _code_mutations() -> list[Mutation]:
             "tools configured for any customer accepted",
             edits=(
                 (
-                    Gate,
+                    ToolCalls,
                     "_prepare",
                     (
                         (
@@ -306,7 +314,7 @@ def _code_mutations() -> list[Mutation]:
             "arguments not validated",
             edits=(
                 (
-                    gate_module,
+                    tool_calls_module,
                     "_validate_args",
                     (
                         (
@@ -324,8 +332,8 @@ def _code_mutations() -> list[Mutation]:
             "missing policy falls back to the shipped one",
             edits=(
                 (
-                    Gate,
-                    "_check_run",
+                    RunRegistry,
+                    "check",
                     (
                         (
                             'engine = self._engines.get(row["customer_id"])',
@@ -373,7 +381,7 @@ def _code_mutations() -> list[Mutation]:
             "tool runs when its allow cannot be recorded",
             edits=(
                 (
-                    Gate,
+                    ToolCalls,
                     "_execute",
                     (
                         ("self._ledger.release(reservation)", "pass"),
@@ -388,7 +396,7 @@ def _code_mutations() -> list[Mutation]:
             "search returns results its retrieval event could not record",
             edits=(
                 (
-                    Gate,
+                    ToolCalls,
                     "_search",
                     (
                         (
@@ -403,7 +411,7 @@ def _code_mutations() -> list[Mutation]:
         ),
         Mutation(
             "failed tool keeps its spend reservation",
-            edits=((Gate, "_tool_failed", (("self._ledger.release(reservation)", "pass"),)),),
+            edits=((ToolCalls, "_tool_failed", (("self._ledger.release(reservation)", "pass"),)),),
             breaks=("fc-011",),
         ),
         Mutation(
@@ -421,7 +429,7 @@ def _code_mutations() -> list[Mutation]:
             "recipients split on the last at sign",
             replace=(
                 (engine_module, "_parse_address", lax_parse_address),
-                (gate_module, "_is_external", lax_is_external),
+                (tool_calls_module, "is_external", lax_is_external),
             ),
             breaks=("fc-013",),
         ),
@@ -447,8 +455,8 @@ def _code_mutations() -> list[Mutation]:
             "events lose their policy version",
             edits=(
                 (
-                    Gate,
-                    "_emit",
+                    AuditRecorder,
+                    "emit",
                     (
                         (
                             "policy_version=policy_version or call.policy_version,",
@@ -472,14 +480,16 @@ def _code_mutations() -> list[Mutation]:
         ),
         Mutation(
             "denials lose their rule ids",
-            edits=((Gate, "_deny_verdict", (("rule_ids=verdict.rule_ids,", "rule_ids=(),"),)),),
+            edits=(
+                (ToolCalls, "_deny_verdict", (("rule_ids=verdict.rule_ids,", "rule_ids=(),"),)),
+            ),
             breaks=("ai-002",),
         ),
         Mutation(
             "allow events log the arguments",
             edits=(
                 (
-                    Gate,
+                    ToolCalls,
                     "_record_allow",
                     (
                         (
@@ -507,7 +517,7 @@ def _code_mutations() -> list[Mutation]:
         ),
         Mutation(
             "executed events dropped",
-            edits=((Gate, "_finish", (("self._emit(", "(lambda *a, **k: None)("),)),),
+            edits=((ToolCalls, "_finish", (("self._recorder.emit(", "(lambda *a, **k: None)("),)),),
             breaks=("ai-008",),
         ),
         Mutation(
@@ -519,9 +529,9 @@ def _code_mutations() -> list[Mutation]:
             "refused identities not recorded",
             edits=(
                 (
-                    Gate,
-                    "_identity_denied",
-                    (("self._emit(call, EventKind.DENY, reason, decision=True)", "pass"),),
+                    AuditRecorder,
+                    "identity_denied",
+                    (("self.emit(call, EventKind.DENY, reason, decision=True)", "pass"),),
                 ),
             ),
             breaks=("ai-010",),
@@ -530,7 +540,7 @@ def _code_mutations() -> list[Mutation]:
             "retrieval events log the query terms",
             edits=(
                 (
-                    Gate,
+                    ToolCalls,
                     "_search",
                     (
                         (
@@ -552,8 +562,8 @@ REFERENCE_MUTATIONS = [
         ("ai-013", "ai-014"),
         edits=(
             (
-                Gate,
-                "_emit",
+                AuditRecorder,
+                "emit",
                 (
                     (
                         "references=self._references(call, subject, unknown_subject),",
@@ -577,19 +587,19 @@ REFERENCE_MUTATIONS = [
     Mutation(
         "a missing document id is treated as a known one",
         ("ai-013", "ai-014"),
-        edits=((Gate, "_prepare", (("unknown_subject=facts.document_id,", ""),)),),
+        edits=((ToolCalls, "_prepare", (("unknown_subject=facts.document_id,", ""),)),),
     ),
     Mutation(
         "a missing approval id is treated as a known one",
         ("ai-013",),
-        edits=((Gate, "execute_approved", (("unknown_subject=_text(approval_id),", ""),)),),
+        edits=((ToolCalls, "execute_approved", (("unknown_subject=as_text(approval_id),", ""),)),),
     ),
     Mutation(
         "an unknown approver is treated as a known one",
         ("ai-014",),
         edits=(
             (
-                Gate,
+                ApprovalDecisions,
                 "_decide_approval",
                 (('claimed=frozenset({"user_id"})', "claimed=frozenset()"),),
             ),
@@ -600,8 +610,8 @@ REFERENCE_MUTATIONS = [
         ("ai-014",),
         edits=(
             (
-                Gate,
-                "start_run",
+                RunRegistry,
+                "start",
                 (('claimed=frozenset({"customer_id", "user_id"}),', "claimed=frozenset(),"),),
             ),
         ),
@@ -631,7 +641,7 @@ RECONSTRUCT_MUTATIONS = [
     Mutation(
         "the approval request carries no approval hash",
         ("ai-020",),
-        edits=((Gate, "call_tool", (('"approval_args_hash": created.args_hash,', ""),)),),
+        edits=((ToolCalls, "call", (('"approval_args_hash": created.args_hash,', ""),)),),
     ),
     Mutation(
         "check-store skips approval rows",
@@ -641,7 +651,7 @@ RECONSTRUCT_MUTATIONS = [
     Mutation(
         "executed events name no side-effect row",
         ("ai-021", "ai-024"),
-        edits=((Gate, "_finish", (("if result.effect_ref is not None:", "if False:"),)),),
+        edits=((ToolCalls, "_finish", (("if result.effect_ref is not None:", "if False:"),)),),
     ),
     Mutation(
         "check-store skips side-effect rows",
@@ -656,17 +666,17 @@ RECONSTRUCT_MUTATIONS = [
     Mutation(
         "policy loads are not recorded",
         ("ai-022",),
-        replace=((Gate, "record_policy_loaded", _nothing),),
+        replace=((OperatorLog, "record_policy_loaded", _nothing),),
     ),
     Mutation(
         "operator actions are not recorded",
         ("ai-023",),
-        replace=((Gate, "record_operator_action", _nothing),),
+        replace=((OperatorLog, "record_operator_action", _nothing),),
     ),
     Mutation(
         "the stale sweep records nothing",
         ("ai-023",),
-        edits=((Gate, "release_stale", (("if not record:", "if True:"),)),),
+        edits=((OperatorLog, "release_stale", (("if not record:", "if True:"),)),),
     ),
     Mutation(
         "the fixture sync records nothing",
@@ -676,14 +686,14 @@ RECONSTRUCT_MUTATIONS = [
     Mutation(
         "decision events carry no values",
         ("ai-020", "ai-021", "ai-024"),
-        replace=((Gate, "_call_values", _no_values),),
+        replace=((ToolCalls, "_call_values", _no_values),),
     ),
     Mutation(
         "allow events drop the call's values",
         ("ai-024",),
         edits=(
             (
-                Gate,
+                ToolCalls,
                 "_record_allow",
                 (("details = {**prepared.values, **(details or {})}", "details = details or {}"),),
             ),
