@@ -48,7 +48,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
-from agentgate.models import Customer, Document, User
+from agentgate.domain import Customer, Document, User
 
 # documents.acl is a JSON list of principals, or NULL for a document without a source ACL.
 # No SQL comments inside the statements: SQLite keeps the CREATE text and rewrites it on

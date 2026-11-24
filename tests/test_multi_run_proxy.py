@@ -30,11 +30,11 @@ import pytest
 from agentgate.audit.base import AuditEvent, EventKind, OperatorAction
 from agentgate.audit.panoptes import read_events, verify_log
 from agentgate.model.admission import Caps
-from agentgate.model.client import ControlClient, ControlError
 from agentgate.model.keys import ProviderKeys
-from agentgate.model.proxy import ProxyConfig, ProxySetupError
-from agentgate.model.server import MultiRunProxy, ServedRuns, ServerConfig
 from agentgate.model.tokens import TokenStore
+from agentgate.model_proxy.client import ControlClient, ControlError
+from agentgate.model_proxy.proxy import ProxyConfig, ProxySetupError
+from agentgate.model_proxy.server import MultiRunProxy, ServedRuns, ServerConfig
 from agentgate.policy.schema import ModelProvider
 from agentgate.store import Store
 from agentgate.world import World, open_world
@@ -208,7 +208,7 @@ def test_a_token_from_a_serve_process_on_the_same_world_is_refused_not_served(
 
 
 def _serve_proxy(world: World, made: Served) -> Any:
-    from agentgate.model.proxy import ModelProxy
+    from agentgate.model_proxy.proxy import ModelProxy
 
     proxy = ModelProxy(
         world,

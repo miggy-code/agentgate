@@ -117,7 +117,7 @@ The host builds a world with `open_world`. A world is the store, fixtures, index
 ```python
 from pathlib import Path
 
-from agentgate.models import Action
+from agentgate.domain import Action
 from agentgate.world import open_world
 
 with open_world(
@@ -292,10 +292,10 @@ agentgate model-proxy server --upstream openai_compatible=https://api.deepseek.c
 
 This is one long-running process that serves model calls for many runs of one world. The model listener is the same Panoptes proxy on a loopback port, with the same `before_forward` and `after_exchange` steps as `serve`.
 
-The difference is where a token's run comes from (`RunSource` in `model/proxy.py`):
+The difference is where a token's run comes from (`RunSource` in `model_proxy/proxy.py`):
 
 - `serve` serves the one run it started. It refuses a token of any other run as `wrong_run`.
-- The server (`ServedRuns` in `model/server.py`) accepts a token for the run that the token names, if this server instance started that run. It refuses any other run as `not_served`. This includes a run of a `serve` process on the same world and a run of another server.
+- The server (`ServedRuns` in `model_proxy/server.py`) accepts a token for the run that the token names, if this server instance started that run. It refuses any other run as `not_served`. This includes a run of a `serve` process on the same world and a run of another server.
 - Like `serve`, the server refuses a run that has ended, or whose user is unknown, suspended or of another customer.
 
 A world can hold several customers, and the server serves all of them. A host with several worlds runs one server for each world.
@@ -326,7 +326,7 @@ How `POST /runs` works:
 
 A malformed request gets a 400 with a reason code. Malformed means it is not one JSON object, or it has a repeated or unknown field, or a wrong type. Another route gets 404, and another method gets 405. The server never sends a traceback.
 
-`agentgate.model.client.ControlClient(socket_path)` wraps the three requests over httpx's Unix-socket transport. It refuses a socket path that is a symlink or not a socket. It also refuses a socket in a directory that is a symlink, that another user owns, or that group or others can open.
+`agentgate.model_proxy.client.ControlClient(socket_path)` wraps the three requests over httpx's Unix-socket transport. It refuses a socket path that is a symlink or not a socket. It also refuses a socket in a directory that is a symlink, that another user owns, or that group or others can open.
 
 #### Lifecycle
 

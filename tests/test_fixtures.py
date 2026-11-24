@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agentgate.domain import Customer, Document, Role, User, UserStatus
 from agentgate.fixtures import (
     CANARY_RE,
     CustomerCounts,
@@ -14,7 +15,6 @@ from agentgate.fixtures import (
     load_fixtures,
     sync_fixtures,
 )
-from agentgate.models import Customer, Document, Role, User, UserStatus
 from agentgate.store import Store
 
 CANARY_A = "AGCANARY-0123456789AB"

@@ -9,7 +9,7 @@ it has read) lives in the gate's own records, keyed by run_id.
 from dataclasses import dataclass
 from datetime import datetime
 
-from agentgate.models import Role
+from agentgate.domain import Role
 
 
 @dataclass(frozen=True)

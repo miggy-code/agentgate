@@ -22,7 +22,7 @@ from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.audit.panoptes import read_events
 from agentgate.model.admission import Caps
 from agentgate.model.keys import ProviderKeys
-from agentgate.model.proxy import ModelProxy, ProxyConfig
+from agentgate.model_proxy.proxy import ModelProxy, ProxyConfig
 from agentgate.policy.schema import ModelProvider
 from conftest import open_file_world
 

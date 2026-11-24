@@ -47,7 +47,7 @@ from enum import StrEnum
 from pydantic import JsonValue
 
 from agentgate.clock import Clock
-from agentgate.models import Action, User, UserStatus
+from agentgate.domain import Action, User, UserStatus
 from agentgate.policy.schema import ApprovalSettings
 from agentgate.store import Store
 

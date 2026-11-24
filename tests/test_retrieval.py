@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from agentgate.context import RunContext
+from agentgate.domain import Action, Customer, Document, Role, User
 from agentgate.fixtures import find_canaries, load_fixtures
-from agentgate.models import Action, Customer, Document, Role, User
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Request
 from agentgate.policy.schema import Effect, load_bundle, load_bundles
 from agentgate.retrieval import (

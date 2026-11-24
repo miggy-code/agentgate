@@ -16,7 +16,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, Reference
 from agentgate.audit.panoptes import PanoptesSink, storable_identifier, to_panoptes_event
-from agentgate.models import Action, Role
+from agentgate.domain import Action, Role
 
 T0 = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 

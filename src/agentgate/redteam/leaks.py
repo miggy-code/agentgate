@@ -33,8 +33,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from agentgate.audit.base import AuditEvent, EventKind
+from agentgate.domain import Action, Document, Role, User, UserStatus
 from agentgate.fixtures import find_canaries
-from agentgate.models import Action, Document, Role, User, UserStatus
 from agentgate.policy.addresses import parse_address
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Request
 from agentgate.policy.schema import Effect

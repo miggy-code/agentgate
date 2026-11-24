@@ -21,9 +21,9 @@ from agentgate.agent.model import AssistantMessage, Message, ToolSpec
 from agentgate.approvals import Approval, ApprovalError
 from agentgate.audit.base import EventKind
 from agentgate.context import RunContext
+from agentgate.domain import Role, UserStatus
 from agentgate.fixtures import sync_fixtures
 from agentgate.gate import IdentityError, PendingApproval
-from agentgate.models import Role, UserStatus
 from agentgate.redteam.core import (
     REDTEAM_START,
     Arena,

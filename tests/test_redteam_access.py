@@ -12,9 +12,9 @@ from pydantic import ConfigDict
 import agentgate.world as world_module
 from agentgate.approvals import ApprovalQueue
 from agentgate.context import RunContext
+from agentgate.domain import Action, Document, Role, User, UserStatus
 from agentgate.fixtures import FixtureSync
 from agentgate.gate import Gate, _Run
-from agentgate.models import Action, Document, Role, User, UserStatus
 from agentgate.policy.engine import Decision, DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Conditions, Effect, LabelBound, PolicyBundle, Rule
 from agentgate.redteam.core import (

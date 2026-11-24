@@ -19,8 +19,8 @@ import agentgate.gateway
 from agentgate.audit.base import MemorySink
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.clock import FixedClock
+from agentgate.domain import Action, UserStatus
 from agentgate.gate import Denied, Executed, Gate
-from agentgate.models import Action, UserStatus
 from agentgate.spend import Reservation
 from agentgate.store import Store
 from agentgate.world import World, open_world

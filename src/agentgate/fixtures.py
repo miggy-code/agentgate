@@ -25,7 +25,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from agentgate._yaml import parse_yaml
-from agentgate.models import Customer, Document, User, UserStatus
+from agentgate.domain import Customer, Document, User, UserStatus
 from agentgate.store import Store
 
 # A fixture canary line. The red-team suite reuses this to recognise the planted secrets.

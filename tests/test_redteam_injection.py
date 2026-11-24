@@ -16,8 +16,8 @@ import pytest
 from agentgate import gate as gate_module
 from agentgate.approvals import Approval, ApprovalError, ApprovalQueue, ApprovalStatus
 from agentgate.context import RunContext
+from agentgate.domain import User
 from agentgate.gate import Gate
-from agentgate.models import User
 from agentgate.policy import addresses
 from agentgate.policy import engine as engine_module
 from agentgate.policy.engine import PolicyEngine

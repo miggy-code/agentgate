@@ -25,8 +25,8 @@ from agentgate.audit.panoptes import PanoptesSink, read_events
 from agentgate.cli import DEMO_IDENTITY_NOTE, app
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action
 from agentgate.gate import Denied, Executed, PendingApproval
-from agentgate.models import Action
 from agentgate.spend import Reservation
 from agentgate.store import Store, StoreError
 from agentgate.tools import ToolEnv, ToolResult, default_tools

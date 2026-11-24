@@ -47,7 +47,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from agentgate.context import RunContext
-from agentgate.models import Action, Document, Role
+from agentgate.domain import Action, Document, Role
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Request
 from agentgate.policy.schema import Effect
 from agentgate.store import Store

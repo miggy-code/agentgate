@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 
-from agentgate.models import Action, Customer, Document, Role
+from agentgate.domain import Action, Customer, Document, Role
 from agentgate.policy import addresses
 from agentgate.policy.schema import (
     DOCUMENT_ACTIONS,

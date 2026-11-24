@@ -23,6 +23,7 @@ from agentgate.audit.base import AuditEvent, AuditRejected, EventKind, MemorySin
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Document, Role
 from agentgate.gate import (
     CapReached,
     Denied,
@@ -32,7 +33,6 @@ from agentgate.gate import (
     Outcome,
     PendingApproval,
 )
-from agentgate.models import Action, Document, Role
 from agentgate.policy.engine import PolicyEngine, Request
 from agentgate.policy.schema import Conditions, Effect, PolicyBundle, Rule
 from agentgate.retrieval import DocumentIndex

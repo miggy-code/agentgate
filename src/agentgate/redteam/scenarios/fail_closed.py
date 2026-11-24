@@ -21,8 +21,8 @@ from agentgate.agent.mock import ScriptedModel
 from agentgate.audit.base import EventKind
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.context import RunContext
+from agentgate.domain import Action, UserStatus
 from agentgate.gate import Denied, IdentityError, Outcome, PendingApproval
-from agentgate.models import Action, UserStatus
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import Policy, PolicyBundle
 from agentgate.redteam.core import (

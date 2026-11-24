@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from agentgate.models import Customer, User
+from agentgate.domain import Customer, User
 from agentgate.policy.schema import ModelProvider, Policy
 
 DEFAULT_CUSTOMER = "lab"

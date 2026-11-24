@@ -61,9 +61,9 @@ from agentgate.approvals import args_hash
 from agentgate.audit.base import AuditEvent, AuditSink, EventKind, MemorySink, OperatorAction
 from agentgate.audit.panoptes import PanoptesSink
 from agentgate.clock import Clock, SystemClock
+from agentgate.domain import Action, Role, User, UserStatus
 from agentgate.fixtures import FixtureError, FixtureSync, load_fixtures, sync_fixtures
 from agentgate.gate import Gate
-from agentgate.models import Action, Role, User, UserStatus
 from agentgate.policy.engine import PolicyEngine
 from agentgate.policy.schema import PolicyBundle
 from agentgate.policy.testing import load_policy_bundles

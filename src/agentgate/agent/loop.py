@@ -32,8 +32,8 @@ from agentgate.agent.model import (
     UserMessage,
 )
 from agentgate.context import RunContext
+from agentgate.domain import Action
 from agentgate.gate import CapReached, Denied, Executed, Gate, Outcome, PendingApproval
-from agentgate.models import Action
 from agentgate.policy.engine import PolicyEngine
 from agentgate.tools.base import ToolAdapter
 

@@ -150,7 +150,7 @@ The model sees the tool's content, a reason code, an approval id or `cap_reached
 ```python
 from pathlib import Path
 
-from agentgate.models import Action
+from agentgate.domain import Action
 from agentgate.world import open_world
 
 with open_world(
@@ -204,7 +204,7 @@ uv run agentgate model-proxy server \
 ```
 
 ```python
-from agentgate.model.client import ControlClient
+from agentgate.model_proxy.client import ControlClient
 
 with ControlClient(socket_path) as control:  # "control_socket" in proxy.json
     run = control.start_run("kettle-creek-hvac", "kc-staff-nadine", max_usd="0.10")

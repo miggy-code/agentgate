@@ -40,8 +40,8 @@ from agentgate.agent.model import (
 )
 from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.context import RunContext
+from agentgate.domain import Customer
 from agentgate.gate import CapReached, Executed
-from agentgate.models import Customer
 from agentgate.policy.schema import SpendLimits
 from agentgate.redteam.core import Arena, Category, describe, scenario, transcript_calls
 from agentgate.spend import Reservation

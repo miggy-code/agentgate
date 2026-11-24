@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 import yaml
 
+from agentgate.domain import Action
 from agentgate.fixtures import FixtureError, load_fixtures
-from agentgate.models import Action
 from agentgate.policy.engine import PolicyEngine, Reason
 from agentgate.policy.schema import Effect, PolicyError, load_bundle
 from agentgate.policy.testing import (

@@ -31,8 +31,8 @@ from agentgate.agent.model import (
 from agentgate.approvals import ApprovalStatus
 from agentgate.audit.base import AuditEvent, EventKind
 from agentgate.context import RunContext
+from agentgate.domain import Action
 from agentgate.fixtures import find_canaries
-from agentgate.models import Action
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Request
 from agentgate.policy.schema import Effect
 from agentgate.tools import default_tools

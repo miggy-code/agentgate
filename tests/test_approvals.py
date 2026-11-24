@@ -16,7 +16,7 @@ from agentgate.approvals import (
     args_hash,
 )
 from agentgate.clock import FixedClock
-from agentgate.models import Action, Role, User, UserStatus
+from agentgate.domain import Action, Role, User, UserStatus
 from agentgate.policy.schema import ApprovalSettings
 from agentgate.store import Store
 

@@ -7,7 +7,7 @@ credential for the provider's key. `after_exchange` ends the reservation by what
 the call (`Gate.finish_model`). Which runs a token may name, and the caps each is held to,
 come from a `RunSource`: `SingleRun` for `ModelProxy`, the process around one run (it starts
 the run, issues the one token, serves, sweeps stale reservations, and ends the run on
-shutdown), and the multi-run source of `agentgate.model.server` for a proxy serving many.
+shutdown), and the multi-run source of `agentgate.model_proxy.server` for a proxy serving many.
 
 A client sees a status and a reason code, never a policy detail or a key.
 """
@@ -40,6 +40,7 @@ from panoptes.schema import ValidationError
 from agentgate.audit.base import OperatorAction
 from agentgate.audit.panoptes import PanoptesSink, storable_identifier
 from agentgate.context import RunContext
+from agentgate.domain import User
 from agentgate.gate import CapReached, Denied, Gate, IdentityError
 from agentgate.model.admission import Caps, ModelExchange, parse_model_call
 from agentgate.model.keys import ProviderKeys, upstream_headers
@@ -52,7 +53,6 @@ from agentgate.model.tokens import (
     presented_token,
     write_token_file,
 )
-from agentgate.models import User
 from agentgate.policy.schema import ModelProvider, SpendLimits
 from agentgate.spend import Reservation
 from agentgate.world import DEFAULT_RESERVATION_LEASE, World

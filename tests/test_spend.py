@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from agentgate.clock import FixedClock
-from agentgate.models import Customer
+from agentgate.domain import Customer
 from agentgate.policy.schema import SpendLimits
 from agentgate.spend import CapHit, CapKind, Reservation, SpendError, SpendLedger
 from agentgate.store import Store

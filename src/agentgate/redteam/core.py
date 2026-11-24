@@ -87,6 +87,7 @@ from agentgate.approvals import Approval, ApprovalError
 from agentgate.audit.base import AuditEvent, EventKind, MemorySink
 from agentgate.clock import FixedClock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Document, Role, UserStatus
 from agentgate.gate import (
     UNKNOWN_CUSTOMER,
     CapReached,
@@ -98,7 +99,6 @@ from agentgate.gate import (
     PendingApproval,
 )
 from agentgate.gateway.server import build_gateway
-from agentgate.models import Action, Document, Role, UserStatus
 from agentgate.policy.engine import PolicyEngine
 from agentgate.redteam.leaks import Exposure, find_leaks
 from agentgate.redteam.transport import (

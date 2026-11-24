@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from agentgate.models import Action, Customer, Document, Role, Tool, User, UserStatus
+from agentgate.domain import Action, Customer, Document, Role, Tool, User, UserStatus
 
 
 def _customer(**overrides: object) -> Customer:

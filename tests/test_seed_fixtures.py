@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from agentgate.domain import Role, UserStatus
 from agentgate.fixtures import find_canaries, load_fixtures
-from agentgate.models import Role, UserStatus
 from agentgate.store import Store
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"

@@ -15,9 +15,9 @@ import agentgate.redteam.scenarios as scenarios_package
 from agentgate.agent.mock import RepeatModel, ScriptedModel
 from agentgate.approvals import ApprovalError
 from agentgate.audit.base import AuditEvent, EventKind
+from agentgate.domain import Action, Role
 from agentgate.fixtures import find_canaries
 from agentgate.gate import Denied, IdentityError
-from agentgate.models import Action, Role
 from agentgate.policy.engine import Decision, Reason, Request
 from agentgate.policy.schema import Effect
 from agentgate.redteam import core

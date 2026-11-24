@@ -41,7 +41,7 @@ from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from agentgate.clock import Clock
-from agentgate.models import Customer
+from agentgate.domain import Customer
 from agentgate.policy.schema import SpendLimits
 from agentgate.store import Store
 

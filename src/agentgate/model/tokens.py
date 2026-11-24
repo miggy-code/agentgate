@@ -31,8 +31,8 @@ from pathlib import Path
 
 from agentgate.clock import Clock
 from agentgate.context import RunContext
+from agentgate.domain import Role, UserStatus
 from agentgate.model.keys import PRESENTED_CREDENTIAL_HEADERS, TOKEN_PREFIX
-from agentgate.models import Role, UserStatus
 from agentgate.store import ServedRun, Store
 
 DEFAULT_TTL = timedelta(hours=8)

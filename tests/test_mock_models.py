@@ -28,7 +28,7 @@ from agentgate.agent.model import (
     ToolSpec,
     UserMessage,
 )
-from agentgate.models import Action
+from agentgate.domain import Action
 from agentgate.tools import default_tools
 from conftest import KC, World
 

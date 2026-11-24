@@ -17,16 +17,16 @@ import yaml
 
 import agentgate.gate as gate_module
 import agentgate.model.admission as admission_module
-import agentgate.model.client as client_module
 import agentgate.model.keys as keys_module
 import agentgate.model.tokens as tokens_module
+import agentgate.model_proxy.client as client_module
 import agentgate.redteam.scenarios.model_boundary as scenarios_module
 from agentgate.gate import Gate
 from agentgate.model.admission import Caps, ModelExchange
 from agentgate.model.keys import KeyConfigError, ProviderKeys
 from agentgate.model.pricing import RateTable
-from agentgate.model.server import ServedRuns
 from agentgate.model.tokens import TokenStore
+from agentgate.model_proxy.server import ServedRuns
 from agentgate.policy.engine import PolicyEngine, Reason
 from agentgate.policy.schema import SpendLimits
 from agentgate.redteam.core import Category, run_suite

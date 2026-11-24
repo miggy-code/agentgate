@@ -10,9 +10,9 @@ from pydantic import ValidationError
 
 from agentgate.audit.base import EventKind, MemorySink
 from agentgate.clock import FixedClock
+from agentgate.domain import Action, Customer, Document, Role, User
 from agentgate.fixtures import load_fixtures, sync_fixtures
 from agentgate.gate import Denied, Executed, Gate
-from agentgate.models import Action, Customer, Document, Role, User
 from agentgate.policy.engine import DocumentFacts, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Effect, load_bundles
 from agentgate.retrieval import DocumentIndex

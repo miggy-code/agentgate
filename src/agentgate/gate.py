@@ -103,10 +103,10 @@ from agentgate.audit.base import (
 from agentgate.audit.panoptes import storable_identifier
 from agentgate.clock import Clock
 from agentgate.context import RunContext
+from agentgate.domain import Action, Customer, Role, Tool, User, UserStatus
 from agentgate.model.admission import Caps, ModelCall, ModelExchange
 from agentgate.model.pricing import RateTable
 from agentgate.model.tokens import TokenRecord
-from agentgate.models import Action, Customer, Role, Tool, User, UserStatus
 from agentgate.policy.addresses import parse_address
 from agentgate.policy.engine import DocumentFacts, ModelRequest, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Effect, Policy, SpendLimits

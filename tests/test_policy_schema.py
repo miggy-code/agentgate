@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 import yaml
 
-from agentgate.models import Action, Role
+from agentgate.domain import Action, Role
 from agentgate.policy.schema import Effect, PolicyError, load_bundle, load_bundles
 
 POLICY: dict[str, Any] = {

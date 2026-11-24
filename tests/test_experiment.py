@@ -11,8 +11,8 @@ import yaml
 
 from agentgate.approvals import ApprovalError, ApprovalErrorReason
 from agentgate.cli import app
+from agentgate.domain import Action, Customer, Role
 from agentgate.gate import Denied
-from agentgate.models import Action, Customer, Role
 from agentgate.policy.engine import ModelRequest, PolicyEngine, Reason, Request
 from agentgate.policy.schema import Effect, ModelProvider, PolicyError, load_bundle
 from agentgate.policy.version import bundle_version

@@ -49,6 +49,7 @@ from agentgate.audit.base import (
 from agentgate.audit.panoptes import read_events, verify_log
 from agentgate.context import RunContext
 from agentgate.demo import AUDIT_FILE, Names, format_transcript, run_demo
+from agentgate.domain import Role, User, UserStatus
 from agentgate.experiment import (
     DEFAULT_CUSTOMER,
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -64,8 +65,6 @@ from agentgate.gate import GateReason, IdentityError, store_audit_reference
 from agentgate.model.admission import Caps
 from agentgate.model.keys import KeyConfigError, load_provider_keys
 from agentgate.model.pricing import RateTableError
-from agentgate.model.proxy import ProxyConfig
-from agentgate.model.server import DEFAULT_MAX_TOKEN_TTL
 from agentgate.model.tokens import (
     DEFAULT_TTL,
     MAX_TTL,
@@ -75,7 +74,8 @@ from agentgate.model.tokens import (
     write_private_file,
     write_token_file,
 )
-from agentgate.models import Role, User, UserStatus
+from agentgate.model_proxy.proxy import ProxyConfig
+from agentgate.model_proxy.server import DEFAULT_MAX_TOKEN_TTL
 from agentgate.policy.engine import Reason
 from agentgate.policy.schema import ModelProvider, PolicyError
 from agentgate.policy.testing import load_policy_bundles, run_policy_tests
@@ -114,7 +114,7 @@ from agentgate.world import (
 )
 
 if TYPE_CHECKING:
-    from agentgate.model.proxy import ModelProxy, ProxyConfig
+    from agentgate.model_proxy.proxy import ModelProxy, ProxyConfig
 
 app = typer.Typer(
     help="Permissions, approval and audit layer between an AI agent and a company's tools.",
@@ -1388,7 +1388,7 @@ def gateway_serve(
         )
         proxy = None
         if config is not None:
-            from agentgate.model.proxy import ModelProxy, ProxySetupError
+            from agentgate.model_proxy.proxy import ModelProxy, ProxySetupError
 
             proxy = ModelProxy(world, user.id, config)
             try:
@@ -1425,7 +1425,7 @@ def _proxy_config(
     ttl_minutes: int | None = None,
     token_file: Path | None = None,
 ) -> "ProxyConfig":
-    from agentgate.model.proxy import ProxyConfig
+    from agentgate.model_proxy.proxy import ProxyConfig
 
     upstreams: dict[ModelProvider, str] = {}
     for item in upstream:
@@ -1505,7 +1505,7 @@ def model_proxy_serve(
     --ready-file tells a harness the proxy is up without parsing stderr: it appears, complete,
     only once the port is listening (and the token file is written), and states the caps the
     proxy enforces, the policy's tightened by --max-usd and --max-calls."""
-    from agentgate.model.proxy import ModelProxy, ProxySetupError
+    from agentgate.model_proxy.proxy import ModelProxy, ProxySetupError
 
     if ready_file is not None and (ready_file.exists() or ready_file.is_symlink()):
         _fail(f"--ready-file {ready_file} already exists")
@@ -1673,14 +1673,14 @@ def model_proxy_server(
     """Serve model APIs for many runs of one world until interrupted.
 
     A host on this machine starts and ends runs on the control socket (see
-    agentgate.model.client.ControlClient): each start returns the run's token, which its
+    agentgate.model_proxy.client.ControlClient): each start returns the run's token, which its
     client sends to the model url in place of a provider key. Only processes of the user
     running the server can reach the socket. Each request is decided as with `model-proxy
     serve`, under the caps its run was started with. Stopping (SIGTERM or an interrupt) drains
     in-flight requests, then ends every run this server started and revokes their tokens.
     Runs of a server that died are ended when the next one starts."""
-    from agentgate.model.proxy import ProxySetupError
-    from agentgate.model.server import MultiRunProxy, ServerConfig
+    from agentgate.model_proxy.proxy import ProxySetupError
+    from agentgate.model_proxy.server import MultiRunProxy, ServerConfig
 
     if ready_file is not None and (ready_file.exists() or ready_file.is_symlink()):
         _fail(f"--ready-file {ready_file} already exists")
@@ -1831,7 +1831,7 @@ def doctor_model_proxy(
     """Check that `model-proxy serve` would start, without starting it: one upstream per
     wire protocol, a provider key for each, a policy model for them, one rate table that
     prices the reservation and the settlement alike, and a Panoptes audit log."""
-    from agentgate.model.proxy import ModelProxy, ProxySetupError
+    from agentgate.model_proxy.proxy import ModelProxy, ProxySetupError
 
     config = _proxy_config(upstream, keys_file, rate_table)
     with _world(db, audit_db, policies, fixtures, record_open=OpenRecord.CHANGES) as world:
