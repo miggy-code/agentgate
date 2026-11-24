@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "panoptes-agentgate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Permissions, approval and audit layer between an AI agent and a company's tools and documents."
 dynamic = ["readme"]
 requires-python = ">=3.12"

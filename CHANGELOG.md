@@ -4,6 +4,41 @@ All notable changes to `panoptes-agentgate` are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). Before 1.0, a minor version can break the API.
 
+## [0.3.0] - 2026-11-24
+
+### Added
+
+- Verified run start. `agentgate model-proxy server --identity-config FILE` starts a run
+  only for a person agentgate verified itself from a signed identity assertion
+  (`ControlClient.start_verified_run`). Without a trust config the server behaves as
+  before; with one, the user-id form is refused as `assertion_required`.
+  - Two issuer kinds, each bound to one customer: `signed` (a host's own Ed25519 persona
+    signer, keys in a local JWKS file, the person in `sub`) and `oidc` (any OpenID Connect
+    provider via discovery and a JWKS cache; with `subject: email`, `email_verified` must
+    be true).
+  - `none` and HMAC algorithms are always refused, keys come only from the configuration
+    (`jku`, `x5u` and `jwk` headers are ignored), and single-use assertions are recorded
+    by a hash of their `jti` so a replay is refused.
+  - Each run records its assurance (`verified:<issuer>`); every refusal is a `deny` audit
+    event with one reason code and never the assertion. An unreachable provider answers
+    503 and fails closed.
+- `agentgate identity keygen`, `agentgate identity check-config` and
+  `agentgate.identity.mint_assertion` for hosts that sign their own assertions.
+- Red-team scenarios id-017 to id-025 for forged, replayed and misdirected assertions.
+- A CI job that runs the OIDC verifier against Keycloak 26.8.2.
+
+### Changed
+
+- New dependency: `pyjwt[crypto]`.
+- The control API's request body limit is 16 KiB (was 4 KiB), so an assertion up to the
+  8 KiB maximum reaches the verifier.
+
+### Security
+
+- An email address with a Unicode look-alike (for example KELVIN SIGN for `K`) no longer
+  matches an ASCII user: only ASCII is case-folded, on both sides.
+- Accepted limits of verified run start are listed in `docs/limits.md`.
+
 ## [0.2.0] - 2026-11-24
 
 Everything since 0.0.1. Version 0.1.0 was prepared but never published, so its changes
@@ -57,5 +92,6 @@ are included here.
 
 First release on PyPI.
 
+[0.3.0]: https://github.com/miggy-code/agentgate/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/miggy-code/agentgate/compare/e5c6cd0...v0.2.0
 [0.0.1]: https://github.com/miggy-code/agentgate/commit/e5c6cd0
