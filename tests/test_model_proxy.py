@@ -460,10 +460,14 @@ def test_the_proxy_does_not_start_without_a_key_for_its_upstream(tmp_path: Path)
         keys=ProviderKeys({ModelProvider.ANTHROPIC: PROVIDER_KEY}),
         rate_table=rates,
     )
+    proxy = ModelProxy(world, STAFF, config)
     try:
         with pytest.raises(ProxySetupError, match="no provider key"):
-            ModelProxy(world, STAFF, config).start()
+            proxy.start()
     finally:
+        # A mutant that lets the start through leaves a proxy serving; its sweeper must not
+        # outlive the world it reads.
+        proxy.stop()
         world.close()
 
 

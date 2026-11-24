@@ -663,8 +663,14 @@ def test_the_server_needs_a_policy_with_a_served_model_and_a_key(tmp_path: Path)
             ({UPSTREAM: "http://127.0.0.1:9"}, {ModelProvider.ANTHROPIC: "k"}, "no provider key"),
         ):
             config = ServerConfig(upstreams=upstreams, keys=ProviderKeys(keys), rate_table=rates)
-            with pytest.raises(ProxySetupError, match=message):
-                MultiRunProxy(world, config).start()
+            proxy = MultiRunProxy(world, config)
+            try:
+                with pytest.raises(ProxySetupError, match=message):
+                    proxy.start()
+            finally:
+                # A mutant that lets the start through leaves a server running; its sweeper
+                # must not outlive the world it reads.
+                proxy.stop()
     finally:
         world.close()
 
