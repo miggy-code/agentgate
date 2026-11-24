@@ -55,6 +55,52 @@ jobs:
           path: reports/
           if-no-files-found: warn
 
+  # The OIDC verifier against a real provider: Keycloak with the test realm imported, then the
+  # tests marked `keycloak` (skipped everywhere else). A step runs the container rather than a
+  # job service, because a service cannot be given a command or the checked-out realm file.
+  keycloak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Start Keycloak
+        run: >
+          docker run -d --name keycloak -p 127.0.0.1:8080:8080
+          -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+          -v "$GITHUB_WORKSPACE/tests/keycloak:/opt/keycloak/data/import:ro"
+          quay.io/keycloak/keycloak:26.8.2 start-dev --import-realm
+
+      # Ready when the test realm's discovery document answers: the realm has been imported.
+      - name: Wait for Keycloak
+        run: |
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8080/realms/agentgate-test/.well-known/openid-configuration > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs keycloak
+          exit 1
+
+      - name: Keycloak tests
+        run: uv run pytest -m keycloak -v
+        env:
+          AGENTGATE_KEYCLOAK_URL: http://127.0.0.1:8080
+
+      - name: Keycloak log
+        if: failure()
+        run: docker logs keycloak
+
   # The same suite against Panoptes main from git, next to the pinned PyPI version above, so a
   # Panoptes change that breaks agentgate shows up before Panoptes is released.
   #
